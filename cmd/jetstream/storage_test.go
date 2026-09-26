@@ -264,6 +264,8 @@ func TestServe_HelpOmitsPGPassword(t *testing.T) {
 	for _, args := range [][]string{
 		{"jetstream", "serve", "--help"},
 		{"jetstream", "serve", "--pg-url=" + secretPGURL, "--help"},
+		{"jetstream", "storage", "init", "--help"},
+		{"jetstream", "storage", "init", "--pg-url=" + secretPGURL, "--help"},
 		{"jetstream", "--help"},
 	} {
 		app := newTestApp()

@@ -63,6 +63,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/jcalabro/atmos"
@@ -139,6 +140,7 @@ func newAppWithEnviron(environ func() []string) *cli.Command {
 			versionCommand(),
 			inspectSegmentCommand(),
 			inspectAllCommand(),
+			storageCommand(),
 		},
 	}
 }
@@ -405,12 +407,60 @@ func serveCommand() *cli.Command {
 	return cmd
 }
 
+// storageCommand groups the commands that administer disaggregated storage.
+func storageCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "storage",
+		Usage: "Administer disaggregated storage (PostgreSQL catalog plus S3 objects)",
+		Commands: []*cli.Command{
+			{
+				Name:   "init",
+				Usage:  "Create a new archive in the PostgreSQL database and S3 bucket that the storage flags name (design §15.1). Refuses a database that already holds an archive.",
+				Flags:  storageInitFlags(),
+				Action: runStorageInit,
+			},
+		},
+	}
+}
+
+// storageInitFlags is the subset of storageFlags that init reads: the
+// connections and the lease it holds while creating the first segments.
+func storageInitFlags() []cli.Flag {
+	var out []cli.Flag
+	for _, f := range storageFlags() {
+		name := f.Names()[0]
+		if strings.HasPrefix(name, "pg-") || strings.HasPrefix(name, "s3-") || name == "leader-lease" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// runStorageInit creates the archive whatever --storage says: init only
+// ever targets disaggregated storage, and requiring the flag would add a
+// step without catching a mistake.
+func runStorageInit(ctx context.Context, cmd *cli.Command) error {
+	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, _, err := storageConfigFromCommand(cmd)
+	if err != nil {
+		return err
+	}
+	archive, err := jetstreamd.InitStorage(runCtx, cfg)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(cmd.Root().Writer, "initialized archive %s\n", objstore.FormatUUID(archive.ArchiveID))
+	return err
+}
+
 // storageFlagCategory groups the disaggregated-storage flags in --help.
 const storageFlagCategory = "Disaggregated storage (design §18)"
 
 // storageFlags declares every design §18 variable. They are declared even
 // before the runtime reads them all so that none is rejected as an unknown
-// JETSTREAM_* variable. `storage` subcommands (S3.4) reuse them.
+// JETSTREAM_* variable. The `storage` subcommands reuse them.
 //
 // --pg-url holds a password. urfave/cli renders defaults before reading env
 // sources, so --help shows no value today; HideDefault keeps it that way if

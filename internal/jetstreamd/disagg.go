@@ -56,6 +56,11 @@ type StorageBackend struct {
 	// Archive checks the schema and format versions and returns the
 	// archive row.
 	Archive func(ctx context.Context) (catalog.ArchiveRow, error)
+	// CreateArchive applies the schema to an empty database and inserts
+	// the archive row with archiveID (design §15.1). It refuses a database
+	// that already holds an archive with pgstore.ErrInitialized. Only Init
+	// calls it; serve may leave it nil.
+	CreateArchive func(ctx context.Context, archiveID [16]byte) error
 	// NewLease returns this pod's writer lease over the archive row.
 	NewLease func() leader.Locker
 	// MetaStore returns the metadata store over DB. Writes go through
@@ -144,7 +149,7 @@ func checkMemoryBudgets(limit int64, budgets []memoryBudget) error {
 func openBackend(ctx context.Context, cfg StorageConfig, pgMetrics *pgstore.Metrics, s3Metrics *s3.Metrics) (*StorageBackend, error) {
 	pg, err := pgstore.Open(ctx, pgstore.Config{URL: cfg.PG.URL, MaxConns: int32(cfg.PG.MaxConns), Metrics: pgMetrics})
 	if err != nil {
-		return nil, fmt.Errorf("serve: connect to PostgreSQL: %w", err)
+		return nil, fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
 	blob, err := s3.New(ctx, s3.Config{
 		Endpoint:          cfg.S3.Endpoint,
@@ -159,14 +164,15 @@ func openBackend(ctx context.Context, cfg StorageConfig, pgMetrics *pgstore.Metr
 	})
 	if err != nil {
 		pg.Close()
-		return nil, fmt.Errorf("serve: open S3: %w", err)
+		return nil, fmt.Errorf("open S3: %w", err)
 	}
 	return &StorageBackend{
-		DB:       pg,
-		Listener: pg,
-		Blob:     blob,
-		Archive:  pg.CheckVersions,
-		NewLease: func() leader.Locker { return pg.NewLease() },
+		DB:            pg,
+		Listener:      pg,
+		Blob:          blob,
+		Archive:       pg.CheckVersions,
+		CreateArchive: pg.Initialize,
+		NewLease:      func() leader.Locker { return pg.NewLease() },
 		MetaStore: func(commit func(context.Context, []metastore.Op) error) metastore.Store {
 			return metapg.New(metapg.Config{DB: pg, Commit: commit})
 		},
@@ -239,7 +245,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 	backend := opts.StorageBackend
 	if backend == nil {
 		if backend, err = openBackend(ctx, st, pgMetrics, s3Metrics); err != nil {
-			return fail(err)
+			return fail(fmt.Errorf("serve: %w", err))
 		}
 	}
 	rt.disagg.backend = backend

@@ -1076,7 +1076,7 @@ Design §10.6, §10.10, §15.1, and §26 stage 3.
     it.
   - Resumability: a kill at any point before the final transaction resumes
     through `merge/next_source_idx`.
-- [ ] **S3.4 `jetstream storage init`** (M). Deps: S2.2, S2.5.
+- [x] **S3.4 `jetstream storage init`** (M). Deps: S2.2, S2.5.
   - The §15.1 steps: refuse if `archive` exists; apply migrations; insert
     `archive` with a random `archive_id`; create segment 0 active in both
     namespaces; PUT/GET/DELETE a probe under
@@ -1248,6 +1248,39 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S3.4 (2026-09-26): `jetstream storage init`.**
+  - `jetstreamd.InitStorage` opens PostgreSQL and S3 with the `serve`
+    connection code, then runs `StorageBackend.Init`. The CLI command
+    `jetstream storage init` takes only the `pg-*` and `s3-*` storage flags and
+    `--leader-lease`, and ignores `JETSTREAM_STORAGE`. It prints the new
+    `archive_id`.
+  - Deviation: the probe runs first, under the `archive_id` about to be
+    inserted, and not last as §15.1 listed. A bad credential or bucket then
+    leaves the database empty, and init can run again once it is fixed. The
+    design now lists the steps in this order.
+  - `pgstore.Initialize` applies the schema and inserts the archive row in one
+    transaction. Init then takes the writer lease and creates segment 0 in
+    `main` and `bootstrap_live` through `Session.InitNamespace`, so the rows
+    go through the same fenced script as every other catalog write. It
+    releases the lease, so the first leader need not wait for it to expire.
+    Init uses epoch 1, and the first leader gets epoch 2.
+  - A failure after the archive row commits leaves an archive that init
+    refuses. The first leader session creates any missing segment 0 (S3.2), so
+    rerunning init is not needed.
+  - `StorageBackend.CreateArchive` is the testing hook: `pg.Initialize` in
+    production, and in `jetstreamdtest` a fake whose first call succeeds and
+    later calls return `pgstore.ErrInitialized`.
+    `jetstreamdtest.InitNamespaces` now runs `Init`, so every disaggregated
+    runtime test starts from a catalog the real init code made.
+  - Tests: storagefake unit tests for `Init` (first segments, refusal, probe
+    failure leaves nothing, lease held), CLI validation and password
+    redaction, and `TestStorageInit_RealStorage`. The real-storage test runs
+    the command against `just test-storage` (SeaweedFS and MinIO), including
+    a wrong-secret run that must leave the database initializable. S3 retries
+    403s until `--s3-retry-timeout`, since a credential refresh can cure them,
+    so a bad credential takes that long (default 30s) to fail init.
+  - Manual smoke test: init, then disaggregated `serve` against the simulator
+    and `just up`, reached `steady_state` through bootstrap and merge.
 - **S3.3 (2026-09-26): Merge on the catalog.**
   - `runMergeDisaggregated` (`orchestrator/disagg.go`) drains `bootstrap_live`
     into `main` with the existing merge runner. The runner now reads through a

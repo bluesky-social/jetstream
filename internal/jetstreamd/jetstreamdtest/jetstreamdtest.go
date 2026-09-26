@@ -6,6 +6,7 @@ package jetstreamdtest
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -14,6 +15,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/objstore/memblob"
+	"github.com/bluesky-social/jetstream/internal/pgstore"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
 )
 
@@ -28,34 +30,35 @@ type Backend struct {
 func New(cfg storagefake.Config) *Backend {
 	db := storagefake.New(cfg)
 	blob := memblob.New()
+	// The fake starts with its archive row, so CreateArchive models an
+	// empty database: the first call succeeds, and later ones refuse as
+	// PostgreSQL would.
+	var created atomic.Bool
 	return &Backend{
 		DB:   db,
 		Blob: blob,
 		Backend: &jetstreamd.StorageBackend{
-			DB:        db,
-			Listener:  db,
-			Blob:      blob,
-			Archive:   func(context.Context) (catalog.ArchiveRow, error) { return db.Archive(), nil },
+			DB:       db,
+			Listener: db,
+			Blob:     blob,
+			Archive:  func(context.Context) (catalog.ArchiveRow, error) { return db.Archive(), nil },
+			CreateArchive: func(context.Context, [16]byte) error {
+				if created.Swap(true) {
+					return pgstore.ErrInitialized
+				}
+				return nil
+			},
 			NewLease:  func() leader.Locker { return db.NewLease() },
 			MetaStore: db.MetaStore,
 		},
 	}
 }
 
-// InitNamespaces creates segment 0 in main and bootstrap_live, under a
-// lease the call takes and releases, as `jetstream storage init` leaves a
-// new catalog.
+// InitNamespaces runs `jetstream storage init` on the fake, which leaves
+// segment 0 in main and bootstrap_live.
 func (b *Backend) InitNamespaces(ctx context.Context) error {
-	lease := b.DB.NewLease()
-	if err := lease.Acquire(ctx, time.Minute); err != nil {
-		return fmt.Errorf("jetstreamdtest: acquire: %w", err)
-	}
-	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
-	sess := catalog.NewSession(catalog.SessionConfig{DB: b.DB, Epoch: lease.Epoch()})
-	for _, ns := range []catalog.Namespace{catalog.Main, catalog.BootstrapLive} {
-		if _, err := sess.InitNamespace(ctx, ns, nil); err != nil {
-			return fmt.Errorf("jetstreamdtest: init %s: %w", ns, err)
-		}
+	if _, err := b.Backend.Init(ctx, time.Minute); err != nil {
+		return fmt.Errorf("jetstreamdtest: %w", err)
 	}
 	return nil
 }

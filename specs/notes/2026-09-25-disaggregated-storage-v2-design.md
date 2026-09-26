@@ -1605,20 +1605,26 @@ data. This is accepted for now and must be measured.
 
 ### 15.1 Initialize
 
-`jetstream storage init` (new subcommand):
+`jetstream storage init` (new subcommand). It reads only the PostgreSQL and
+S3 flags that `serve` takes and `JETSTREAM_LEADER_LEASE`. S3 credentials come
+from the AWS default chain, as in `serve`.
 
-1. Connect to PostgreSQL and apply migrations to an empty database. Refuse if
-   the `archive` table already exists.
-2. Insert the `archive` row with a new random `archive_id`. Create segment 0,
-   `state = 'active'`, in both `main` and `bootstrap_live`. Leave `metadata_kv`
+1. PUT, GET, and DELETE a probe object under
+   `<prefix>/<archive_id>/probe/<uuid>`, using the `archive_id` step 2 will
+   insert, to check credentials and read-after-write.
+2. Connect to PostgreSQL. In one transaction, apply migrations to an empty
+   database and insert the `archive` row. Refuse if the `archive` table
+   already exists.
+3. Take the writer lease. Through a leader session, create segment 0,
+   `state = 'active'`, in both `main` and `bootstrap_live`. Release the lease,
+   so the first leader need not wait for it to expire. Leave `metadata_kv`
    empty; the orchestrator starts in `bootstrap` when `phase` is absent, as
    today.
-3. PUT, GET, and DELETE a probe object under
-   `<prefix>/<archive_id>/probe/<uuid>` to check credentials and read-after-write.
 
-If init ends after inserting the `archive` row, running it again refuses. So
-the first leader session on a catalog with no `phase` creates any missing
-segment 0 itself (§10.10).
+The probe runs first so that a bad credential or bucket leaves the database
+empty, and init can run again once it is fixed. If init ends after inserting
+the `archive` row, running it again refuses. So the first leader session on a
+catalog with no `phase` creates any missing segment 0 itself (§10.10).
 
 ### 15.2 Pod start
 
