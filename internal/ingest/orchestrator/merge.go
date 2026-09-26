@@ -42,6 +42,9 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 
 		start := time.Now()
 		defer func() { o.cfg.Metrics.observeState("merge", time.Since(start).Seconds()) }()
+		if o.cfg.Disaggregated != nil {
+			return o.runMergeDisaggregated(ctx)
+		}
 
 		liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
@@ -107,7 +110,7 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
-		runner := newMergeRunner(dst, o.cfg.Store, segs, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
+		runner := newMergeRunner(dst, o.cfg.Store, localMergeSource{segs}, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
 
 		if err := runner.run(ctx); err != nil {
 			if cerr := dst.Close(); cerr != nil {
@@ -116,28 +119,11 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
-		// Bootstrap restart can defer pre-existing not_started rows to pending
-		// (#262). Repair them only after the captured live tail has merged, so
-		// the synthetic sync + replacement rows land above any stale account
-		// tombstones that were replayed from live_segments.
-		if err := backfill.RunPendingRepoRetryPass(ctx, backfill.RetryConfig{
-			Store:         o.cfg.Store,
-			Writer:        dst,
-			HTTPClient:    o.cfg.HTTPClient,
-			RelayURL:      o.cfg.RelayURL,
-			Logger:        o.cfg.Logger,
-			Metrics:       o.cfg.BackfillMetrics,
-			DropMetrics:   o.cfg.DropMetrics,
-			NewHostClient: o.cfg.BackfillNewHostClient,
-			Interval:      o.cfg.FailedRepoRetryInterval,
-			Workers:       o.cfg.FailedRepoRetryWorkers,
-			HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
-			MaxDelay:      o.cfg.FailedRepoRetryMaxDelay,
-		}); err != nil {
+		if err := o.runPendingRepoRetryPass(ctx, dst); err != nil {
 			if cerr := dst.Close(); cerr != nil {
 				o.logger.WarnContext(ctx, "dst writer close after pending retry error", "err", cerr)
 			}
-			return fmt.Errorf("orchestrator: merge: pending repo retry: %w", err)
+			return err
 		}
 
 		if err := dst.SealActiveAndClose(); err != nil {
@@ -159,15 +145,8 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			return err
 		}
 
-		if !o.cfg.SkipMergeDiscovery {
-			limits := discoveryLimits{
-				maxHosts:       o.cfg.BackfillMaxHosts,
-				maxActiveHosts: o.cfg.BackfillMaxActiveHosts,
-				retryDelay:     o.cfg.MergeDiscoveryRetryBaseDelay,
-			}
-			if err := runner.runDiscoveryWithClient(ctx, o.cfg.RelayURL, o.cfg.HTTPClient, o.cfg.BackfillNewHostClient, limits); err != nil {
-				return err
-			}
+		if err := o.runMergeDiscovery(ctx, runner); err != nil {
+			return err
 		}
 		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDiscoveryBeforeCleanup); err != nil {
 			return err
@@ -234,4 +213,42 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, segs SegmentCa
 	}
 	o.logger.InfoContext(ctx, "sealed active bootstrap-live source before merge", "segment", latest.Index)
 	return nil
+}
+
+// runPendingRepoRetryPass repairs repos left pending. Bootstrap restart can
+// defer pre-existing not_started rows to pending (#262). Repair them only
+// after the captured live tail has merged, so the synthetic sync +
+// replacement rows land above any stale account tombstones that were
+// replayed from live_segments.
+func (o *Orchestrator) runPendingRepoRetryPass(ctx context.Context, dst *ingest.Writer) error {
+	if err := backfill.RunPendingRepoRetryPass(ctx, backfill.RetryConfig{
+		Store:         o.cfg.Store,
+		Writer:        dst,
+		HTTPClient:    o.cfg.HTTPClient,
+		RelayURL:      o.cfg.RelayURL,
+		Logger:        o.cfg.Logger,
+		Metrics:       o.cfg.BackfillMetrics,
+		DropMetrics:   o.cfg.DropMetrics,
+		NewHostClient: o.cfg.BackfillNewHostClient,
+		Interval:      o.cfg.FailedRepoRetryInterval,
+		Workers:       o.cfg.FailedRepoRetryWorkers,
+		HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
+		MaxDelay:      o.cfg.FailedRepoRetryMaxDelay,
+	}); err != nil {
+		return fmt.Errorf("orchestrator: merge: pending repo retry: %w", err)
+	}
+	return nil
+}
+
+// runMergeDiscovery runs new-DID discovery unless SkipMergeDiscovery.
+func (o *Orchestrator) runMergeDiscovery(ctx context.Context, runner *mergeRunner) error {
+	if o.cfg.SkipMergeDiscovery {
+		return nil
+	}
+	limits := discoveryLimits{
+		maxHosts:       o.cfg.BackfillMaxHosts,
+		maxActiveHosts: o.cfg.BackfillMaxActiveHosts,
+		retryDelay:     o.cfg.MergeDiscoveryRetryBaseDelay,
+	}
+	return runner.runDiscoveryWithClient(ctx, o.cfg.RelayURL, o.cfg.HTTPClient, o.cfg.BackfillNewHostClient, limits)
 }

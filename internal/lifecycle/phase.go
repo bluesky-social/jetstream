@@ -158,6 +158,16 @@ func WriteBackfillTiming(ctx context.Context, s metastore.Store, startedAt time.
 	return nil
 }
 
+// StagePhase stages the writes of phase p into b, for a caller that commits
+// the phase with other writes in one transaction.
+func StagePhase(b metastore.Batch, p Phase, enteredAt time.Time) error {
+	if !p.valid() {
+		return fmt.Errorf("lifecycle: refuse to write unrecognized phase %q", string(p))
+	}
+	stagePhase(b, p, enteredAt)
+	return nil
+}
+
 func stagePhase(b metastore.Batch, p Phase, enteredAt time.Time) {
 	b.Set([]byte(phaseKey), []byte(p))
 	stageTime(b, phaseEnteredAtKey, enteredAt)

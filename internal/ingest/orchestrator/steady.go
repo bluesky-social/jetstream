@@ -84,10 +84,14 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		}
-		if o.cfg.Hot != nil {
+		if d := o.cfg.Disaggregated; d != nil {
 			// Hot batches commit seq/next with their rows, so there is no
 			// seq lease, local directory, or local catalog.
-			cfg.Hot = o.cfg.Hot
+			hot, err := d.Hot(ctx)
+			if err != nil {
+				return fmt.Errorf("orchestrator: open hot mode: %w", err)
+			}
+			cfg.Hot = hot
 			cfg.DataDir, cfg.SegmentsDir, cfg.FS = "", "", nil
 			cfg.ReserveClientVisibleSeqs = false
 		} else {

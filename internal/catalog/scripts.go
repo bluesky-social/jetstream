@@ -645,17 +645,20 @@ func (s *Session) PublishGeneration(context.Context) error {
 }
 
 // InitNamespace creates ns's first active segment if the namespace has no
-// segments, and applies meta in the same transaction.
+// active segment, and applies meta in the same transaction either way.
 func (s *Session) InitNamespace(ctx context.Context, ns Namespace, meta []metastore.Op) (uint64, error) {
 	if !ns.Valid() {
 		return 0, s.fail(fmt.Errorf("catalog: unknown namespace %q", ns))
 	}
 	return s.run(ctx, TxNamespace, func(tx Tx, rev uint64) error {
-		if _, found, err := tx.ActiveSegment(ctx, ns); err != nil || found {
+		_, found, err := tx.ActiveSegment(ctx, ns)
+		if err != nil {
 			return err
 		}
-		if err := tx.InsertSegment(ctx, SegmentRow{Namespace: ns, Index: 0, State: Active, Revision: rev}); err != nil {
-			return err
+		if !found {
+			if err := tx.InsertSegment(ctx, SegmentRow{Namespace: ns, Index: 0, State: Active, Revision: rev}); err != nil {
+				return err
+			}
 		}
 		if len(meta) == 0 {
 			return nil

@@ -1054,14 +1054,14 @@ Design §10.6, §10.10, §15.1, and §26 stage 3.
     blocks.
   - Tests: swarm (the `writer_swarm_test.go` pattern) on storagefake;
     invariants hold per namespace.
-- [ ] **S3.2 Bootstrap on the catalog** (M). Deps: S3.1.
+- [x] **S3.2 Bootstrap on the catalog** (M). Deps: S3.1.
   - `orchestrator/bootstrap.go`: both writers in direct mode. Backfill
     checkpoints go through the completion batcher hook inside block commits
     (`backfill/run.go:117`, `completion_batcher.go:158`). `finishBootstrap`
     seal-reopen (`:238-263`) goes through the catalog.
   - The phase write (`states.go` `writeMergingPhase`) becomes a fenced
     metastore commit.
-- [ ] **S3.3 Merge on the catalog** (L). Deps: S3.1, S1.11.
+- [x] **S3.3 Merge on the catalog** (L). Deps: S3.1, S1.11.
   - The merge runner reads `bootstrap_live` blocks via `RefsFrom` + objstore in
     seq order, applies the rev filter unchanged (`merge_filter.go`), and
     appends survivors to `main` in direct mode.
@@ -1247,6 +1247,70 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S3.3 (2026-09-26): Merge on the catalog.**
+  - `runMergeDisaggregated` (`orchestrator/disagg.go`) drains `bootstrap_live`
+    into `main` with the existing merge runner. The runner now reads through a
+    `mergeSource`: `localMergeSource` over the local segment catalog, or
+    `catalogMergeSource`, which reads the catalog rows (`SegmentsSince`,
+    `GenerationBlocks`, `ActiveBlocksSince`) and fetches objects with
+    `objstore.Store.Get`. Merge needs only the blocks in order, so it loads no
+    footers.
+  - The runner skips a trailing empty unsealed source. Seal inserts the next
+    active segment, so a sealed `bootstrap_live` always ends with one.
+  - The seal guard runs as in local mode: a non-empty unsealed last source is
+    sealed through a direct writer before the drain.
+  - Deviation: the destination is closed, not sealed, after the drain and the
+    pending retry pass. The steady-state hot writer continues `main`'s active
+    segment (design §10.10). The crashpoint `AfterMergeDstSealBeforeDiscovery`
+    keeps its name.
+  - `commitSourceComplete`, discovery, and the retry pass write through the
+    orchestrator's store, which in disaggregated mode is the fenced session
+    store, so each step commits on its own and repeats safely.
+  - Merge-tail compaction and its manifest reconcile are skipped (D5).
+  - Final transaction: `Session.DeleteNamespace(bootstrap_live, ops)` with
+    deletes of `live_segments/seq/next` and `merge/next_source_idx`, plus
+    `phase = steady_state` and `phase/entered_at`. `writeSteadyStatePhase`
+    then only records the transition. The two cleanup crashpoints bracket the
+    transaction.
+  - A `merging` phase with no `bootstrap_live` segments is a corruption error.
+    The final transaction removes the namespace and writes the phase together,
+    so no crash leaves that state, and local mode's restart-after-cleanup
+    guard has nothing to recover.
+  - Tests: `TestDisagg_RuntimeLifecycle` runs bootstrap, merge, and steady state
+    through the runtime on storagefake. It checks that survivors captured in
+    `bootstrap_live` land in `main` below the post-merge `seq/next`, that the
+    final transaction left no `bootstrap_live` rows or keys, and the full
+    stream against the model. `TestRunDisaggregated_MergingWithoutBootstrapLive`
+    covers the corruption case.
+
+- **S3.2 (2026-09-26): Bootstrap on the catalog.**
+  - `orchestrator.Config.Disaggregated` replaces `Hot`. It carries the leader
+    session, a `Direct` factory per namespace, a lazy `Hot` factory for steady
+    state, and the object store merge reads from. The runtime's leader session
+    (`runLeaderSession`) builds these and no longer refuses a phase other
+    than `steady_state`; the maintainer opens only when steady state starts,
+    because a direct writer owns `main`'s active segment until then.
+  - Both bootstrap writers run in direct mode (`openBootstrapWriters`). The
+    live consumer gained `live.Config.Direct`. Backfill checkpoints ride the
+    completion batcher's `DurableBatchHook` in block commits unchanged.
+  - `main` in direct mode seals at `SteadyMaxSegmentBytes`, `bootstrap_live` at
+    `BootstrapLiveMaxSegmentBytes`. `BackfillAsyncFlushWorkers` stays unset:
+    direct mode does its own concurrent uploads.
+  - `finishBootstrap` seals `bootstrap_live` through a direct writer's
+    `SealActiveAndClose`.
+  - Phase writes go through the fenced session store. `lifecycle.StagePhase`
+    stages a phase write into a batch so it can ride another transaction.
+  - Addition: on a new catalog (phase absent) the orchestrator creates any
+    missing segment 0 in `main` and `bootstrap_live` and writes
+    `phase = bootstrap` in the last of those transactions. `storage init`
+    that ends after inserting the archive row refuses to run again, so the
+    first leader finishes its job. This found a bug: `InitNamespace` skipped
+    its metadata ops when the namespace already had an active segment. It now
+    applies them either way.
+  - Tests: `TestConfig_Validate_Disaggregated`,
+    `TestScripts_InitNamespaceIdempotent`, and the lifecycle test under
+    S3.3.
 
 - **S3.1 (2026-09-26): Direct mode.**
   - `ingest.Config.Direct` opens the Writer in direct mode

@@ -216,12 +216,11 @@ type Config struct {
 	// manifest. Nil uses a private local catalog over DataDir.
 	Catalog SegmentCatalog
 
-	// Hot, when set, runs disaggregated mode (design §10.10): the
-	// steady-state writer runs in hot mode against the leader session, and
-	// DataDir, FS, and Catalog are unused. Only phase steady_state can run;
-	// bootstrap and merge in disaggregated mode are stage 3, so any other
-	// phase is a fatal error. Compaction must be off (D5).
-	Hot *ingest.HotConfig
+	// Disaggregated, when set, runs the lifecycle on the shared catalog
+	// (design §10.10), and DataDir, FS, and Catalog are unused. Store must
+	// be the leader session's fenced metadata store. Compaction must be off
+	// (D5).
+	Disaggregated *Disaggregated
 
 	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
 	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh
@@ -322,11 +321,15 @@ type Config struct {
 }
 
 func (c *Config) validate() error {
-	if c.DataDir == "" && c.Hot == nil {
+	if d := c.Disaggregated; d != nil {
+		switch {
+		case d.Session == nil || d.Direct == nil || d.Hot == nil || d.Objects == nil:
+			return fmt.Errorf("%w: Disaggregated needs Session, Direct, Hot, and Objects", ErrInvalidConfig)
+		case c.Catalog != nil || c.CompactionInterval != 0 || c.BackfillAsyncFlushWorkers != 0:
+			return fmt.Errorf("%w: Disaggregated takes neither Catalog, CompactionInterval, nor BackfillAsyncFlushWorkers", ErrInvalidConfig)
+		}
+	} else if c.DataDir == "" {
 		return fmt.Errorf("%w: DataDir is required", ErrInvalidConfig)
-	}
-	if c.Hot != nil && (c.Catalog != nil || c.CompactionInterval != 0) {
-		return fmt.Errorf("%w: Hot takes neither Catalog nor CompactionInterval", ErrInvalidConfig)
 	}
 	if c.Store == nil {
 		return fmt.Errorf("%w: Store is required", ErrInvalidConfig)

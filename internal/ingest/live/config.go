@@ -178,6 +178,12 @@ type Config struct {
 	// Store only reads the committed cursor at Run.
 	Hot *ingest.HotConfig
 
+	// Direct, when set, runs the inner writer in direct mode (design §10.6):
+	// each block commits in the leader session with the relay cursor sampled
+	// when that block froze. Bootstrap uses it for bootstrap_live.
+	// SegmentsDir is unused and SeqKey must be Namespace's catalog.SeqKey.
+	Direct *ingest.DirectConfig
+
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
 
@@ -194,7 +200,7 @@ type Config struct {
 }
 
 func (c *Config) validate() error {
-	if c.SegmentsDir == "" && c.Hot == nil {
+	if c.SegmentsDir == "" && c.Hot == nil && c.Direct == nil {
 		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
 	}
 	if c.Store == nil {

@@ -331,6 +331,32 @@ func TestScripts_DirectBlockCommit(t *testing.T) {
 	})
 }
 
+// InitNamespace is idempotent, and applies its metadata whether or not it
+// created the segment: the orchestrator's first phase write rides on it.
+func TestScripts_InitNamespaceIdempotent(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		for i, v := range []string{"first", "second"} {
+			_, err := h.s.InitNamespace(ctx, catalog.BootstrapLive, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("init/test"), Value: []byte(v)}})
+			require.NoError(t, err, "call %d", i)
+			got, found := h.meta("init/test")
+			require.True(t, found)
+			require.Equal(t, []byte(v), got)
+		}
+		snap, err := h.snapshot()
+		require.NoError(t, err)
+		var segs int
+		for _, row := range snap.Segments {
+			if row.Namespace == catalog.BootstrapLive {
+				segs++
+			}
+		}
+		require.Equal(t, 1, segs)
+	})
+}
+
 func TestScripts_Dedup(t *testing.T) {
 	t.Parallel()
 	eachBackend(t, func(t *testing.T, be backend) {

@@ -57,28 +57,28 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("orchestrator: read phase: %w", err)
 		}
-		if o.cfg.Hot != nil {
-			if phase != lifecycle.PhaseSteadyState {
-				return fmt.Errorf("orchestrator: disaggregated mode needs phase %q, found %q: bootstrap and merge in disaggregated mode are not available yet", lifecycle.PhaseSteadyState, phase)
-			}
-			o.logger.InfoContext(ctx, "starting", "phase", phase, "mode", "disaggregated")
-			return o.runSteadyState(ctx)
-		}
 		if phase == "" {
 			phase = lifecycle.PhaseBootstrap
-			if err := lifecycle.WritePhase(ctx, o.cfg.Store, phase, time.Now().UTC()); err != nil {
+			if o.cfg.Disaggregated != nil {
+				if err := o.writeInitialPhaseDisaggregated(ctx, time.Now().UTC()); err != nil {
+					return err
+				}
+			} else if err := lifecycle.WritePhase(ctx, o.cfg.Store, phase, time.Now().UTC()); err != nil {
 				return fmt.Errorf("orchestrator: write initial phase: %w", err)
 			}
 		}
 
-		// A crash mid-rewrite can leave a segment-sized *.jss.tmp
-		// behind; reclaim it at boot even when compaction is disabled
-		// (each pass also cleans at start).
-		if err := o.segments().RemoveStaleTemps(catalog.Main); err != nil {
+		mode := "local"
+		if o.cfg.Disaggregated != nil {
+			mode = "disaggregated"
+		} else if err := o.segments().RemoveStaleTemps(catalog.Main); err != nil {
+			// A crash mid-rewrite can leave a segment-sized *.jss.tmp
+			// behind; reclaim it at boot even when compaction is disabled
+			// (each pass also cleans at start).
 			return fmt.Errorf("orchestrator: compaction: %w", err)
 		}
 
-		o.logger.InfoContext(ctx, "starting", "phase", phase)
+		o.logger.InfoContext(ctx, "starting", "phase", phase, "mode", mode)
 
 		switch phase {
 		case lifecycle.PhaseBootstrap:

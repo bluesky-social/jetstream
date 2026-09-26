@@ -155,6 +155,7 @@ func Open(cfg Config) (*Consumer, error) {
 		Catalog:                  cfg.Catalog,
 		Namespace:                cfg.Namespace,
 		Hot:                      cfg.Hot,
+		Direct:                   cfg.Direct,
 		SegmentMetrics:           cfg.SegmentMetrics,
 		SegmentIOFaultInjector:   cfg.SegmentIOFaultInjector,
 	})

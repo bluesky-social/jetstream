@@ -20,7 +20,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/maintainer"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream/internal/leader"
-	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	metapg "github.com/bluesky-social/jetstream/internal/metastore/pg"
@@ -332,8 +331,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		}
 	} else {
 		// Footers load on the first steady-state tick, which bootstrap and
-		// merge (stage 3) must precede; until then there is nothing to
-		// measure.
+		// merge must precede; until then there is nothing to measure.
 		logger.Warn("catalog not ready after first load; manifest not measured", "err", err)
 	}
 
@@ -409,16 +407,29 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 			IngestMetrics: ingestMetrics,
 			LiveMetrics:   liveMetrics,
 			DropMetrics:   ingest.NewDropMetrics(reg),
-			// Bootstrap is stage 3; only the retry runner uses these.
-			BackfillMetrics:         backfill.NewMetrics(reg),
-			BackfillNewHostClient:   backfillNewHostClient,
-			BackfillGlobalDownloads: opts.effectiveBackfillGlobalDownloads(),
-			BackfillHostWorkers:     opts.effectiveBackfillHostWorkers(),
-			BackfillMaxActiveHosts:  opts.effectiveBackfillMaxActiveHosts(),
-			BackfillMaxHosts:        opts.effectiveBackfillMaxHosts(),
-			BackfillRetryBaseDelay:  opts.BackfillRetryBaseDelay,
-			SegmentMetrics:          segmentMetrics,
-			OnEvent:                 onSteadyStateEvent,
+			// Bootstrap and merge write in direct mode, which does its own
+			// concurrent uploads, so BackfillAsyncFlushWorkers stays unset.
+			BackfillMetrics:                backfill.NewMetrics(reg),
+			BackfillNewHostClient:          backfillNewHostClient,
+			BackfillGlobalDownloads:        opts.effectiveBackfillGlobalDownloads(),
+			BackfillHostWorkers:            opts.effectiveBackfillHostWorkers(),
+			BackfillMaxActiveHosts:         opts.effectiveBackfillMaxActiveHosts(),
+			BackfillMaxHosts:               opts.effectiveBackfillMaxHosts(),
+			BackfillWorkers:                opts.BackfillWorkers,
+			BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
+			BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
+			BackfillRepos:                  opts.BackfillRepos,
+			MaxBackfillRepos:               opts.MaxBackfillRepos,
+			AfterRepoComplete:              opts.AfterRepoComplete,
+			OnBootstrapLiveEvent:           opts.OnBootstrapLiveEvent,
+			BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
+			BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
+			SkipMergeDiscovery:             opts.SkipMergeDiscovery,
+			BarrierBeforeCutover:           phaseBarrier(opts.BarrierBeforeCutover),
+			BarrierAfterBootstrap:          phaseBarrier(opts.BarrierAfterBootstrap),
+			BarrierAfterMerge:              phaseBarrier(opts.BarrierAfterMerge),
+			SegmentMetrics:                 segmentMetrics,
+			OnEvent:                        onSteadyStateEvent,
 			// Subscribers read the follower's log. The writer's keeps only
 			// events not yet committed, which PendingBytes bounds.
 			ReadLogRetentionBytes:      0,
@@ -518,10 +529,11 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 	return rt, nil
 }
 
-// runHotSession is the disaggregated leader.SessionFunc (design §10.9): a
-// fenced metadata store, the maintainer's rebuild, then the steady-state
-// orchestrator with its writer in hot mode.
-func (r *Runtime) runHotSession(ctx context.Context, epoch uint64) error {
+// runLeaderSession is the disaggregated leader.SessionFunc: a fenced
+// metadata store and the orchestrator on the shared catalog (design
+// §10.10). Bootstrap and merge write in direct mode; steady state opens the
+// maintainer, rebuilds hot state (§10.9), and writes in hot mode.
+func (r *Runtime) runLeaderSession(ctx context.Context, epoch uint64) error {
 	d := r.disagg
 	sess := catalog.NewSession(catalog.SessionConfig{
 		DB:            d.backend.DB,
@@ -529,10 +541,10 @@ func (r *Runtime) runHotSession(ctx context.Context, epoch uint64) error {
 		Metrics:       d.catalogMetrics,
 		LeaderMetrics: r.leaderMetrics,
 	})
-	return sessionError(r.hotSession(ctx, epoch, sess), sess)
+	return sessionError(r.leaderSession(ctx, epoch, sess), sess)
 }
 
-func (r *Runtime) hotSession(ctx context.Context, epoch uint64, sess *catalog.Session) error {
+func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog.Session) error {
 	d := r.disagg
 	st := r.opts.Storage
 	var meta metastore.Store = &sessionStore{
@@ -545,64 +557,105 @@ func (r *Runtime) hotSession(ctx context.Context, epoch uint64, sess *catalog.Se
 	if r.opts.StoreFaultInjector != nil {
 		meta = metastore.WithFaults(meta, r.opts.StoreFaultInjector)
 	}
-	phase, err := lifecycle.ReadPhase(ctx, meta)
-	if err != nil {
-		return fmt.Errorf("serve: read phase: %w", err)
-	}
-	if phase != lifecycle.PhaseSteadyState {
-		return fmt.Errorf("serve: disaggregated mode needs phase %q, found %q: bootstrap and merge in disaggregated mode are not available yet", lifecycle.PhaseSteadyState, phase)
-	}
 
 	// A failed writer or maintainer has already ended the session; the
 	// cancel stops the rest of it, and sessionError reports why.
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	onFailure := func(error) { cancel() }
-	m, err := maintainer.Open(sctx, maintainer.Config{
-		Session:           sess,
-		Uploader:          d.uploader,
-		Objects:           d.objects,
-		Cache:             d.cache,
-		MaxEventsPerBlock: r.opts.SteadyMaxEventsPerBlock,
-		MaxSegmentBytes:   r.opts.SteadyMaxSegmentBytes,
-		ReadConcurrency:   st.S3.ReadConcurrency,
-		Logger:            r.processLogger,
-		Metrics:           d.maintMetrics,
-		Crash:             r.opts.CrashInjector,
-		OnFailure:         onFailure,
-	})
-	if err != nil {
-		return fmt.Errorf("serve: open maintainer: %w", err)
+
+	direct := func(ctx context.Context, ns catalog.Namespace) (*ingest.DirectConfig, error) {
+		seg := maintainer.SegmentConfig{
+			Session:         sess,
+			Namespace:       ns,
+			Uploader:        d.uploader,
+			Objects:         d.objects,
+			Cache:           d.cache,
+			MaxSegmentBytes: r.opts.BootstrapLiveMaxSegmentBytes,
+			ReadConcurrency: st.S3.ReadConcurrency,
+			Crash:           r.opts.CrashInjector,
+		}
+		if ns == catalog.Main {
+			seg.MaxSegmentBytes = r.opts.SteadyMaxSegmentBytes
+			seg.Metrics = d.maintMetrics
+		}
+		sealer, err := maintainer.OpenSegment(ctx, seg)
+		if err != nil {
+			return nil, err
+		}
+		return &ingest.DirectConfig{
+			Session:           sess,
+			Uploader:          d.uploader,
+			Sealer:            sealer,
+			UploadConcurrency: st.S3.UploadConcurrency,
+			Crash:             r.opts.CrashInjector,
+			OnFailure:         onFailure,
+		}, nil
 	}
-	// The writer closes inside the orchestrator's Run, before the
-	// maintainer, so an append blocked on the unfolded cap is released
-	// first.
+
+	// The maintainer opens only when steady state starts: a direct writer
+	// owns main's active segment until then. The writer closes inside the
+	// orchestrator's Run, before the maintainer, so an append blocked on
+	// the unfolded cap is released first.
+	var m *maintainer.Maintainer
 	defer func() {
+		if m == nil {
+			return
+		}
 		if cerr := m.Close(); cerr != nil {
 			r.logger.Warn("maintainer close", "epoch", epoch, "err", cerr)
 		}
 	}()
-	resume, err := m.Rebuild(sctx, maintainer.RebuildConfig{BlockMaxAge: st.BlockMaxAge})
-	if err != nil {
-		return fmt.Errorf("serve: rebuild hot state: %w", err)
+	hot := func(context.Context) (*ingest.HotConfig, error) {
+		if m != nil {
+			return nil, errors.New("serve: hot mode opened twice in one session")
+		}
+		var err error
+		m, err = maintainer.Open(sctx, maintainer.Config{
+			Session:           sess,
+			Uploader:          d.uploader,
+			Objects:           d.objects,
+			Cache:             d.cache,
+			MaxEventsPerBlock: r.opts.SteadyMaxEventsPerBlock,
+			MaxSegmentBytes:   r.opts.SteadyMaxSegmentBytes,
+			ReadConcurrency:   st.S3.ReadConcurrency,
+			Logger:            r.processLogger,
+			Metrics:           d.maintMetrics,
+			Crash:             r.opts.CrashInjector,
+			OnFailure:         onFailure,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("serve: open maintainer: %w", err)
+		}
+		resume, err := m.Rebuild(sctx, maintainer.RebuildConfig{BlockMaxAge: st.BlockMaxAge})
+		if err != nil {
+			return nil, fmt.Errorf("serve: rebuild hot state: %w", err)
+		}
+		return &ingest.HotConfig{
+			Session:           sess,
+			Uploader:          d.uploader,
+			Sink:              m,
+			Resume:            resume,
+			BatchMaxAge:       st.Hot.BatchMaxAge,
+			BlockMaxAge:       st.BlockMaxAge,
+			UploadConcurrency: st.S3.UploadConcurrency,
+			InlineBytesPerSec: st.Hot.InlineBytesPerSec,
+			BulkPendingBytes:  st.Hot.BulkPendingBytes,
+			PendingBytes:      st.Hot.PendingBytes,
+			MaxUnfoldedEvents: int64(st.Hot.MaxUnfoldedEvents),
+			// The doorbell makes this pod's own readers see a commit
+			// without waiting for NOTIFY or the poll.
+			OnCommit:  func(uint64) { d.follower.Doorbell() },
+			Crash:     r.opts.CrashInjector,
+			OnFailure: onFailure,
+		}, nil
 	}
-	s, err := r.sessions.buildWith(meta, &ingest.HotConfig{
-		Session:           sess,
-		Uploader:          d.uploader,
-		Sink:              m,
-		Resume:            resume,
-		BatchMaxAge:       st.Hot.BatchMaxAge,
-		BlockMaxAge:       st.BlockMaxAge,
-		UploadConcurrency: st.S3.UploadConcurrency,
-		InlineBytesPerSec: st.Hot.InlineBytesPerSec,
-		BulkPendingBytes:  st.Hot.BulkPendingBytes,
-		PendingBytes:      st.Hot.PendingBytes,
-		MaxUnfoldedEvents: int64(st.Hot.MaxUnfoldedEvents),
-		// The doorbell makes this pod's own readers see a commit without
-		// waiting for NOTIFY or the poll.
-		OnCommit:  func(uint64) { d.follower.Doorbell() },
-		Crash:     r.opts.CrashInjector,
-		OnFailure: onFailure,
+
+	s, err := r.sessions.buildWith(meta, &orchestrator.Disaggregated{
+		Session: sess,
+		Direct:  direct,
+		Hot:     hot,
+		Objects: d.objects,
 	})
 	if err != nil {
 		return err
@@ -610,7 +663,7 @@ func (r *Runtime) hotSession(ctx context.Context, epoch uint64, sess *catalog.Se
 	return r.runWriterSession(sctx, epoch, s)
 }
 
-// sessionError is what a hot session reports to the leader loop. When the
+// sessionError is what a leader session reports to the leader loop. When the
 // catalog session ended first, its error is the cause and everything after
 // it, often a cancellation, is fallout; corruption from elsewhere still
 // wins so it stays fatal.
@@ -647,7 +700,7 @@ func (r *Runtime) runDisaggregated(gctx context.Context, g *errgroup.Group) {
 			AcquireInterval: st.Leader.AcquireInterval,
 			Logger:          r.processLogger.With(slog.String("component", "leader")),
 			Metrics:         r.leaderMetrics,
-		}, r.runHotSession)
+		}, r.runLeaderSession)
 	}))
 }
 

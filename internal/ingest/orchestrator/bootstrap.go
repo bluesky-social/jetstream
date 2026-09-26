@@ -31,54 +31,9 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 		liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
 
-		// Backfill writer (shared with the backfill engine).
-		bw, err := ingest.Open(ingest.Config{
-			SegmentsDir:            segmentsDir,
-			DataDir:                o.cfg.DataDir,
-			FS:                     o.cfg.FS,
-			Store:                  o.cfg.Store,
-			Logger:                 o.cfg.Logger,
-			Metrics:                o.cfg.IngestMetrics,
-			SegmentMetrics:         o.cfg.SegmentMetrics,
-			AsyncFlushWorkers:      o.cfg.BackfillAsyncFlushWorkers,
-			Catalog:                o.segments(),
-			Namespace:              catalog.Main,
-			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
+		bw, bootstrapLive, err := o.openBootstrapWriters(ctx, segmentsDir, liveSegmentsDir)
 		if err != nil {
-			return fmt.Errorf("orchestrator: open backfill ingest writer: %w", err)
-		}
-
-		// Bootstrap-time live consumer.
-		bootstrapLive, err := live.Open(live.Config{
-			DataDir:           o.cfg.DataDir,
-			SegmentsDir:       liveSegmentsDir,
-			FS:                o.cfg.FS,
-			Store:             o.cfg.Store,
-			SeqKey:            live.BootstrapSeqKey,
-			CursorKey:         live.CursorKey,
-			RelayURL:          o.cfg.RelayURL,
-			Logger:            o.cfg.Logger,
-			Metrics:           o.cfg.LiveMetrics,
-			DropMetrics:       o.cfg.DropMetrics,
-			Verifier:          o.cfg.Verifier,
-			SyncStateStore:    o.cfg.SyncStateStore,
-			MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
-			MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
-			SegmentMetrics:    o.cfg.SegmentMetrics,
-			Catalog:           o.segments(),
-			Namespace:         catalog.BootstrapLive,
-			OnEvent:           o.cfg.OnBootstrapLiveEvent,
-			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
-			Dial:              o.cfg.LiveDial,
-
-			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
-		if err != nil {
-			if cerr := bw.Close(); cerr != nil {
-				o.logger.WarnContext(ctx, "backfill writer close after bootstrap-live open failure", "err", cerr)
-			}
-			return fmt.Errorf("orchestrator: open bootstrap-live consumer: %w", err)
+			return err
 		}
 
 		g, gctx := errgroup.WithContext(ctx)
@@ -239,36 +194,115 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 			return err
 		}
 
-		sealW, err := ingest.Open(ingest.Config{
-			SegmentsDir: liveSegmentsDir,
-			DataDir:     o.cfg.DataDir,
-			FS:          o.cfg.FS,
-			Store:       o.cfg.Store,
-			SeqKey:      live.BootstrapSeqKey,
-			// Bare cfg.Logger; ingest.Open sets its own component.
-			Logger: o.cfg.Logger,
-			// Metrics nil to match the bootstrap-live consumer convention
-			// (live/consumer.go Open): bootstrap-time live writes are not
-			// counted in steady-state ingest counters, and the trailing
-			// seal is a continuation of that lifetime.
-			Metrics: nil,
-			// SegmentMetrics IS shared though — the seal_duration
-			// histogram is a global concern and we want every
-			// segment.Writer in the process recording into the same
-			// series.
-			SegmentMetrics:         o.cfg.SegmentMetrics,
-			Catalog:                o.segments(),
-			Namespace:              catalog.BootstrapLive,
-			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
-		if err != nil {
-			return fmt.Errorf("orchestrator: re-open bootstrap-live writer for seal: %w", err)
-		}
-		if err := sealW.SealActiveAndClose(); err != nil {
-			return fmt.Errorf("orchestrator: seal bootstrap-live segment: %w", err)
+		if o.cfg.Disaggregated != nil {
+			if err := o.sealBootstrapLive(ctx); err != nil {
+				return err
+			}
+		} else {
+			sealW, err := ingest.Open(ingest.Config{
+				SegmentsDir: liveSegmentsDir,
+				DataDir:     o.cfg.DataDir,
+				FS:          o.cfg.FS,
+				Store:       o.cfg.Store,
+				SeqKey:      live.BootstrapSeqKey,
+				// Bare cfg.Logger; ingest.Open sets its own component.
+				Logger: o.cfg.Logger,
+				// Metrics nil to match the bootstrap-live consumer convention
+				// (live/consumer.go Open): bootstrap-time live writes are not
+				// counted in steady-state ingest counters, and the trailing
+				// seal is a continuation of that lifetime.
+				Metrics: nil,
+				// SegmentMetrics IS shared though — the seal_duration
+				// histogram is a global concern and we want every
+				// segment.Writer in the process recording into the same
+				// series.
+				SegmentMetrics:         o.cfg.SegmentMetrics,
+				Catalog:                o.segments(),
+				Namespace:              catalog.BootstrapLive,
+				SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
+			})
+			if err != nil {
+				return fmt.Errorf("orchestrator: re-open bootstrap-live writer for seal: %w", err)
+			}
+			if err := sealW.SealActiveAndClose(); err != nil {
+				return fmt.Errorf("orchestrator: seal bootstrap-live segment: %w", err)
+			}
 		}
 
 		o.cfg.Metrics.observeState("seal_bootstrap", time.Since(start).Seconds())
 		return nil
 	})
+}
+
+// openBootstrapWriters opens the backfill writer on main and the
+// bootstrap-live consumer on bootstrap_live: local segment files, or direct
+// mode on the shared catalog (design §10.10).
+func (o *Orchestrator) openBootstrapWriters(ctx context.Context, segmentsDir, liveSegmentsDir string) (*ingest.Writer, *live.Consumer, error) {
+	var bw *ingest.Writer
+	var err error
+	if o.cfg.Disaggregated != nil {
+		bw, err = o.openDirect(ctx, catalog.Main, o.cfg.IngestMetrics)
+	} else {
+		// Backfill writer (shared with the backfill engine).
+		bw, err = ingest.Open(ingest.Config{
+			SegmentsDir:            segmentsDir,
+			DataDir:                o.cfg.DataDir,
+			FS:                     o.cfg.FS,
+			Store:                  o.cfg.Store,
+			Logger:                 o.cfg.Logger,
+			Metrics:                o.cfg.IngestMetrics,
+			SegmentMetrics:         o.cfg.SegmentMetrics,
+			AsyncFlushWorkers:      o.cfg.BackfillAsyncFlushWorkers,
+			Catalog:                o.segments(),
+			Namespace:              catalog.Main,
+			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
+		})
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("orchestrator: open backfill ingest writer: %w", err)
+	}
+
+	// Bootstrap-time live consumer.
+	cfg := live.Config{
+		Store:             o.cfg.Store,
+		SeqKey:            live.BootstrapSeqKey,
+		CursorKey:         live.CursorKey,
+		RelayURL:          o.cfg.RelayURL,
+		Logger:            o.cfg.Logger,
+		Metrics:           o.cfg.LiveMetrics,
+		DropMetrics:       o.cfg.DropMetrics,
+		Verifier:          o.cfg.Verifier,
+		SyncStateStore:    o.cfg.SyncStateStore,
+		MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
+		MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
+		SegmentMetrics:    o.cfg.SegmentMetrics,
+		Namespace:         catalog.BootstrapLive,
+		OnEvent:           o.cfg.OnBootstrapLiveEvent,
+		ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
+		Dial:              o.cfg.LiveDial,
+	}
+	if d := o.cfg.Disaggregated; d != nil {
+		// The direct sealer applies BootstrapLiveMaxSegmentBytes.
+		cfg.Direct, err = d.Direct(ctx, catalog.BootstrapLive)
+		if err != nil {
+			err = fmt.Errorf("open direct mode in %s: %w", catalog.BootstrapLive, err)
+		}
+	} else {
+		cfg.DataDir = o.cfg.DataDir
+		cfg.SegmentsDir = liveSegmentsDir
+		cfg.FS = o.cfg.FS
+		cfg.Catalog = o.segments()
+		cfg.SegmentIOFaultInjector = o.cfg.SegmentIOFaultInjector
+	}
+	var bootstrapLive *live.Consumer
+	if err == nil {
+		bootstrapLive, err = live.Open(cfg)
+	}
+	if err != nil {
+		if cerr := bw.Close(); cerr != nil {
+			o.logger.WarnContext(ctx, "backfill writer close after bootstrap-live open failure", "err", cerr)
+		}
+		return nil, nil, fmt.Errorf("orchestrator: open bootstrap-live consumer: %w", err)
+	}
+	return bw, bootstrapLive, nil
 }

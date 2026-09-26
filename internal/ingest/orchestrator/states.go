@@ -34,13 +34,17 @@ func (o *Orchestrator) writeMergingPhase() error {
 }
 
 // writeSteadyStatePhase is commit point #2. After this call returns
-// nil, the data dir is durably in PhaseSteadyState.
+// nil, the data dir is durably in PhaseSteadyState. In disaggregated mode
+// merge's final transaction already wrote the phase, so it only records
+// the transition.
 func (o *Orchestrator) writeSteadyStatePhase() error {
-	start := time.Now()
-	if err := lifecycle.WritePhase(context.Background(), o.cfg.Store, lifecycle.PhaseSteadyState, start.UTC()); err != nil {
-		return fmt.Errorf("orchestrator: write phase=steady_state: %w", err)
+	if o.cfg.Disaggregated == nil {
+		start := time.Now()
+		if err := lifecycle.WritePhase(context.Background(), o.cfg.Store, lifecycle.PhaseSteadyState, start.UTC()); err != nil {
+			return fmt.Errorf("orchestrator: write phase=steady_state: %w", err)
+		}
+		o.cfg.Metrics.observeState("write_phase_steady", time.Since(start).Seconds())
 	}
-	o.cfg.Metrics.observeState("write_phase_steady", time.Since(start).Seconds())
 	o.cfg.Metrics.incTransition(lifecycle.PhaseMerging, lifecycle.PhaseSteadyState)
 	o.cfg.Metrics.setPhase(PhaseGaugeSteadyState)
 	return nil

@@ -42,8 +42,26 @@ func New(cfg storagefake.Config) *Backend {
 	}
 }
 
+// InitNamespaces creates segment 0 in main and bootstrap_live, under a
+// lease the call takes and releases, as `jetstream storage init` leaves a
+// new catalog.
+func (b *Backend) InitNamespaces(ctx context.Context) error {
+	lease := b.DB.NewLease()
+	if err := lease.Acquire(ctx, time.Minute); err != nil {
+		return fmt.Errorf("jetstreamdtest: acquire: %w", err)
+	}
+	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
+	sess := catalog.NewSession(catalog.SessionConfig{DB: b.DB, Epoch: lease.Epoch()})
+	for _, ns := range []catalog.Namespace{catalog.Main, catalog.BootstrapLive} {
+		if _, err := sess.InitNamespace(ctx, ns, nil); err != nil {
+			return fmt.Errorf("jetstreamdtest: init %s: %w", ns, err)
+		}
+	}
+	return nil
+}
+
 // SeedPhase initializes main and records phase p, under a lease the call
-// takes and releases, as a stage-3 bootstrap would have left the catalog.
+// takes and releases, as a finished merge leaves the catalog.
 func (b *Backend) SeedPhase(ctx context.Context, p lifecycle.Phase) error {
 	lease := b.DB.NewLease()
 	if err := lease.Acquire(ctx, time.Minute); err != nil {

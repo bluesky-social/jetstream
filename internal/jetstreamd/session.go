@@ -54,10 +54,10 @@ func (f *sessionFactory) build() (*writerSession, error) {
 	return f.buildWith(f.store, nil)
 }
 
-// buildWith builds a session over store. A non-nil hot runs the
-// orchestrator's writer in hot mode (disaggregated storage), where store is
+// buildWith builds a session over store. A non-nil disagg runs the
+// orchestrator on the shared catalog (disaggregated storage), where store is
 // the session's epoch-fenced handle.
-func (f *sessionFactory) buildWith(store metastore.Store, hot *ingest.HotConfig) (*writerSession, error) {
+func (f *sessionFactory) buildWith(store metastore.Store, disagg *orchestrator.Disaggregated) (*writerSession, error) {
 	stateStore := syncstate.New(store)
 	tombstones := tombstone.New()
 	// A new session's schedule starts unknown, so archive responses are not
@@ -83,7 +83,7 @@ func (f *sessionFactory) buildWith(store metastore.Store, hot *ingest.HotConfig)
 
 	cfg := f.orch
 	cfg.Store = store
-	cfg.Hot = hot
+	cfg.Disaggregated = disagg
 	cfg.Verifier = verifier
 	cfg.SyncStateStore = stateStore
 	cfg.Tombstones = tombstones

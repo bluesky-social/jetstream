@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd/jetstreamdtest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
@@ -102,32 +103,24 @@ func TestStorageValidate_BackendReplacesPGAndS3(t *testing.T) {
 	require.NoError(t, opts.Storage.Validate(opts))
 }
 
-// Bootstrap and merge in disaggregated mode are stage 3. Until then a
-// session on a catalog in any other phase ends the process: restarting
-// would only find the same phase again.
-func TestRunDisaggregated_RefusesNonSteadyPhase(t *testing.T) {
+// A catalog in merging without its bootstrap_live namespace cannot come from
+// any crash: merge's final transaction deletes the namespace and writes
+// steady_state together. The session fails as corruption, which ends the
+// process instead of retrying until the deadline.
+func TestRunDisaggregated_MergingWithoutBootstrapLive(t *testing.T) {
 	t.Parallel()
-	for name, phase := range map[string]lifecycle.Phase{
-		"empty":     "",
-		"bootstrap": lifecycle.PhaseBootstrap,
-		"merging":   lifecycle.PhaseMerging,
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			fake := jetstreamdtest.New(storagefake.Config{})
-			if phase != "" {
-				require.NoError(t, fake.SeedPhase(t.Context(), phase))
-			}
-			rt, err := jetstreamd.Build(t.Context(), disaggOptions(t, fake.Backend))
-			require.NoError(t, err)
-			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			defer cancel()
-			err = rt.Run(ctx)
-			require.ErrorContains(t, err, `needs phase "steady_state"`)
-			require.False(t, errors.Is(err, context.DeadlineExceeded), "the refusal is fatal, not a retry until timeout")
-			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer closeCancel()
-			require.NoError(t, rt.Close(closeCtx))
-		})
-	}
+	fake := jetstreamdtest.New(storagefake.Config{})
+	require.NoError(t, fake.SeedPhase(t.Context(), lifecycle.PhaseMerging))
+	rt, err := jetstreamd.Build(t.Context(), disaggOptions(t, fake.Backend))
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	err = rt.Run(ctx)
+	require.ErrorContains(t, err, "bootstrap_live has no segments")
+	_, corrupt := catalog.IsCorruption(err)
+	require.True(t, corrupt, "got %v", err)
+	require.False(t, errors.Is(err, context.DeadlineExceeded), "corruption is fatal, not a retry until timeout")
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	require.NoError(t, rt.Close(closeCtx))
 }

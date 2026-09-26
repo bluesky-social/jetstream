@@ -1,15 +1,18 @@
 package orchestrator
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
@@ -67,36 +70,38 @@ func TestConfig_Validate_MissingFields(t *testing.T) {
 	require.Contains(t, err.Error(), "Store")
 }
 
-func TestConfig_Validate_Hot(t *testing.T) {
+func TestConfig_Validate_Disaggregated(t *testing.T) {
 	t.Parallel()
-	cfg := validBaseConfig(t)
-	cfg.Hot, cfg.DataDir = &ingest.HotConfig{}, ""
+	valid := func() Config {
+		cfg := validBaseConfig(t)
+		cfg.DataDir = ""
+		cfg.Disaggregated = &Disaggregated{
+			Session: &catalog.Session{},
+			Direct: func(context.Context, catalog.Namespace) (*ingest.DirectConfig, error) {
+				return nil, nil
+			},
+			Hot:     func(context.Context) (*ingest.HotConfig, error) { return nil, nil },
+			Objects: nopObjects{},
+		}
+		return cfg
+	}
+	cfg := valid()
 	require.NoError(t, cfg.validate())
 
-	cfg.CompactionInterval = time.Minute
-	require.ErrorIs(t, cfg.validate(), ErrInvalidConfig)
-}
-
-// TestRun_HotRefusesNonSteadyPhase pins that disaggregated mode never starts
-// bootstrap or merge, and never writes the initial phase itself.
-func TestRun_HotRefusesNonSteadyPhase(t *testing.T) {
-	t.Parallel()
-	for _, phase := range []lifecycle.Phase{"", lifecycle.PhaseBootstrap, lifecycle.PhaseMerging} {
-		t.Run(string(phase), func(t *testing.T) {
-			t.Parallel()
-			cfg := validBaseConfig(t)
-			cfg.Hot = &ingest.HotConfig{}
-			if phase != "" {
-				require.NoError(t, lifecycle.WritePhase(t.Context(), cfg.Store, phase, time.Now()))
-			}
-			o, err := New(cfg)
-			require.NoError(t, err)
-			err = o.Run(t.Context())
-			require.ErrorContains(t, err, "disaggregated mode needs phase")
-
-			got, err := lifecycle.ReadPhase(t.Context(), cfg.Store)
-			require.NoError(t, err)
-			require.Equal(t, phase, got)
-		})
+	for name, mutate := range map[string]func(*Config){
+		"no session":            func(c *Config) { c.Disaggregated.Session = nil },
+		"no direct":             func(c *Config) { c.Disaggregated.Direct = nil },
+		"no hot":                func(c *Config) { c.Disaggregated.Hot = nil },
+		"no objects":            func(c *Config) { c.Disaggregated.Objects = nil },
+		"compaction":            func(c *Config) { c.CompactionInterval = time.Minute },
+		"async flush":           func(c *Config) { c.BackfillAsyncFlushWorkers = 2 },
+		"local segment catalog": func(c *Config) { c.Catalog = &localcatalog.Catalog{} },
+	} {
+		cfg := valid()
+		mutate(&cfg)
+		require.ErrorIs(t, cfg.validate(), ErrInvalidConfig, name)
 	}
 }
+
+// nopObjects is an objstore.Store for config validation only.
+type nopObjects struct{ objstore.Store }

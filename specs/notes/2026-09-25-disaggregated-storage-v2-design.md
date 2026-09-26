@@ -1101,6 +1101,29 @@ Each maps onto catalog operations like this:
   segment that merge left behind simply continues. Hot batches start at
   `seq/next`.
 
+As built (S3.2, S3.3; `internal/ingest/orchestrator/disagg.go`):
+
+- On a new catalog (`phase` absent), the orchestrator creates segment 0 in any
+  namespace that lacks it and writes `phase = bootstrap` in the last of those
+  transactions (§15.1).
+- Phase writes go through the leader session's fenced metadata store.
+- `main` in direct mode seals at the steady-state segment size, and
+  `bootstrap_live` at the bootstrap-live size.
+- The runtime opens the maintainer only when steady state starts. Until then a
+  direct writer owns `main`'s active segment.
+- Merge reads `bootstrap_live` from the catalog rows and the object store. It
+  loads no footers, because it needs only the blocks in order. A seal inserts
+  the next active segment, so the drain skips a trailing empty active
+  segment.
+- Merge closes its `main` writer rather than sealing it, so the hot writer
+  continues that segment.
+- Merge-tail compaction is skipped until stage 4 (D5).
+- The final transaction is `DeleteNamespace(bootstrap_live)`. It carries the
+  deletes of `live_segments/seq/next` and `merge/next_source_idx` and the phase
+  write.
+- A `merging` phase with no `bootstrap_live` segments is a corruption error,
+  because only that final transaction removes them.
+
 ## 11. Read path
 
 ### 11.1 Follower
@@ -1593,6 +1616,10 @@ data. This is accepted for now and must be measured.
 3. PUT, GET, and DELETE a probe object under
    `<prefix>/<archive_id>/probe/<uuid>` to check credentials and read-after-write.
 
+If init ends after inserting the `archive` row, running it again refuses. So
+the first leader session on a catalog with no `phase` creates any missing
+segment 0 itself (§10.10).
+
 ### 15.2 Pod start
 
 1. Load config. Check the configurable memory budgets (§17) and the GC-delay
@@ -1607,9 +1634,8 @@ data. This is accepted for now and must be measured.
    `phase = steady_state`, and all footers are loaded.
 5. Start the election loop.
 
-Until stage 3 adds disaggregated bootstrap and merge, a leader session that
-finds any phase other than `steady_state` exits the process. Restarting would
-only find the same phase again.
+The leader session runs whichever phase it finds, as local mode does
+(§10.10). Pods stay unready until the phase is `steady_state`.
 
 ### 15.3 Failover
 

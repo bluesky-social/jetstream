@@ -34,7 +34,7 @@ func TestMergeRunner_EmptySourceDir(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, refreshedCatalog(t, dataDir), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, localMergeSource{refreshedCatalog(t, dataDir)}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
 	require.NoError(t, r.run(t.Context()))
 
@@ -85,7 +85,7 @@ func TestMergeRunner_SourceIndexGap(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, refreshedCatalog(t, dataDir), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, localMergeSource{refreshedCatalog(t, dataDir)}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 	err = r.run(t.Context())
 	require.ErrorContains(t, err, "source index gap")
 }
@@ -110,7 +110,7 @@ func TestMergeRunner_DiscoveryEmptyRoster(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dst.Close() })
 
-	r := newMergeRunner(dst, st, refreshedCatalog(t, dataDir), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	r := newMergeRunner(dst, st, localMergeSource{refreshedCatalog(t, dataDir)}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		require.Equal(t, "/xrpc/com.atproto.sync.listHosts", req.URL.Path)
