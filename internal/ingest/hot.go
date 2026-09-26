@@ -544,18 +544,21 @@ func (h *hotWriter) appendBatch(ctx context.Context, events []segment.Event) err
 	return h.appendLive(ctx, len(events), func(i int) *segment.Event { return &events[i] })
 }
 
-// appendLive appends n events under one admission.
-func (h *hotWriter) appendLive(ctx context.Context, n int, at func(int) *segment.Event) error {
+// appendLive appends n events, admitting each one: a single admission for
+// the whole batch would let one large AppendBatch freeze batches far past
+// the pending and unfolded caps (rules 8 and 9).
+func (h *hotWriter) appendLive(ctx context.Context, n int, at func(int) *segment.Event) (err error) {
 	h.liveWaiting.Add(1)
 	h.mu.Lock()
 	h.liveWaiting.Add(-1)
+	defer h.endIfFailed(&err)
 	defer h.mu.Unlock()
 	// A bulk appender may be yielding to this one.
 	defer h.signalLocked()
-	if _, err := h.admitLocked(ctx, ClassLive, nil); err != nil {
-		return err
-	}
 	for i := range n {
+		if _, err := h.admitLocked(ctx, ClassLive, nil); err != nil {
+			return err
+		}
 		if err := h.appendLocked(ClassLive, at(i)); err != nil {
 			return err
 		}
@@ -593,6 +596,21 @@ func (h *hotWriter) appendLocked(class Class, ev *segment.Event) error {
 
 	candidate := *ev
 	candidate.Seq = h.nextSeq
+	// The hook runs before the event is buffered, and a hook error fails
+	// the writer: otherwise the event would still commit with its batch
+	// while the caller, told Append failed, retries it. The hook gets ev
+	// itself, since observers match rows by pointer (live.promoteMark).
+	if h.cfg.OnAppend != nil {
+		prev := ev.Seq
+		ev.Seq = candidate.Seq
+		if err := h.cfg.OnAppend(ev); err != nil {
+			ev.Seq = prev
+			h.cfg.Metrics.incAppendErrors()
+			err = fmt.Errorf("ingest: on_append: %w", err)
+			h.failLocked(err)
+			return &hookFailure{err: err}
+		}
+	}
 	// One copy serves the read log and the open block.
 	entry := catalog.NewLogEntry(&candidate)
 	blk.events = append(blk.events, *entry.Event())
@@ -604,12 +622,6 @@ func (h *hotWriter) appendLocked(class Class, ev *segment.Event) error {
 	h.cfg.Metrics.incEventsAppended()
 	h.cfg.Metrics.setNextSeq(h.nextSeq)
 	h.readLog.appendEntry(entry)
-
-	if h.cfg.OnAppend != nil {
-		if err := h.cfg.OnAppend(ev); err != nil {
-			return fmt.Errorf("ingest: on_append: %w", err)
-		}
-	}
 
 	switch {
 	case len(blk.events) >= h.cfg.MaxEventsPerBlock:
@@ -998,13 +1010,45 @@ func (h *hotWriter) failure() error {
 // the session ends (design §9.1) if the failure did not already end it.
 func (h *hotWriter) fail(err error) {
 	h.mu.Lock()
+	first := h.failLocked(err)
+	h.mu.Unlock()
+	if first {
+		h.failed(err)
+	}
+}
+
+// failLocked records err as the writer's failure, so nothing later commits.
+// It reports whether err is the first failure; the caller then runs failed
+// once mu is released.
+func (h *hotWriter) failLocked(err error) bool {
 	if h.err != nil {
-		h.mu.Unlock()
-		return
+		return false
 	}
 	h.err = err
 	h.signalLocked()
-	h.mu.Unlock()
+	return true
+}
+
+// hookFailure is appendLocked's error for a failed OnAppend hook, which
+// failLocked has already recorded. endIfFailed finishes ending the writer.
+type hookFailure struct{ err error }
+
+func (f *hookFailure) Error() string { return f.err.Error() }
+func (f *hookFailure) Unwrap() error { return f.err }
+
+// endIfFailed runs failed for an append whose hook failed. It is deferred
+// to run after mu is released: ending the session and OnFailure must not
+// hold it.
+func (h *hotWriter) endIfFailed(errp *error) {
+	var f *hookFailure
+	if errors.As(*errp, &f) {
+		*errp = f.err
+		h.failed(f.err)
+	}
+}
+
+// failed ends the session and reports a failure failLocked recorded first.
+func (h *hotWriter) failed(err error) {
 	h.cancel()
 	if serr := h.hot.Session.Err(); serr == nil {
 		_ = h.hot.Session.End("hot writer", err)

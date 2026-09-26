@@ -51,9 +51,9 @@ to its delivery through a follower's readable log.`,
 				Value: []string{"idle:10:1m", "pop1:330:3m", "load:3000:6m", "bulk:3000:0:4000000"},
 			},
 			&cli.Uint64Flag{Name: "seed", Value: 1},
-			&cli.Uint64Flag{Name: "did-universe", Value: 40_000_000, Usage: "Distinct accounts live traffic draws from"},
+			&cli.Uint64Flag{Name: "did-universe", Value: 40_000_000, Validator: atLeastOne[uint64], Usage: "Distinct accounts live traffic draws from"},
 			&cli.DurationFlag{Name: "progress", Value: 10 * time.Second, Usage: "How often to print progress within a phase"},
-			&cli.IntFlag{Name: "bulk-workers", Value: 4},
+			&cli.IntFlag{Name: "bulk-workers", Value: 4, Validator: atLeastOne[int]},
 			&cli.Int64Flag{Name: "bulk-pending-bytes", Usage: "Override JETSTREAM_HOT_BULK_PENDING_BYTES's default"},
 		},
 		Action: runWrite,
@@ -516,6 +516,9 @@ func runPhase(ctx context.Context, w *ingest.Writer, p *phaseStats, cmd *cli.Com
 					if before >= p.spec.bulk {
 						return nil
 					}
+					// The repo that crosses the target is cut short, so a
+					// phase appends exactly its bulk count.
+					n = int(min(int64(n), p.spec.bulk-before))
 					if p.spec.bulkRate > 0 {
 						due := start.Add(time.Duration(float64(before) / p.spec.bulkRate * float64(time.Second)))
 						select {

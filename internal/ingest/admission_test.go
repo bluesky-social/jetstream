@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -321,6 +322,47 @@ func TestHot_PendingCap(t *testing.T) {
 		require.Zero(t, testutil.ToFloat64(m.HotPendingBytes.WithLabelValues("live")))
 		require.NoError(t, w.Close())
 		requireTiles(t, env.rows(), 8)
+	})
+}
+
+// Rule 8 holds inside one live AppendBatch: each event is admitted, so a
+// large batch waits at the pending cap rather than freezing batches past it.
+func TestHot_LiveBatchPendingCap(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		env := newHotEnv(t)
+		gate := make(chan struct{})
+		w := env.open(Config{
+			MaxEventsPerBlock: 64,
+			// Commits stall in the hook until gate closes, so frozen
+			// batches stay pending.
+			OnDurableBatch: func(ctx context.Context, _ metastore.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				}
+				return nil, nil, nil
+			},
+			Hot: &HotConfig{
+				BlockMaxAge:    time.Hour,
+				BatchMaxEvents: 4,
+				PendingBytes:   4*sizedRaw - 1,
+			},
+		})
+		release := sync.OnceFunc(func() { close(gate) })
+		// A failed assertion must still let the bubble's goroutines exit.
+		defer func() { release(); _ = w.Close() }()
+		rng := rand.New(rand.NewPCG(12, 12))
+		done := make(chan error, 1)
+		go func() { done <- w.AppendBatch(t.Context(), sizedEvents(rng, 12)) }()
+		synctest.Wait()
+		require.Equal(t, uint64(5), w.NextSeq(), "one frozen batch fills the cap; the rest wait")
+
+		release()
+		require.NoError(t, <-done)
+		require.NoError(t, w.Close())
+		requireTiles(t, env.rows(), 13)
 	})
 }
 

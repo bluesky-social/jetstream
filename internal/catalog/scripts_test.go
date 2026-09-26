@@ -246,6 +246,24 @@ func requireCorruption(t *testing.T, err error, source string) {
 	require.True(t, sf.SessionFatal(), "corruption must exit the process")
 }
 
+// An absent seq counter is 1; a stored 0 is corruption, not a fresh
+// namespace, so a damaged seq/next cannot restart allocation at 1.
+func TestDecodeSeq(t *testing.T) {
+	t.Parallel()
+	n, err := catalog.DecodeSeq(catalog.MainSeqKey, nil, false)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), n)
+	n, err = catalog.DecodeSeq(catalog.MainSeqKey, catalog.EncodeSeq(7), true)
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), n)
+	for _, val := range [][]byte{catalog.EncodeSeq(0), {1, 2, 3}} {
+		_, err = catalog.DecodeSeq(catalog.MainSeqKey, val, true)
+		src, ok := catalog.IsCorruption(err)
+		require.True(t, ok, "%x: %v", val, err)
+		require.Equal(t, catalog.SourceMeta, src)
+	}
+}
+
 func TestScripts_HappyPath(t *testing.T) {
 	t.Parallel()
 	eachBackend(t, func(t *testing.T, be backend) {

@@ -41,7 +41,9 @@ func EncodeSeq(v uint64) []byte {
 }
 
 // DecodeSeq decodes a stored seq counter. An absent key is 1: seqs start at
-// 1, as in the local writer.
+// 1, as in the local writer. A stored 0 is corruption: every catalog write
+// stores a counter past a committed seq. (The local writer floors a stored 0
+// to 1 only because a pre-seed pebble build could have written one.)
 func DecodeSeq(key string, val []byte, found bool) (uint64, error) {
 	if !found {
 		return 1, nil
@@ -49,7 +51,11 @@ func DecodeSeq(key string, val []byte, found bool) (uint64, error) {
 	if len(val) != 8 {
 		return 0, Corruptf(SourceMeta, "%s has length %d, want 8", key, len(val))
 	}
-	return max(binary.LittleEndian.Uint64(val), 1), nil
+	n := binary.LittleEndian.Uint64(val)
+	if n == 0 {
+		return 0, Corruptf(SourceMeta, "%s is 0", key)
+	}
+	return n, nil
 }
 
 // SessionConfig configures a Session.

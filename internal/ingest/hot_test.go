@@ -857,3 +857,52 @@ func TestHot_ConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+// A failed OnAppend hook fails the writer before the event is buffered: the
+// event never commits, its Seq is untouched, the session ends, and later
+// appends fail. Otherwise the caller, told Append failed, would retry an
+// event that still commits with its batch.
+func TestHot_OnAppendFailure(t *testing.T) {
+	t.Parallel()
+	for _, class := range []Class{ClassLive, ClassBulk} {
+		t.Run(fmt.Sprint(class), func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				env := newHotEnv(t)
+				boom := errors.New("boom")
+				var fail atomic.Bool
+				var failures atomic.Int32
+				w := env.open(Config{
+					MaxEventsPerBlock: 64,
+					OnAppend: func(*segment.Event) error {
+						if fail.Load() {
+							return boom
+						}
+						return nil
+					},
+					Hot: &HotConfig{BlockMaxAge: time.Hour, OnFailure: func(error) { failures.Add(1) }},
+				})
+				ctx := WithClass(t.Context(), class)
+				rng := rand.New(rand.NewPCG(20, uint64(class)))
+				require.NoError(t, w.AppendBatch(ctx, sizedEvents(rng, 2)))
+				require.NoError(t, w.Flush(ctx))
+
+				fail.Store(true)
+				evs := sizedEvents(rng, 2)
+				require.ErrorIs(t, w.AppendBatch(ctx, evs), boom)
+				require.Zero(t, evs[0].Seq)
+				require.Zero(t, evs[1].Seq)
+				require.Equal(t, uint64(3), w.NextSeq())
+				require.ErrorIs(t, env.s.Err(), boom)
+				require.Equal(t, int32(1), failures.Load())
+
+				fail.Store(false)
+				ev := sizedEvent(rng)
+				require.ErrorIs(t, w.Append(ctx, &ev), boom)
+				require.ErrorIs(t, w.Close(), boom)
+				require.Equal(t, int32(1), failures.Load(), "the writer fails once")
+				requireTiles(t, env.rows(), 3)
+			})
+		})
+	}
+}

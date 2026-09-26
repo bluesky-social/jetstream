@@ -17,7 +17,7 @@ func calibrateCommand() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.IntFlag{Name: "blocks", Value: 16},
 			&cli.Uint64Flag{Name: "seed", Value: 1},
-			&cli.Uint64Flag{Name: "did-universe", Value: 40_000_000},
+			&cli.Uint64Flag{Name: "did-universe", Value: 40_000_000, Validator: atLeastOne[uint64]},
 		},
 		Action: runCalibrate,
 	}

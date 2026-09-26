@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/binary"
+	"fmt"
 	"math/rand/v2"
 	"strings"
 	"time"
@@ -82,6 +83,16 @@ func newGenerator(seed, universe uint64) *generator {
 		g.cum = append(g.cum, total)
 	}
 	return g
+}
+
+// atLeastOne validates a count flag that must be positive: a zero DID
+// universe panics the generator, and zero bulk workers never finish a bulk
+// phase.
+func atLeastOne[T int | uint64](v T) error {
+	if v < 1 {
+		return fmt.Errorf("must be at least 1, got %d", v)
+	}
+	return nil
 }
 
 func (g *generator) did() string {

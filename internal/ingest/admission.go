@@ -34,8 +34,9 @@ import (
 
 // appendBulk appends events as bulk chunks: at most BulkChunkMaxEvents, and
 // never past the open block.
-func (h *hotWriter) appendBulk(ctx context.Context, events []segment.Event) error {
+func (h *hotWriter) appendBulk(ctx context.Context, events []segment.Event) (err error) {
 	h.mu.Lock()
+	defer h.endIfFailed(&err)
 	defer h.mu.Unlock()
 	for len(events) > 0 {
 		n, err := h.admitLocked(ctx, ClassBulk, events)

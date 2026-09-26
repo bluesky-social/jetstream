@@ -115,7 +115,9 @@ type Config struct {
 
 	// OnAppend runs under the writer mutex after seq assignment and
 	// before any flush or seal. Observers therefore see every event
-	// before a sealed header can expose its seq. An error fails Append.
+	// before a sealed header can expose its seq. An error fails Append;
+	// in hot mode it also fails the writer before the event is buffered,
+	// so the event never commits.
 	// The hook runs per event: keep it cheap and do not call Writer
 	// methods.
 	OnAppend func(ev *segment.Event) error

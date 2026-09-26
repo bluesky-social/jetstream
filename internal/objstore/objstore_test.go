@@ -84,19 +84,27 @@ func TestProbe(t *testing.T) {
 	require.Empty(t, b.Keys(), "the probe object is deleted")
 
 	for _, tc := range []struct {
-		op   memblob.Op
-		kind memblob.FaultKind
-		want string
+		op       memblob.Op
+		kind     memblob.FaultKind
+		want     string
+		leftover bool
 	}{
-		{memblob.OpPut, memblob.FaultError, "probe put"},
-		{memblob.OpPut, memblob.FaultDropPut, "probe get"},
-		{memblob.OpGet, memblob.FaultError, "probe get"},
-		{memblob.OpGet, memblob.FaultWrongBytes, "differ"},
-		{memblob.OpDelete, memblob.FaultError, "probe delete"},
+		{memblob.OpPut, memblob.FaultError, "probe put", false},
+		{memblob.OpPut, memblob.FaultDropPut, "probe get", false},
+		{memblob.OpGet, memblob.FaultError, "probe get", false},
+		{memblob.OpGet, memblob.FaultWrongBytes, "differ", false},
+		{memblob.OpDelete, memblob.FaultError, "probe delete", true},
 	} {
 		b := memblob.New(memblob.WithFaultInjector(&memblob.KeyPrefixFault{Prefix: prefix, Op: tc.op, Kind: tc.kind, Ordinal: 1}))
 		err := objstore.Probe(t.Context(), b, archive)
 		require.ErrorContains(t, err, tc.want, "%s %s", tc.op, tc.kind)
 		require.Contains(t, err.Error(), prefix, "the error names the key")
+		// No catalog row references a probe object, so a failed probe
+		// must not leave one for GC to miss.
+		if tc.leftover {
+			require.Len(t, b.Keys(), 1, "%s %s", tc.op, tc.kind)
+		} else {
+			require.Empty(t, b.Keys(), "%s %s: the probe object is deleted", tc.op, tc.kind)
+		}
 	}
 }
