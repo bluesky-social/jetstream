@@ -55,3 +55,10 @@ naming the failure mode (not the test).
   load parked in `storagefake.Seeded` kept `synctest.Wait` from returning,
   and the child hung. Fixed by making the fake's meta reads skip the
   scheduler.
+- [2026-09-26 — a pipelined save hides an earlier event's chain state](2026-09-26-disagg-pipelined-chain-state-hidden.md):
+  found by the S3.5 lifecycle harness. The atmos verifier saves a DID's
+  state for a later event before the earlier event's rows are appended, and
+  the syncstate store kept one pending entry per DID, so the earlier
+  event's promotion made nothing durable. After a crash the successor
+  resynced needlessly or archived an event twice. Fixed with an ordered
+  pending queue per DID.

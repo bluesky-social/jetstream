@@ -1,6 +1,7 @@
 package syncstate
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -106,6 +107,92 @@ func TestStateStore_PromoteChainRevGate(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, durable)
 	require.Equal(t, "3lrev2", durable.Rev)
+}
+
+// The verifier runs ahead of the appends: it saves a later commit's state
+// before the earlier commit's rows land. Promoting the earlier commit must
+// make its own state durable. Were it to wait for the later commit, a batch
+// could commit the earlier rows and a cursor past them with the DID's state
+// still older, and after a crash the redelivered commit would verify against
+// that older state and be archived twice.
+func TestStateStore_PipelinedSavesPromoteEach(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
+	fresh := New(raw)
+	durableRev := func() string {
+		t.Helper()
+		got, err := fresh.LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		if got == nil {
+			return ""
+		}
+		return got.Rev
+	}
+
+	for _, rev := range []string{"3lrev1", "3lrev2", "3lrev3"} {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+	}
+	live, err := s.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev3", live.Rev, "the verifier reads its newest save")
+
+	s.PromoteChain(did, "3lrev1")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev1", durableRev())
+
+	// A promotion past several entries makes the newest of them durable.
+	s.PromoteChain(did, "3lrev3")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev3", durableRev())
+	s.PromoteChain(did, "3lrev2")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev3", durableRev(), "a superseded entry is gone")
+
+	// A save at or below a queued rev supersedes it.
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev5", Data: fixedCID(t)}))
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev4", Data: fixedCID(t)}))
+	s.PromoteChain(did, "3lrev5")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev4", durableRev())
+}
+
+func TestStateStore_PipelinedHostingPromotesEach(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:ffffffffffffffffffffffff")
+	older := atmossync.HostingState{Active: false, Status: "takendown", Seq: 10}
+	newer := atmossync.HostingState{Active: true, Seq: 11}
+	require.NoError(t, s.SaveHosting(t.Context(), did, older))
+	require.NoError(t, s.SaveHosting(t.Context(), did, newer))
+
+	s.PromoteHosting(did, 10)
+	require.NoError(t, flush(t, s))
+	durable, err := New(raw).LoadHosting(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, older, *durable)
+	live, err := s.LoadHosting(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, newer, *live, "the newer event stays pending")
+}
+
+// A DID whose events verify but never append cannot grow its queue without
+// bound; the newest entries survive.
+func TestStateStore_PendingQueueIsBounded(t *testing.T) {
+	t.Parallel()
+	s := New(newTestStore(t))
+	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
+	for i := range 3 * maxPendingPerDID {
+		rev := fmt.Sprintf("3lrev%04d", i)
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+	}
+	require.Len(t, s.pendingChain[did], maxPendingPerDID)
+	last := fmt.Sprintf("3lrev%04d", 3*maxPendingPerDID-1)
+	require.Equal(t, last, s.pendingChain[did][maxPendingPerDID-1].key)
+	s.PromoteChain(did, last)
+	require.Empty(t, s.pendingChain)
 }
 
 func TestStateStore_HostingRoundTrip(t *testing.T) {

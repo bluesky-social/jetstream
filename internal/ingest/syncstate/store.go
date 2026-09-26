@@ -2,6 +2,7 @@ package syncstate
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -37,12 +38,20 @@ const (
 // promotion uses the source account event's upstream seq. A later pipelined
 // event stays pending until its own rows are appended, and a replayed account
 // row cannot promote newer state.
+//
+// The verifier runs ahead of the appends, so a DID can have several verified
+// events in flight. Each keeps its own pending entry: an event's promotion
+// must make exactly its own state durable. With one entry per DID, a later
+// event's save hid the earlier event's state, so a batch could commit the
+// earlier event's rows and a cursor past it with the DID's state still older.
+// After a crash, redelivery then archived the event twice, or the next commit
+// chain-broke into a needless resync.
 type StateStore struct {
 	s  metastore.Store
 	mu sync.Mutex
 
-	pendingChain   map[atmos.DID]pendingChainState
-	pendingHosting map[atmos.DID]pendingHostingState
+	pendingChain   map[atmos.DID][]pending[string]
+	pendingHosting map[atmos.DID][]pending[int64]
 
 	promotedChain   map[atmos.DID][]byte
 	promotedHosting map[atmos.DID][]byte
@@ -86,14 +95,62 @@ type StateStore struct {
 	failed *Snapshot
 }
 
-type pendingChainState struct {
+// pending is one verified but unpromoted state: the chain state after a
+// commit (key is its rev) or the hosting state after an account event (key is
+// its upstream seq). A DID's entries are oldest first with increasing keys.
+type pending[K cmp.Ordered] struct {
 	buf []byte
-	rev string
+	key K
 }
 
-type pendingHostingState struct {
-	buf []byte
-	seq int64
+// maxPendingPerDID bounds a DID's queue. The verifier cannot run far ahead of
+// the appends, so it is reached only when events verify but never append
+// (malformed after verification, say) and no later event promotes past them.
+// Dropping the oldest then loses only that entry's promotion, which leaves
+// durable state older than the archive: a chain break and resync, not a lost
+// or duplicated event.
+const maxPendingPerDID = 64
+
+// savePending queues e as did's newest pending state. Entries at or above
+// e's key are superseded: the verifier's view of the DID moved back.
+func savePending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, e pending[K]) {
+	q := m[did]
+	for len(q) > 0 && q[len(q)-1].key >= e.key {
+		q = q[:len(q)-1]
+	}
+	if len(q) >= maxPendingPerDID {
+		q = append(q[:0], q[len(q)-maxPendingPerDID+1:]...)
+	}
+	m[did] = append(q, e)
+}
+
+// latestPending returns did's newest pending state.
+func latestPending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID) ([]byte, bool) {
+	q := m[did]
+	if len(q) == 0 {
+		return nil, false
+	}
+	return q[len(q)-1].buf, true
+}
+
+// takePending removes and returns did's newest pending state whose key is at
+// most max, with every older one, which it supersedes.
+func takePending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, max K) ([]byte, bool) {
+	q := m[did]
+	i := len(q) - 1
+	for i >= 0 && q[i].key > max {
+		i--
+	}
+	if i < 0 {
+		return nil, false
+	}
+	buf := q[i].buf
+	if i == len(q)-1 {
+		delete(m, did)
+	} else {
+		m[did] = q[i+1:]
+	}
+	return buf, true
 }
 
 // New returns a StateStore that stores chain and hosting state in s under the
@@ -101,8 +158,8 @@ type pendingHostingState struct {
 func New(s metastore.Store) *StateStore {
 	p := &StateStore{
 		s:               s,
-		pendingChain:    make(map[atmos.DID]pendingChainState),
-		pendingHosting:  make(map[atmos.DID]pendingHostingState),
+		pendingChain:    make(map[atmos.DID][]pending[string]),
+		pendingHosting:  make(map[atmos.DID][]pending[int64]),
 		promotedChain:   make(map[atmos.DID][]byte),
 		promotedHosting: make(map[atmos.DID][]byte),
 		promotedIdent:   make(map[atmos.DID]int64),
@@ -146,8 +203,8 @@ func acctKey(did atmos.DID) []byte {
 func (p *StateStore) LoadChain(ctx context.Context, did atmos.DID) (*atmossync.ChainState, error) {
 	p.mu.Lock()
 	var buf []byte
-	if pending, ok := p.pendingChain[did]; ok {
-		buf = append([]byte(nil), pending.buf...)
+	if pending, ok := latestPending(p.pendingChain, did); ok {
+		buf = append([]byte(nil), pending...)
 	} else if promoted, ok := p.promotedChain[did]; ok {
 		buf = append([]byte(nil), promoted...)
 	}
@@ -181,7 +238,7 @@ func (p *StateStore) SaveChain(_ context.Context, did atmos.DID, state atmossync
 		return fmt.Errorf("syncstate: save chain %s: %w", did, err)
 	}
 	p.mu.Lock()
-	p.pendingChain[did] = pendingChainState{buf: append([]byte(nil), buf...), rev: state.Rev}
+	savePending(p.pendingChain, did, pending[string]{buf: append([]byte(nil), buf...), key: state.Rev})
 	p.mu.Unlock()
 	return nil
 }
@@ -189,8 +246,8 @@ func (p *StateStore) SaveChain(_ context.Context, did atmos.DID, state atmossync
 func (p *StateStore) LoadHosting(ctx context.Context, did atmos.DID) (*atmossync.HostingState, error) {
 	p.mu.Lock()
 	var buf []byte
-	if pending, ok := p.pendingHosting[did]; ok {
-		buf = append([]byte(nil), pending.buf...)
+	if pending, ok := latestPending(p.pendingHosting, did); ok {
+		buf = append([]byte(nil), pending...)
 	} else if promoted, ok := p.promotedHosting[did]; ok {
 		buf = append([]byte(nil), promoted...)
 	}
@@ -257,7 +314,7 @@ func (p *StateStore) SaveHosting(_ context.Context, did atmos.DID, state atmossy
 		return fmt.Errorf("syncstate: save hosting %s: %w", did, err)
 	}
 	p.mu.Lock()
-	p.pendingHosting[did] = pendingHostingState{buf: append([]byte(nil), buf...), seq: state.Seq}
+	savePending(p.pendingHosting, did, pending[int64]{buf: append([]byte(nil), buf...), key: state.Seq})
 	p.mu.Unlock()
 	return nil
 }
@@ -350,25 +407,24 @@ func (p *StateStore) RecordAccountSeq(did atmos.DID, seq int64) {
 	p.unsnappedAccount[did] = seq
 }
 
-// PromoteChain marks the pending chain entry for did as flushable iff
-// its rev is <= maxRev — i.e. it was produced by the upstream event
-// whose rows the caller just finished appending (or an earlier one).
-// A pending entry with a newer rev belongs to a later pipelined event
-// whose rows have not landed yet; it stays pending.
+// PromoteChain marks the newest pending chain entry for did with rev <=
+// maxRev as flushable — the one produced by the upstream event whose rows
+// the caller just finished appending (or an earlier one) — and drops the
+// older entries it supersedes. Entries with a newer rev belong to later
+// pipelined events whose rows have not landed yet; they stay pending.
 func (p *StateStore) PromoteChain(did atmos.DID, maxRev string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pending, ok := p.pendingChain[did]
-	if !ok || pending.rev > maxRev {
+	buf, ok := takePending(p.pendingChain, did, maxRev)
+	if !ok {
 		return
 	}
-	p.promotedChain[did] = pending.buf
-	p.unsnappedChain[did] = pending.buf
-	delete(p.pendingChain, did)
+	p.promotedChain[did] = buf
+	p.unsnappedChain[did] = buf
 }
 
-// PromoteHosting marks the pending hosting entry for did as flushable
-// iff its source #account event seq is <= maxSeq — i.e. the archived
+// PromoteHosting marks the newest pending hosting entry for did whose
+// source #account event seq is <= maxSeq as flushable — i.e. the archived
 // KindAccount row the caller just appended (UpstreamRelayCursor) is
 // the event that produced it, or a later one. A redelivered account
 // row (which the verifier replay-drops without re-staging) carries an
@@ -376,13 +432,12 @@ func (p *StateStore) PromoteChain(did atmos.DID, maxRev string) {
 func (p *StateStore) PromoteHosting(did atmos.DID, maxSeq int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pending, ok := p.pendingHosting[did]
-	if !ok || pending.seq > maxSeq {
+	buf, ok := takePending(p.pendingHosting, did, maxSeq)
+	if !ok {
 		return
 	}
-	p.promotedHosting[did] = pending.buf
-	p.unsnappedHosting[did] = pending.buf
-	delete(p.pendingHosting, did)
+	p.promotedHosting[did] = buf
+	p.unsnappedHosting[did] = buf
 }
 
 // Snapshot is the state promoted between two instants, for a later
