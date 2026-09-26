@@ -133,3 +133,22 @@ func TestFaultsCountIndependently(t *testing.T) {
 	require.ErrorIs(t, b.PutKey(ctx, "b", []byte("x")), errSecond)
 	require.NoError(t, b.PutKey(ctx, "c", []byte("x")))
 }
+
+// TestUnfaulted checks that the view shares the objects both ways but never
+// consults, or advances, the fault schedule.
+func TestUnfaulted(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	b := memblob.New(memblob.WithFaultInjector(&memblob.KeyPrefixFault{Ordinal: 1, Err: errInjected}))
+	u := b.Unfaulted()
+	require.NoError(t, u.PutKey(ctx, "k", []byte("x")))
+	got, err := u.GetKey(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, []byte("x"), got)
+	require.Equal(t, []string{"k"}, b.Keys(), "the view writes through")
+
+	_, err = b.GetKey(ctx, "k")
+	require.ErrorIs(t, err, errInjected, "the view's ops did not count toward the ordinal")
+	require.NoError(t, u.DeleteKey(ctx, "k"))
+	require.Empty(t, b.Keys())
+}

@@ -1159,7 +1159,7 @@ Design §12, §13, and §26 stage 4.
   - This is backend-neutral code over `catalog.Tx` (D1).
   - Metrics: `jetstream_objects{state}`, `jetstream_gc_deleted_total`, and
     `jetstream_gc_run_duration_seconds`.
-- [ ] **S4.4 Layer 3 with compaction and GC** (M). Deps: S4.2, S4.3.
+- [x] **S4.4 Layer 3 with compaction and GC** (M). Deps: S4.2, S4.3.
   - Turn on compaction and GC in the disaggregated oracle, and switch it to the
     compacted-model checks (`assertCompacted`, fold convergence via the
     client).
@@ -1266,6 +1266,46 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S4.4 (2026-09-26): Layer 3 with compaction and GC.**
+  - Every pod runs delete compaction (2s interval, tombstone cap 4, so a
+    pass has several chunks) and GC (1s interval, a 15s delay) on the fake
+    clock. The code is in `internal/oracle/disagg_compaction_test.go`.
+  - Deviation from the task's wording: compaction removes rows, so the
+    model checks do not run on the catalog alone. The harness keeps an
+    archive union: every `main` row it has read, by seq. The leader's
+    `OnBeforeCompactionPass` hook reads the catalog before each pass, so the
+    union always has a row before any pass can drop it. Streams and
+    archives are checked against the union with the drop rule over
+    (floor, W]. Once W reaches `main`'s tip, `main` and a fresh client
+    download from each live pod must hold exactly the rows the rule keeps
+    (the `assertCompacted` analog, `CheckCompacted`) and fold to what the
+    union folds to (`CheckFoldConvergence`).
+  - A held reader, with its own follower, reads each replaced generation
+    again just before `GC_DELAY` runs out and requires the rows the union
+    has. At the end, GC must have collected every unreferenced object, and
+    the object store must hold exactly the referenced keys.
+  - Faults: the leader is killed after a rewrite's upload, after its
+    publish, after a chunk's watermark, and after each GC step. The short
+    plan picks one per seed and the full plan runs all six.
+  - Production bug found: the held reader's follower ticks rarely, and it
+    stopped with "storage corruption" when a seal and a compaction pass
+    both happened between two of its ticks. `feed` now allows holes inside
+    a sealed ref's envelope, and `FollowerLog.Skip` leaves those seqs
+    vacant in the readable log. Design §11.1 and §11.4 record it; the diary
+    entry is `specs/oracle/2026-09-26-disagg-follower-compaction-hole.md`.
+  - Added:
+    - `jetstreamd.Options.GCDelayMargin` is test-only. It shrinks the
+      clock-skew margin `CheckGCDelay` requires; the default is
+      `xrpcapi.DefaultGCDelayMargin`, 10m (design §11.7).
+    - `storagefake.DB.Observer` gives the harness reads that no fault can
+      hit. `DB.AllObjects` lists unreferenced rows too.
+    - `memblob.Blob.Unfaulted` gives the same kind of fault-free view for
+      the object store.
+    - `catalog.Snapshot.ReferencedObjects` is now exported.
+  - Runs: seeds 1–12 short and 1–16 full pass, all six faults fire in each
+    full seed, and an 8-seed race sweep passes. Seed 1 short does 4 passes
+    and leaves 99 of 133 rows in `main`.
 
 - **S4.3 (2026-09-26): GC.**
   - `protocol.Collector` (`internal/objstore/protocol/gc.go`) runs one design

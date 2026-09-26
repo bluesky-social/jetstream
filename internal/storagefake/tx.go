@@ -743,7 +743,7 @@ func (t *tx) Commit(ctx context.Context) error {
 		t.finish()
 		return nil
 	}
-	f := t.db.commitFault(t.kind)
+	f := t.db.commitFault(t.cl, t.kind)
 	if f != nil && f.Kind == FaultCommitFails {
 		t.finish()
 		return fmt.Errorf("storagefake: injected commit failure (%s)", f)

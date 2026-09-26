@@ -62,3 +62,8 @@ naming the failure mode (not the test).
   event's promotion made nothing durable. After a crash the successor
   resynced needlessly or archived an event twice. Fixed with an ordered
   pending queue per DID.
+- [2026-09-26 — a follower behind a compaction pass reports corruption](2026-09-26-disagg-follower-compaction-hole.md):
+  found by the S4.4 held reader. A follower whose last tick predates a seal
+  and a compaction pass read a sealed block missing seqs, called it storage
+  corruption, and stopped. Fixed by allowing holes inside sealed refs'
+  envelopes and leaving those seqs vacant in the readable log.

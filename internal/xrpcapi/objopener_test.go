@@ -406,8 +406,10 @@ func emptyPlanSource(t *testing.T) SegmentSource {
 func TestCheckGCDelay(t *testing.T) {
 	t.Parallel()
 	const viewAge, resp = 30 * time.Second, time.Hour
-	require.NoError(t, CheckGCDelay(6*time.Hour, viewAge, resp))
-	require.NoError(t, CheckGCDelay(viewAge+resp+10*time.Minute+time.Second, viewAge, resp))
-	require.Error(t, CheckGCDelay(viewAge+resp+10*time.Minute, viewAge, resp), "the bound is strict")
-	require.ErrorContains(t, CheckGCDelay(time.Hour, viewAge, resp), "GC delay 1h0m0s")
+	require.NoError(t, CheckGCDelay(6*time.Hour, viewAge, resp, 0))
+	require.NoError(t, CheckGCDelay(viewAge+resp+10*time.Minute+time.Second, viewAge, resp, 0))
+	require.Error(t, CheckGCDelay(viewAge+resp+10*time.Minute, viewAge, resp, 0), "the bound is strict")
+	require.ErrorContains(t, CheckGCDelay(time.Hour, viewAge, resp, 0), "GC delay 1h0m0s")
+	require.NoError(t, CheckGCDelay(viewAge+resp+2*time.Second, viewAge, resp, time.Second), "a smaller margin")
+	require.Error(t, CheckGCDelay(viewAge+resp+time.Second, viewAge, resp, time.Second))
 }

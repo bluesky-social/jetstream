@@ -76,7 +76,7 @@ func LoadSnapshotFrames(ctx context.Context, rtx ReadTx, framesFrom uint64) (*Sn
 	if s.HotBatches, err = rtx.HotBatches(ctx, framesFrom); err != nil {
 		return nil, err
 	}
-	objs, err := rtx.Objects(ctx, s.referencedObjects())
+	objs, err := rtx.Objects(ctx, s.ReferencedObjects())
 	if err != nil {
 		return nil, err
 	}
@@ -94,9 +94,9 @@ func LoadSnapshotFrames(ctx context.Context, rtx ReadTx, framesFrom uint64) (*Sn
 	return s, nil
 }
 
-// referencedObjects lists every object ID a catalog row references, sorted
+// ReferencedObjects lists every object ID a catalog row references, sorted
 // and deduplicated.
-func (s *Snapshot) referencedObjects() []uint64 {
+func (s *Snapshot) ReferencedObjects() []uint64 {
 	var ids []uint64
 	for _, g := range s.Generations {
 		ids = append(ids, g.FooterObjectID)
@@ -157,7 +157,7 @@ func CheckInvariants(s *Snapshot, opts InvariantOptions) error {
 
 // checkObjects is invariant 4: every referenced object is available.
 func checkObjects(s *Snapshot) error {
-	for _, id := range s.referencedObjects() {
+	for _, id := range s.ReferencedObjects() {
 		o, ok := s.Objects[id]
 		if !ok {
 			return Corruptf(SourceInvariant, "invariant 4: referenced object %d has no row", id)

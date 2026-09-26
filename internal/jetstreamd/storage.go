@@ -70,9 +70,7 @@ type StorageConfig struct {
 
 	// ObjectCacheBytes bounds the compressed object cache (§17).
 	ObjectCacheBytes int64
-	// CompactionMemoryBytes bounds the compaction working set (§17). It is
-	// declared now so the variable is not rejected; compaction is refused in
-	// disaggregated mode until stage 4.
+	// CompactionMemoryBytes bounds the compaction working set (§17).
 	CompactionMemoryBytes int64
 }
 

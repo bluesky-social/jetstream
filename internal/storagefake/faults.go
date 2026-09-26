@@ -110,11 +110,17 @@ func (db *DB) match(txKind catalog.TxKind, kinds ...FaultKind) *Fault {
 
 // armConnLost returns the connection-loss fault a new transaction carries,
 // if any. It fires later, when the transaction reaches the statement.
-func (db *DB) armConnLost(kind catalog.TxKind) *Fault {
+func (db *DB) armConnLost(cl *Client, kind catalog.TxKind) *Fault {
+	if cl.exempt() {
+		return nil
+	}
 	return db.match(kind, FaultConnLost)
 }
 
-func (db *DB) slowRead() time.Duration {
+func (db *DB) slowRead(cl *Client) time.Duration {
+	if cl.exempt() {
+		return 0
+	}
 	f := db.match("", FaultSlowRead)
 	if f == nil {
 		return 0
@@ -123,7 +129,10 @@ func (db *DB) slowRead() time.Duration {
 	return f.Delay
 }
 
-func (db *DB) commitFault(kind catalog.TxKind) *Fault {
+func (db *DB) commitFault(cl *Client, kind catalog.TxKind) *Fault {
+	if cl.exempt() {
+		return nil
+	}
 	f := db.match(kind, FaultCommitFails, FaultCommitLost, FaultNotifyLost)
 	if f != nil {
 		f.fired.Add(1)

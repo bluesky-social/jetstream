@@ -17,7 +17,11 @@ import (
 // Blob is an in-memory objstore.Blob. The zero value is not usable; call New.
 type Blob struct {
 	faults FaultInjector
+	// st is shared with every Unfaulted view.
+	st *state
+}
 
+type state struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 }
@@ -39,11 +43,18 @@ func WithFaultInjector(f FaultInjector) Option {
 
 // New returns an empty Blob.
 func New(opts ...Option) *Blob {
-	b := &Blob{objects: make(map[string][]byte)}
+	b := &Blob{st: &state{objects: make(map[string][]byte)}}
 	for _, o := range opts {
 		o(b)
 	}
 	return b
+}
+
+// Unfaulted returns a view of b's objects that never consults the fault
+// injector, for a test harness's own reads and checks: they must not take a
+// fault meant for the code under test.
+func (b *Blob) Unfaulted() *Blob {
+	return &Blob{st: b.st}
 }
 
 // PutKey implements objstore.Blob.
@@ -66,9 +77,9 @@ func (b *Blob) PutKey(ctx context.Context, key string, data []byte) error {
 	if kind == FaultWrongBytes {
 		stored = corrupt(stored)
 	}
-	b.mu.Lock()
-	b.objects[key] = stored
-	b.mu.Unlock()
+	b.st.mu.Lock()
+	b.st.objects[key] = stored
+	b.st.mu.Unlock()
 	if kind == FaultErrorAfter {
 		return ferr
 	}
@@ -84,9 +95,9 @@ func (b *Blob) GetKey(ctx context.Context, key string) ([]byte, error) {
 	if kind == FaultError {
 		return nil, ferr
 	}
-	b.mu.Lock()
-	data, ok := b.objects[key]
-	b.mu.Unlock()
+	b.st.mu.Lock()
+	data, ok := b.st.objects[key]
+	b.st.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("memblob: get %q: %w", key, objstore.ErrNotFound)
 	}
@@ -108,9 +119,9 @@ func (b *Blob) GetKeyRange(ctx context.Context, key string, off, n int64) ([]byt
 	if kind == FaultError {
 		return nil, ferr
 	}
-	b.mu.Lock()
-	data, ok := b.objects[key]
-	b.mu.Unlock()
+	b.st.mu.Lock()
+	data, ok := b.st.objects[key]
+	b.st.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("memblob: get range %q: %w", key, objstore.ErrNotFound)
 	}
@@ -134,9 +145,9 @@ func (b *Blob) DeleteKey(ctx context.Context, key string) error {
 	if kind == FaultError {
 		return ferr
 	}
-	b.mu.Lock()
-	delete(b.objects, key)
-	b.mu.Unlock()
+	b.st.mu.Lock()
+	delete(b.st.objects, key)
+	b.st.mu.Unlock()
 	if kind == FaultErrorAfter {
 		return ferr
 	}
@@ -146,12 +157,12 @@ func (b *Blob) DeleteKey(ctx context.Context, key string) error {
 // Keys returns every stored key in sorted order, so a test can check for
 // leaked or prematurely deleted objects.
 func (b *Blob) Keys() []string {
-	b.mu.Lock()
-	keys := make([]string, 0, len(b.objects))
-	for k := range b.objects {
+	b.st.mu.Lock()
+	keys := make([]string, 0, len(b.st.objects))
+	for k := range b.st.objects {
 		keys = append(keys, k)
 	}
-	b.mu.Unlock()
+	b.st.mu.Unlock()
 	slices.Sort(keys)
 	return keys
 }

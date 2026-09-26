@@ -38,13 +38,19 @@ type SeqSyncer interface {
 // response in disaggregated mode (JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION).
 const DefaultMaxArchiveResponseDuration = time.Hour
 
+// DefaultGCDelayMargin is CheckGCDelay's allowance for clock skew between
+// pods and the catalog, and for scheduling delays.
+const DefaultGCDelayMargin = 10 * time.Minute
+
 // CheckGCDelay reports whether GC_DELAY outlives every reader of a replaced
-// generation's objects (design §11.5): a pod may serve a view up to
+// generation's objects (design §11.7): a pod may serve a view up to
 // maxViewAge old, and an open response may read from it for up to
 // maxResponse more, so objects must survive both plus a margin for clock
-// skew and scheduling.
-func CheckGCDelay(gcDelay, maxViewAge, maxResponse time.Duration) error {
-	const margin = 10 * time.Minute
+// skew and scheduling. Zero margin means DefaultGCDelayMargin.
+func CheckGCDelay(gcDelay, maxViewAge, maxResponse, margin time.Duration) error {
+	if margin <= 0 {
+		margin = DefaultGCDelayMargin
+	}
 	if need := maxViewAge + maxResponse + margin; gcDelay <= need {
 		return fmt.Errorf("GC delay %s must exceed max view age %s + max archive response duration %s + %s",
 			gcDelay, maxViewAge, maxResponse, margin)
@@ -133,7 +139,7 @@ func (s *Server) Handler() http.Handler {
 // responseDeadline bounds a response to d when d is positive: ctx ends, so
 // object reads stop, and the connection's write deadline is set, so a
 // stalled client cannot hold the response open either. Pinning a generation
-// is only safe for GC_DELAY, so no response may outlive it (design §11.5).
+// is only safe for GC_DELAY, so no response may outlive it (design §11.7).
 // The write deadline is best-effort: a wrapping ResponseWriter that cannot
 // reach the connection leaves only the ctx cutoff.
 func responseDeadline(ctx context.Context, w http.ResponseWriter, d time.Duration) (context.Context, context.CancelFunc) {

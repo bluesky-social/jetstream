@@ -1196,6 +1196,19 @@ sealed) between two ticks. That is normal. The follower reads them through
 the block cache) and appends them to the readable log before any later hot
 batch. The readable log receives every seq exactly once, in order.
 
+As built (S4.4), a follower that falls behind across a seal and a compaction
+pass reads sealed blocks that lack seqs inside their envelopes: the pass
+dropped them before the follower saw them. The follower leaves those seqs
+vacant in the readable log (`FollowerLog.Skip`), and readers skip vacancies,
+as the cold reader already skips holes inside a block's envelope. Only a
+sealed generation (`BlockRef.Generation != 0`) may have holes; hot batches
+and active blocks must still be dense, and every ref must still end at its
+envelope's `MaxSeq`. So the log receives every seq at most once, in order, and
+every seq it lacks is one a published compacted generation dropped. The
+disaggregated oracle's held reader found this: its follower ticks rarely, and
+the first version reported the thinned block as storage corruption and
+stopped advancing.
+
 `$follower_next_seq` always sits on a batch boundary, because blocks start on
 batch boundaries. At pod start it is set to the `main` tip plus one, so the
 readable log starts empty. Older seqs are served by the cold reader.
@@ -1298,6 +1311,12 @@ blocks and `first_seq` plus SHA-256 for inline frames; active blocks and
 pointer hot batches are not cached. The log requires strictly contiguous
 seqs, which S4 revisits when compaction can remove seqs.
 
+As built (S4.4), the log is contiguous but may hold vacant seqs (§11.1). A
+cursor on a vacancy resumes at the next resident seq, and a cursor with only
+vacancies above it waits at the tip. A run of vacancies at the floor below
+the durable watermark is evicted regardless of the byte budget. A writer's
+log never has vacancies.
+
 ### 11.5 Cursor resolution
 
 Cursor rules do not change (`docs/README.md` §2, §5). v1 time cursors resolve
@@ -1334,6 +1353,13 @@ and refuses to start if it does not hold (`xrpcapi.CheckGCDelay`). Default
 `JETSTREAM_GC_DELAY` is 6h. The cutoff is both a context timeout and the
 connection's write deadline, so a stalled client cannot hold a response open
 past it.
+
+As built (S4.4), the 10m margin is `xrpcapi.DefaultGCDelayMargin`, and
+`CheckGCDelay` takes it as a parameter. A test-only option
+(`jetstreamd.Options.GCDelayMargin`) shrinks it, so the disaggregated oracle
+can run GC with delays of seconds on its fake clock. It is not an environment
+variable: the margin covers clock skew between pods and PostgreSQL, which
+only a test sharing one clock can rule out.
 
 ### 11.8 Archive endpoints
 
@@ -2009,6 +2035,25 @@ seam, like SIGKILL, and a fresh pod replaces it. `storagefake.DB.ExpireLease` mo
 touching the holder's process. `Options.SteadyMaxSegmentBytes` shrinks
 segments so seals happen within a short run. What the tier does not prove,
 and why, is in `specs/oracle.md` ("Disaggregated Storage Tier").
+
+As built (S4.4), every pod runs delete compaction and GC with fake-clock
+intervals of seconds (`internal/oracle/disagg_compaction_test.go`), so sealed
+segments are rewritten and replaced objects collected while the waves run.
+Because compaction removes rows, the model checks run on an archive union:
+every `main` row the harness has read, by seq. The leader's
+`OnBeforeCompactionPass` hook reads the catalog before each pass, so no row
+is dropped before the union holds it, and a seq read twice must hold the same
+row. Streams and archives are then checked against the union with the drop
+rule over (merge floor, W]: a stream may miss only droppable rows, and once W
+reaches `main`'s last seq, `main` and a fresh client download from every live
+pod must hold exactly the non-droppable rows (the `assertCompacted` analog)
+and fold to what the union folds to. A held reader, with its own follower,
+reads each replaced generation again just before `GC_DELAY` runs out and
+requires it to still decode to the union's rows. At the end GC must leave
+every object row available and referenced, and the object store must hold
+exactly their keys. The fault plan adds a leader kill after a rewrite's
+upload, after its publish, after a chunk's watermark, and after each GC step.
+The short plan picks one of them per seed; the full plan runs all six.
 
 `internal/storagefake` (S2.7) differs from PostgreSQL in these deliberate ways.
 None of them weakens a check:

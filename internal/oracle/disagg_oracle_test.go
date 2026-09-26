@@ -99,7 +99,7 @@ const (
 	disaggServeTimeout = 10 * time.Second
 	// disaggMaxExtraChunks bounds the extra events a wave generates while
 	// its fault has not fired yet.
-	disaggMaxExtraChunks = 8
+	disaggMaxExtraChunks = 24
 	disaggExtraChunk     = 8
 
 	disaggSimURL = "http://sim.invalid"
@@ -130,8 +130,8 @@ func TestDisagg_Oracle(t *testing.T) {
 		t.Run("seed="+seed, func(t *testing.T) {
 			t.Parallel()
 			res := runDisaggChild(t, seed, mode)
-			t.Logf("seed %s (%s): readers=%d leaders=%d fired=%v events=%d sessions=%d scheduler turns=%d",
-				seed, mode, res.Readers, res.Leaders, res.Fired, res.Events, res.Sessions, res.Turns)
+			t.Logf("seed %s (%s): readers=%d leaders=%d fired=%v events=%d sessions=%d scheduler turns=%d compaction passes=%d main rows=%d/%d held late reads=%d",
+				seed, mode, res.Readers, res.Leaders, res.Fired, res.Events, res.Sessions, res.Turns, res.Passes, res.MainRows, res.MainNext-1, res.HeldLate)
 		})
 	}
 }
@@ -233,6 +233,12 @@ type disaggResult struct {
 	Sessions int    `json:"sessions"`
 	Turns    int    `json:"turns"`
 	Trace    string `json:"trace"`
+	// Passes, MainRows, and HeldLate show the compaction checks had
+	// something to check: compaction passes run, the rows main kept of
+	// MainNext-1, and replaced generations the held reader read late.
+	Passes   int `json:"passes"`
+	MainRows int `json:"mainRows"`
+	HeldLate int `json:"heldLate"`
 }
 
 // deterministic is the part of a result the seed decides: the plan and the
@@ -283,6 +289,8 @@ var disaggAllFaults = []disaggFault{
 	dfCommitLost, dfLeaseLoss, dfStaleLeader,
 	dfPutError, dfPutWrongBytes, dfGetWrongBytes,
 	dfNotifyLost, dfSlowRead,
+	dfCrashCompactUpload, dfCrashCompactRewrite, dfCrashCompactChunk,
+	dfCrashGCMark, dfCrashGCClaim, dfCrashGCDelete,
 }
 
 // disaggPlan is the seeded schedule: pod counts, the bootstrap faults in
@@ -313,7 +321,8 @@ func newDisaggPlan(seed uint64, mode string) disaggPlan {
 		p.bootFaults = []disaggFault{pick(dfCrashRepoComplete, dfCrashDirectCut, dfCrashDirectUpload, dfCrashDirectCommit)}
 		p.mergeFaults = []disaggFault{pick(dfCrashCloseBeforeSeal, dfCrashMergeFlush, dfCrashMergeSeal,
 			dfCrashMergeDiscovery, dfCrashMergeCleanup, dfCrashSteadyPhase)}
-		p.faults = []disaggFault{pick(dfCrashCut, dfCrashUpload, dfCrashCommit, dfCommitLost), dfNotifyLost}
+		p.faults = []disaggFault{pick(dfCrashCut, dfCrashUpload, dfCrashCommit, dfCommitLost),
+			pick(disaggCompactionFaults...), dfNotifyLost}
 	default:
 		p.readers += rng.IntN(2)
 		p.leaders += rng.IntN(2)
@@ -372,8 +381,24 @@ type disaggHarness struct {
 
 	expected []segment.Event
 	fired    []string
-	// stream is the delivered stream every reader must agree on.
-	stream []disaggKey
+
+	// The compaction checks (disagg_compaction_test.go). floor is main's
+	// last seq when merge began, where the watermark starts. archive is
+	// the archive union by seq; passTarget, the highest target a
+	// compaction pass has announced. archiveMu guards the three and
+	// passes, which the leader's pass hook writes.
+	archiveMu  sync.Mutex
+	floor      uint64
+	archive    map[uint64]segment.Event
+	passTarget uint64
+	passes     int
+	// The test goroutine's cache of archiveNow, keyed by archiveKey.
+	archiveCacheKey  string
+	archiveCache     []segment.Event
+	archiveCacheRead map[catalog.Namespace][]segment.Event
+	held             *disaggHeld
+	// mainRows is the rows main holds after compaction settles.
+	mainRows int
 
 	// The lifecycle prelude (disagg_lifecycle_test.go). stage names the
 	// phase the harness is driving, for failure reports.
@@ -435,6 +460,7 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 	archiveID := h.db.Archive().ArchiveID
 	h.objects = objstore.FormatUUID(archiveID) + "/objects/"
 	h.initCatalog()
+	h.startHeldReader()
 
 	simLn := newPipeListener()
 	h.gate = newDisaggListGate(simhttp.NewHandler(h.w, disaggSimURL))
@@ -469,9 +495,14 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 	h.converge("quiet wave")
 	require.NoError(t, h.db.Violation())
 	require.Empty(t, h.db.Unfired(), "every scheduled catalog fault fired")
+	h.settleCompaction()
+	h.converge("settled")
 
 	stream := h.checkStreams()
-	h.checkArchives()
+	evs := h.checkArchives()
+	h.checkHeld(evs)
+	h.checkLeaks()
+	require.NoError(t, h.db.Violation())
 
 	snap, err := h.db.Snapshot()
 	require.NoError(t, err)
@@ -507,6 +538,9 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 		Sessions: sessions,
 		Turns:    len(trace),
 		Trace:    hex.EncodeToString(sum[:8]),
+		Passes:   h.passCount(),
+		MainRows: h.mainRows,
+		HeldLate: h.heldLate(),
 	}
 }
 
@@ -529,6 +563,10 @@ func (h *disaggHarness) wave(i int, f disaggFault, n int) {
 		for range disaggExtraChunk {
 			h.generate()
 		}
+		// Compaction and GC faults wait on the clock as well as on
+		// traffic: a pass every CompactionInterval, a claim GC_DELAY
+		// after a rewrite.
+		time.Sleep(time.Second)
 		h.converge(what)
 	}
 	h.fired = append(h.fired, string(f))
@@ -647,8 +685,9 @@ func (h *disaggHarness) generate() {
 }
 
 // converge waits until the catalog covers every expected row and every
-// observer has delivered the whole catalog, replacing crashed leaders as it
-// goes. A row the model forbids fails at once: delivered streams only grow.
+// observer has delivered the whole catalog, less rows compaction may drop,
+// replacing crashed leaders as it goes. The model check runs on the archive
+// union, which holds every row main ever did.
 func (h *disaggHarness) converge(what string) {
 	want, groups := h.model()
 	deadline := time.Now().Add(disaggConvergeTimeout)
@@ -665,51 +704,57 @@ func (h *disaggHarness) converge(what string) {
 				heldAt = time.Now()
 			}
 		}
-		o0 := h.observers[0] // the first reader's v2 observer
-		o0.mu.Lock()
-		keys := make([]disaggKey, len(o0.v2))
-		for i, ev := range o0.v2 {
-			keys[i] = disaggKeyOf(ev)
-		}
-		o0.mu.Unlock()
-		covered, rewinds, err := disaggCover(want, groups, keys)
-		if err != nil {
-			h.failf("%s: %s v2: %v", what, o0.pod.name, err)
-		}
-		if limit := h.sessionChanges(); rewinds > limit {
-			h.failf("%s: %s v2: %d commit prefixes re-archived across %d leader changes", what, o0.pod.name, rewinds, limit)
-		}
-		done = done && covered && uint64(len(keys)) == next-1
-		wantV1 := -1
-		if done {
-			// Reading the catalog is slow; only a caught-up stream needs it.
-			wantV1 = len(disaggV1Project(keys, h.resyncSeqs()))
-		}
-		for _, o := range h.observers[1:] {
-			if o.progress() < map[bool]int{true: wantV1, false: len(keys)}[o.proto == "v1"] {
+		// Every v2 stream ends at main's last row, which nothing
+		// supersedes.
+		for _, o := range h.observers {
+			if o.proto == "v2" && o.lastSeq() < next-1 {
 				done = false
+			}
+		}
+		covered, archived, wantV1 := false, 0, uint64(0)
+		if done {
+			// Reading the catalog is slow; only caught-up streams need it.
+			evs, _ := h.archiveNow()
+			archived = len(evs)
+			var rewinds int
+			var err error
+			covered, rewinds, err = disaggCover(want, groups, disaggKeys(evs))
+			if err != nil {
+				h.failf("%s: the archive: %v", what, err)
+			}
+			if limit := h.sessionChanges(); rewinds > limit {
+				h.failf("%s: the archive: %d commit prefixes re-archived across %d leader changes", what, rewinds, limit)
+			}
+			done = covered && uint64(len(evs)) == next-1
+			if done {
+				wantV1 = disaggV1Last(evs, h.droppable(evs, h.passBound()))
+				for _, o := range h.observers {
+					if o.proto == "v1" && o.lastSeq() < wantV1 {
+						done = false
+					}
+				}
 			}
 		}
 		if done {
 			return
 		}
 		if !heldAt.IsZero() && time.Since(heldAt) > disaggServeTimeout {
-			h.failf("%s: the catalog has held every row at seq/next %d for %s, but %s v2 has %d (covered=%v); v1 wants %d; %s",
-				what, next, disaggServeTimeout, o0.pod.name, len(keys), covered, wantV1, h.observerProgress())
+			h.failf("%s: the catalog has held every row at seq/next %d for %s, but the streams lag: archive %d rows (covered=%v); v1 wants seq %d; %s",
+				what, next, disaggServeTimeout, archived, covered, wantV1, h.observerProgress())
 		}
 		if time.Now().After(deadline) {
-			h.failf("%s: not converged after %s: seq/next %d, %d model rows, %s v2 has %d (covered=%v); v1 wants %d; %s",
-				what, disaggConvergeTimeout, next, len(want), o0.pod.name, len(keys), covered, wantV1, h.observerProgress())
+			h.failf("%s: not converged after %s: seq/next %d, %d model rows, archive %d rows (covered=%v); v1 wants seq %d; %s",
+				what, disaggConvergeTimeout, next, len(want), archived, covered, wantV1, h.observerProgress())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// resyncSeqs is the set of main's seqs that hold resync replacements,
-// which v1 does not deliver.
-func (h *disaggHarness) resyncSeqs() map[uint64]bool {
+// resyncSeqs is the set of evs' seqs that hold resync replacements, which
+// v1 does not deliver.
+func resyncSeqs(evs []segment.Event) map[uint64]bool {
 	out := map[uint64]bool{}
-	for _, ev := range h.readCatalog()[catalog.Main] {
+	for _, ev := range evs {
 		if ev.Kind.IsResyncReplacement() {
 			out[ev.Seq] = true
 		}
@@ -721,7 +766,7 @@ func (h *disaggHarness) resyncSeqs() map[uint64]bool {
 func (h *disaggHarness) observerProgress() string {
 	parts := make([]string, len(h.observers))
 	for i, o := range h.observers {
-		parts[i] = fmt.Sprintf("%s %s %d", o.pod.name, o.proto, o.progress())
+		parts[i] = fmt.Sprintf("%s %s %d (seq %d)", o.pod.name, o.proto, o.progress(), o.lastSeq())
 	}
 	return strings.Join(parts, ", ")
 }
@@ -814,68 +859,57 @@ func (h *disaggHarness) maxEpoch() uint64 {
 	return m
 }
 
-// checkStreams compares the delivered streams with the model and with each
-// other, and returns a digest of the stream's per-DID form.
+// checkStreams checks the archive union against the model and every
+// delivered stream against the union, and returns a digest of the union's
+// per-DID form.
 //
 // Against the model the check is per DID: ingest processes DIDs in
 // parallel, so the archive promises per-DID order and no global order
-// (docs/README.md §2, specs/invariants.md). Between readers it is exact:
-// every reader serves the one catalog.
+// (docs/README.md §2, specs/invariants.md). Against the union it is exact
+// but for the rows compaction may drop: readers that read a segment before
+// and after a rewrite serve different subsets of it, so readers need not
+// agree with each other, only fold to the same records.
 func (h *disaggHarness) checkStreams() string {
 	t := h.t
 	want, groups := h.model()
 	ground, err := GroundTruthFromWorld(h.w)
 	require.NoError(t, err)
 
-	var ref []ObservedEvent
-	var refKeys []disaggKey
-	var refName string
+	evs, _ := h.archiveNow()
+	keys := disaggKeys(evs)
+	full := disaggObserved(evs)
+	disaggRequireModel(t, want, groups, keys, h.sessionChanges(), "the archive union")
+	// The merged prefix may repeat a source's rows, which checkMerged
+	// located.
+	require.NoError(t, CheckStructuralInvariants(full), "the archive union")
+	require.NoError(t, CheckInvariants(h.withoutReplayed(full)), "the archive union, less the re-drained run")
+	model, err := Reconstruct(full)
+	require.NoError(t, err)
+	require.NoError(t, Compare(ground, model), "the archive union")
+
+	drop := h.droppable(evs, max(h.passBound(), h.mustWatermark()))
+	proj := disaggV1Project(keys, resyncSeqs(evs))
 	for _, o := range h.observers {
-		if o.proto != "v2" {
-			continue
-		}
 		o.mu.Lock()
-		v2, fatal := slices.Clone(o.v2), o.fatal
+		v1, v2, fatal := slices.Clone(o.v1), slices.Clone(o.v2), o.fatal
 		o.mu.Unlock()
-		name := o.pod.name + " v2"
-		require.Emptyf(t, fatal, "%s: the client saw fatal errors", name)
-		keys := make([]disaggKey, len(v2))
-		for i, ev := range v2 {
-			keys[i] = disaggKeyOf(ev)
-		}
-		if ref == nil {
-			disaggRequireModel(t, want, groups, keys, h.sessionChanges(), name)
-			// The merged prefix may repeat a source's rows, which
-			// checkMerged located.
-			require.NoErrorf(t, CheckStructuralInvariants(v2), "%s", name)
-			require.NoErrorf(t, CheckInvariants(h.withoutReplayed(v2)), "%s, less the re-drained run", name)
-			model, err := Reconstruct(v2)
-			require.NoErrorf(t, err, "%s", name)
-			require.NoErrorf(t, Compare(ground, model), "%s", name)
-			ref, refKeys, refName = v2, keys, name
-			h.stream = refKeys
+		name := o.pod.name + " " + o.proto
+		require.Emptyf(t, fatal, "%s: the subscriber saw fatal errors or bad frames", name)
+		if o.proto == "v1" {
+			h.requireV1(proj, drop, v1, name)
 			continue
 		}
-		disaggRequireKeys(t, refKeys, keys, name+" against "+refName)
-		require.Equalf(t, ref, v2, "%s and %s delivered different events", refName, name)
-	}
-	require.NotNil(t, ref, "no v2 observer")
-	refV1 := disaggV1Project(refKeys, h.resyncSeqs())
-	for _, o := range h.observers {
-		if o.proto != "v1" {
-			continue
-		}
-		o.mu.Lock()
-		v1, fatal := slices.Clone(o.v1), o.fatal
-		o.mu.Unlock()
-		name := o.pod.name + " v1"
-		require.Emptyf(t, fatal, "%s: the subscriber saw bad frames", name)
-		disaggRequireKeys(t, refV1, v1, name+" against "+refName)
+		h.requireServed(evs, drop, v2, false, name)
+		require.NoErrorf(t, CheckFoldConvergence(v2, full, nil), "%s", name)
+		model, err := Reconstruct(v2)
+		require.NoErrorf(t, err, "%s", name)
+		require.NoErrorf(t, Compare(ground, model), "%s", name)
 	}
 
 	d := sha256.New()
-	for _, did := range slices.Sorted(maps.Keys(disaggByDID(ref))) {
-		for _, ev := range disaggByDID(ref)[did] {
+	byDID := disaggByDID(full)
+	for _, did := range slices.Sorted(maps.Keys(byDID)) {
+		for _, ev := range byDID[did] {
 			k := disaggKeyOf(ev)
 			_, _ = fmt.Fprintf(d, "%d\x00%s\x00%s\x00%s\x00%s\x00", k.Kind, k.DID, k.Collection, k.Rkey, k.Rev)
 			_ = binary.Write(d, binary.BigEndian, uint64(len(ev.Payload)))
@@ -885,11 +919,29 @@ func (h *disaggHarness) checkStreams() string {
 	return hex.EncodeToString(d.Sum(nil))
 }
 
-// checkArchives downloads the whole archive from every live pod with a
-// fresh client; each must match what the observers saw.
-func (h *disaggHarness) checkArchives() {
+// checkArchives checks main once compaction has settled: it holds exactly
+// the union's rows the drop rule keeps at the watermark (the
+// assertCompacted analog), and every live pod serves exactly those to a
+// fresh client. It returns the union.
+func (h *disaggHarness) checkArchives() []segment.Event {
 	t := h.t
-	want := uint64(len(h.stream))
+	w := h.mustWatermark()
+	evs, got := h.archiveNow()
+	main := got[catalog.Main]
+	require.Equal(t, w, uint64(len(evs)), "the watermark is main's last seq")
+	drop := h.droppable(evs, w)
+	h.requireServed(evs, drop, disaggObserved(main), true, "main after compaction")
+	require.NoError(t, CheckCompacted(disaggObserved(main), w), "main after compaction")
+	ground, err := GroundTruthFromWorld(h.w)
+	require.NoError(t, err)
+	model, err := Reconstruct(disaggObserved(main))
+	require.NoError(t, err)
+	require.NoError(t, Compare(ground, model), "main after compaction")
+	full := disaggObserved(evs)
+	h.mainRows = len(main)
+
+	// The last pass's publish reaches every follower within a poll.
+	time.Sleep(time.Second)
 	for _, p := range h.pods {
 		if p.stopped {
 			continue
@@ -901,22 +953,26 @@ func (h *disaggHarness) checkArchives() {
 		)
 		require.NoError(t, err)
 		ctx, cancel := context.WithTimeout(h.ctx, disaggConvergeTimeout)
-		var got []disaggKey
+		var dl []ObservedEvent
 		for batch, err := range client.Events(ctx) {
 			require.NoErrorf(t, err, "%s archive download", p.name)
 			for _, ev := range batch.Events() {
 				oe, err := observedEventFromClientErr(ev)
 				require.NoError(t, err)
-				got = append(got, disaggKeyOf(oe))
+				dl = append(dl, oe)
 			}
-			if len(got) > 0 && got[len(got)-1].Seq >= want {
+			if len(dl) > 0 && dl[len(dl)-1].Seq >= w {
 				break
 			}
 		}
 		cancel()
 		_ = client.Close()
-		disaggRequireKeys(t, h.stream, got, p.name+" archive download")
+		name := p.name + " archive download"
+		h.requireServed(evs, drop, dl, true, name)
+		require.NoErrorf(t, CheckFoldConvergence(dl, full, nil), "%s", name)
+		require.NoErrorf(t, CheckCompacted(dl, w), "%s", name)
 	}
+	return evs
 }
 
 // teardown stops observers, then every pod, requiring a clean exit from
@@ -1042,6 +1098,7 @@ func (h *disaggHarness) startPod(reader bool) *disaggPod {
 	// A small inline budget mixes pointer and inline batches.
 	opts.Storage.Hot.InlineBytesPerSec = 512
 	opts.OnSessionStart = func(epoch uint64) { h.sessionStarted(p.name, epoch) }
+	h.compactionOptions(&opts)
 	if reader {
 		opts.Storage.Leader.AcquireInterval = time.Hour
 	} else {
@@ -1291,24 +1348,6 @@ func disaggKeyOf(ev ObservedEvent) disaggKey {
 		k.Kind = segment.KindCreate
 	}
 	return k
-}
-
-// disaggRequireKeys fails with the first divergence and its neighbours;
-// a full dump of two streams is unreadable.
-func disaggRequireKeys(t *testing.T, want, got []disaggKey, what string) {
-	t.Helper()
-	i := 0
-	for i < len(want) && i < len(got) && want[i] == got[i] {
-		i++
-	}
-	if i == len(want) && i == len(got) {
-		return
-	}
-	var b strings.Builder
-	for j := max(0, i-3); j < min(max(len(want), len(got)), i+6); j++ {
-		fmt.Fprintf(&b, "  [%d]\n    want %s\n    got  %s\n", j, disaggKeyAt(want, j), disaggKeyAt(got, j))
-	}
-	t.Fatalf("%s: %d events, want %d; first divergence at index %d:\n%s", what, len(got), len(want), i, b.String())
 }
 
 func disaggKeyAt(keys []disaggKey, i int) string {

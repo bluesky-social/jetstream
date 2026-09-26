@@ -84,6 +84,11 @@ type Options struct {
 	FailedRepoRetryHostWorkers     int
 	FailedRepoRetryMaxDelay        time.Duration
 
+	// GCDelayMargin is test-only: the clock-skew allowance JETSTREAM_GC_DELAY
+	// must leave (xrpcapi.CheckGCDelay). Zero is the default. Only pods that
+	// share one clock with the catalog, as in the oracle, may shrink it.
+	GCDelayMargin time.Duration
+
 	// DisableRepoActionRateLimits disables the per-source-IP limiter for
 	// expensive operator-triggered repo actions on the status UI.
 	DisableRepoActionRateLimits bool

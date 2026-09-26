@@ -27,6 +27,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -303,6 +304,12 @@ func (db *DB) Snapshot() (*catalog.Snapshot, error) {
 	return catalog.LoadSnapshot(context.Background(), &readTx{db: db, s: db.current()})
 }
 
+// AllObjects returns every committed objects row, referenced or not, keyed
+// by ID, for test assertions. Snapshot holds only the referenced ones.
+func (db *DB) AllObjects() map[uint64]catalog.ObjectRow {
+	return maps.Clone(db.current().objects.all())
+}
+
 // yield announces a storage call by cl (nil for the DB's own handle) to
 // the scheduler. A killed client's calls fail before and after the wait, so
 // nothing a dead process does reaches the catalog.
@@ -334,7 +341,7 @@ func (db *DB) begin(ctx context.Context, cl *Client, kind catalog.TxKind) (catal
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &tx{db: db, cl: cl, kind: kind, connLost: db.armConnLost(kind)}, nil
+	return &tx{db: db, cl: cl, kind: kind, connLost: db.armConnLost(cl, kind)}, nil
 }
 
 // BeginRead implements catalog.DB.
@@ -346,7 +353,7 @@ func (db *DB) beginRead(ctx context.Context, cl *Client) (catalog.ReadTx, error)
 	if err := db.yield(ctx, cl, "begin_read"); err != nil {
 		return nil, err
 	}
-	if d := db.slowRead(); d > 0 {
+	if d := db.slowRead(cl); d > 0 {
 		t := time.NewTimer(d)
 		select {
 		case <-t.C:

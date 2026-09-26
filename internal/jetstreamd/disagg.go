@@ -196,7 +196,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 	if err := checkMemoryBudgets(limit, budgets); err != nil {
 		return nil, err
 	}
-	if err := xrpcapi.CheckGCDelay(st.GC.Delay, st.MaxViewAge, st.MaxArchiveResponseDuration); err != nil {
+	if err := xrpcapi.CheckGCDelay(st.GC.Delay, st.MaxViewAge, st.MaxArchiveResponseDuration, opts.GCDelayMargin); err != nil {
 		return nil, fmt.Errorf("serve: JETSTREAM_GC_DELAY: %w", err)
 	}
 

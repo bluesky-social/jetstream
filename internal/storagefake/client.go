@@ -20,6 +20,8 @@ var ErrKilled = errors.New("storagefake: client process killed")
 type Client struct {
 	db    *DB
 	actor string
+	// observer exempts the client from the fault schedule (Observer).
+	observer bool
 
 	killCtx context.Context
 	kill    context.CancelFunc
@@ -35,6 +37,16 @@ func (db *DB) Client(actor string) *Client {
 	return &Client{db: db, actor: actor, killCtx: ctx, kill: cancel}
 }
 
+// Observer returns a client for a test harness's own reads. It is a
+// Client, scheduler yields included, but the fault schedule never fires on
+// it or counts its calls, so the harness cannot take a fault meant for a
+// pod.
+func (db *DB) Observer(actor string) *Client {
+	c := db.Client(actor)
+	c.observer = true
+	return c
+}
+
 // Kill ends the client's process. Every later call fails with ErrKilled, a
 // transaction in flight rolls back at its next call (COMMIT included), and
 // its LISTEN channels close. A statement already past its scheduler point
@@ -43,6 +55,9 @@ func (c *Client) Kill() { c.kill() }
 
 // Killed reports whether Kill was called.
 func (c *Client) Killed() bool { return c.killCtx.Err() != nil }
+
+// exempt reports whether the fault schedule skips c's calls.
+func (c *Client) exempt() bool { return c != nil && c.observer }
 
 func (c *Client) alive() error {
 	if c != nil && c.Killed() {

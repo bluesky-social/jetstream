@@ -274,6 +274,27 @@ func TestFaultNotifyLost(t *testing.T) {
 	}
 }
 
+// An observer's calls neither take nor count toward a scheduled fault.
+func TestFaultObserverExempt(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		db := storagefake.New(storagefake.Config{})
+		f := &storagefake.Fault{Kind: storagefake.FaultSlowRead, Ordinal: 1, Delay: time.Minute}
+		db.InjectFaults(f)
+		start := time.Now()
+		r, err := db.Observer("harness").BeginRead(t.Context())
+		require.NoError(t, err)
+		require.NoError(t, r.Close(t.Context()))
+		require.Zero(t, time.Since(start))
+		require.False(t, f.Fired())
+		r, err = db.Client("pod").BeginRead(t.Context())
+		require.NoError(t, err)
+		require.NoError(t, r.Close(t.Context()))
+		require.Equal(t, time.Minute, time.Since(start), "the pod's read is the first to count")
+		require.True(t, f.Fired())
+	})
+}
+
 func TestFaultSlowRead(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {

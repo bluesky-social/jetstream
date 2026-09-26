@@ -369,9 +369,10 @@ func (h *disaggHarness) catalogMark() string {
 	snap, err := h.db.Snapshot()
 	require.NoError(h.t, err)
 	var b strings.Builder
-	fmt.Fprintf(&b, "epoch=%d segments=%d generations=%d blocks=%d active=%d hot=%d objects=%d",
+	// Not the objects: GC changes them without moving what readers see.
+	fmt.Fprintf(&b, "epoch=%d segments=%d generations=%d blocks=%d active=%d hot=%d",
 		snap.Archive.WriterEpoch, len(snap.Segments), len(snap.Generations), len(snap.GenerationBlocks),
-		len(snap.ActiveBlocks), len(snap.HotBatches), len(snap.Objects))
+		len(snap.ActiveBlocks), len(snap.HotBatches))
 	keys := make([]string, 0, len(snap.Meta))
 	for k := range snap.Meta {
 		keys = append(keys, k)
@@ -386,31 +387,58 @@ func (h *disaggHarness) catalogMark() string {
 // readCatalog reads main and bootstrap_live from seq 1 through a fresh
 // follower, the read path every pod serves from.
 func (h *disaggHarness) readCatalog() map[catalog.Namespace][]segment.Event {
-	t := h.t
+	got, err := h.readCatalogErr()
+	require.NoError(h.t, err)
+	return got
+}
+
+// readCatalogErr is readCatalog for any goroutine. It reads as a fault-free
+// observer, so the harness's reads neither take nor skew the seeded faults,
+// and retries a read that GC raced: an object can go between the view and
+// the read only once it is GC_DELAY past unreferenced, which a fresh view
+// never references, so a retry sees the catalog after.
+func (h *disaggHarness) readCatalogErr() (map[catalog.Namespace][]segment.Event, error) {
+	var err error
+	for range 3 {
+		var got map[catalog.Namespace][]segment.Event
+		if got, err = h.readCatalogOnce(); err == nil {
+			return got, nil
+		}
+	}
+	return nil, err
+}
+
+func (h *disaggHarness) readCatalogOnce() (map[catalog.Namespace][]segment.Event, error) {
 	ctx := h.ctx
 	f, err := follower.New(follower.Config{
-		DB:              h.db.Client("oracle-check"),
-		Blob:            h.blob,
+		DB:              h.db.Observer("oracle-check"),
+		Blob:            h.blob.Unfaulted(),
 		ArchiveID:       h.db.Archive().ArchiveID,
 		Logger:          slog.New(slog.DiscardHandler),
 		Metrics:         follower.NewMetrics(prometheus.NewRegistry()),
 		ReadConcurrency: 4,
 	})
-	require.NoError(t, err)
-	require.NoError(t, f.Refresh(ctx))
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Refresh(ctx); err != nil {
+		return nil, fmt.Errorf("refresh: %w", err)
+	}
 	view := f.Snapshot()
 	out := map[catalog.Namespace][]segment.Event{}
 	for _, ns := range []catalog.Namespace{catalog.Main, catalog.BootstrapLive} {
 		for ref := range view.RefsFrom(ns, 1) {
 			evs, err := catalog.DecodeRef(ctx, f, ref)
-			require.NoErrorf(t, err, "read %s segment %d block %d", ns, ref.Segment, ref.Block)
+			if err != nil {
+				return nil, fmt.Errorf("read %s segment %d block %d: %w", ns, ref.Segment, ref.Block, err)
+			}
 			for _, ev := range evs {
 				ev.Payload = bytes.Clone(ev.Payload)
 				out[ns] = append(out[ns], ev)
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 func disaggObserved(evs []segment.Event) []ObservedEvent {
@@ -477,6 +505,9 @@ func (h *disaggHarness) checkBootstrap() {
 		h.requireDense(evs, "bootstrap "+string(ns))
 		require.NoErrorf(t, CheckInvariants(disaggObserved(evs)), "bootstrap %s", ns)
 	}
+	h.archiveMu.Lock()
+	h.floor = uint64(len(main))
+	h.archiveMu.Unlock()
 	h.requireSurvivors(live, "bootstrap_live at cutover")
 	ground, model, err := h.cutoverModels(got)
 	require.NoError(t, err)
@@ -529,15 +560,26 @@ func (h *disaggHarness) mergePending() string {
 
 // checkMerged is the after-merge check: main alone is dense, clean unless a
 // kill replayed a merge source, holds every row generated after backfill,
-// and reconstructs the world. It becomes the model's prefix.
+// and reconstructs the world. It becomes the model's prefix. Compaction may
+// already have run, so the check is on the archive union, and main may lack
+// only rows the drop rule allows.
 func (h *disaggHarness) checkMerged() {
 	t := h.t
-	got := h.readCatalog()
+	evs, got := h.archiveNow()
 	main := got[catalog.Main]
 	require.Empty(t, got[catalog.BootstrapLive], "bootstrap_live rows after merge")
-	h.requireDense(main, "main after merge")
-	require.Equal(t, uint64(len(main))+1, h.mainNext(), "main's seq/next after merge")
-	obs := disaggObserved(main)
+	drop := h.droppable(evs, h.passBound())
+	have := make(map[uint64]bool, len(main))
+	for _, ev := range main {
+		have[ev.Seq] = true
+	}
+	for _, ev := range evs {
+		if !have[ev.Seq] && !drop[ev.Seq] {
+			h.failf("main after merge lacks seq %d, which compaction does not drop: %s", ev.Seq, disaggRowString(ev))
+		}
+	}
+	require.Equal(t, uint64(len(evs))+1, h.mainNext(), "main's seq/next after merge")
+	obs := disaggObserved(evs)
 	require.NoError(t, CheckStructuralInvariants(obs), "main after merge")
 	if h.mergeReplay {
 		// A kill after a source's rows are flushed and before its cursor
@@ -550,14 +592,14 @@ func (h *disaggHarness) checkMerged() {
 		}
 	}
 	require.NoError(t, CheckInvariants(h.withoutReplayed(obs)), "main after merge, less the re-drained run")
-	h.requireSurvivors(main, "main after merge")
+	h.requireSurvivors(evs, "main after merge")
 	ground, err := GroundTruthFromWorld(h.w)
 	require.NoError(t, err)
 	model, err := Reconstruct(obs)
 	require.NoError(t, err)
 	require.NoError(t, Compare(ground, model), "main after merge")
-	h.expected = main
-	t.Logf("merge check: main %d rows (replayed source: %t)", len(main), h.mergeReplay)
+	h.expected = evs
+	t.Logf("merge check: main %d rows, %d compacted away (replayed source: %t)", len(evs), len(evs)-len(main), h.mergeReplay)
 }
 
 // mergeReplayRun finds the first copy of a merge source that a kill
