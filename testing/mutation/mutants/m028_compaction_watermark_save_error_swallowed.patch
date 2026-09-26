@@ -1,8 +1,9 @@
 mutant: m028_compaction_watermark_save_error_swallowed
 target: internal/ingest/orchestrator/compact_deletes.go
 failure-mode: |
-  The error check on the compaction watermark save is inverted (== nil), so a
-  failed persistent watermark write is silently swallowed and the pass
+  The error check on the compaction watermark advance (in local mode,
+  saveCompactionWatermark) is inverted (== nil), so a failed persistent
+  watermark write is silently swallowed and the pass
   proceeds: the in-memory gauge and finalWatermark advance and tombstones are
   evicted while the durable compaction/seq stays stale. A swallowed-
   persistence-error in the same family as m006, on the compaction-watermark
@@ -16,15 +17,14 @@ expected-tier: storefault
 tiers: storefault
 
 diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
-index 9ef6801..26330f1 100644
 --- a/internal/ingest/orchestrator/compact_deletes.go
 +++ b/internal/ingest/orchestrator/compact_deletes.go
-@@ -179,7 +179,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
+@@ -187,7 +187,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
  				return err
  			}
  
--			if err := saveCompactionWatermark(o.cfg.Store, chunkEnd); err != nil {
-+			if err := saveCompactionWatermark(o.cfg.Store, chunkEnd); err == nil {
+-			if err := o.advanceCompactionWatermark(ctx, current, watermarkOK, chunkEnd); err != nil {
++			if err := o.advanceCompactionWatermark(ctx, current, watermarkOK, chunkEnd); err == nil {
  				return err
  			}
- 			o.cfg.Metrics.setCompactionWatermark(chunkEnd)
+ 			watermarkOK = true
