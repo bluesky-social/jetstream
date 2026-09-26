@@ -7,8 +7,10 @@ failure-mode: |
   segments, and a later bootstrap would resume bootstrap_live's seqs from
   the stale counter instead of 1.
 expected-detection: |
-  The layer 3 oracle's after-merge wait (mergePending) requires the key to
-  be gone, so the run fails when merge never looks finished.
+  The layer 3 oracle checks the catalog invariants at every revision, and
+  invariant 2 rejects a namespace with no segments that still has a seq key.
+  The next leader's hot-mode open also refuses the catalog as corrupt, and
+  the after-merge wait (mergePending) requires the key to be gone.
 expected-tier: disagg
 tiers: disagg
 
