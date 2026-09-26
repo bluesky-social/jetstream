@@ -284,9 +284,13 @@ func runWrite(ctx context.Context, cmd *cli.Command) error {
 			ps.metaOps.Add(int64(mb.Len()))
 			ps.metaBatches.Add(1)
 			return func() {
-				state.CommitStaged()
-				committed.Store(next)
-			}, nil, nil
+					state.CommitStaged()
+					committed.Store(next)
+				}, func(err error) {
+					if err != nil {
+						state.AbortStaged()
+					}
+				}, nil
 		},
 		Hot: &ingest.HotConfig{
 			Session:           sess,
@@ -577,8 +581,9 @@ func report(out *os.File, p *phaseStats) {
 		[2]string{"staged metadata", fmt.Sprintf("%d ops in %d batches (%.1f per batch, %.2f per live event)",
 			p.metaOps.Load(), p.metaBatches.Load(), float64(p.metaOps.Load())/float64(max(1, p.metaBatches.Load())),
 			float64(p.metaOps.Load())/float64(max(1, p.live.Load())))},
-		[2]string{"hot batches", fmt.Sprintf("live %.0f inline, %.0f pointer; bulk %.0f inline, %.0f pointer",
-			p.batches[0][0], p.batches[0][1], p.batches[1][0], p.batches[1][1])},
+		[2]string{"hot batches", fmt.Sprintf("live %.0f inline, %.0f pointer; bulk %.0f inline, %.0f pointer; %.1f per transaction",
+			p.batches[0][0], p.batches[0][1], p.batches[1][0], p.batches[1][1],
+			(p.batches[0][0]+p.batches[0][1]+p.batches[1][0]+p.batches[1][1])/float64(max(1, p.txn.total[catalog.TxHotBatch].summary().n)))},
 		[2]string{"fold", p.folds.summary().String()},
 		[2]string{"seal", p.seals.summary().String()},
 		[2]string{"max queued blocks", strconv.FormatInt(p.maxQueued.Load(), 10)},

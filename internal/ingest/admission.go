@@ -20,7 +20,11 @@ import (
 //  5. Bulk batches are pointer batches, at most one chunk long.
 //  6. Bulk chunks take permits for their raw bytes, released at commit.
 //  7. The writer bounds its uploads in flight (prepare); the blob store
-//     bounds PUTs process-wide.
+//     bounds PUTs process-wide. A bulk chunk also waits while as many bulk
+//     batches are frozen and uncommitted as uploads may be in flight.
+//     Commits are in seq order, so a live batch waits for every bulk batch
+//     frozen ahead of it: the byte pool alone let hundreds queue for the
+//     upload slots, and live latency grew to seconds (design §22.2).
 //  8. and 9. Every append waits while frozen-uncommitted bytes or
 //     committed-but-unfolded events are over their caps.
 //
@@ -98,6 +102,8 @@ func (h *hotWriter) admissibleLocked(class Class, raw int64) bool {
 		return true
 	case h.liveWaiting.Load() > 0:
 		return false
+	case h.bulkFrozen >= h.hot.UploadConcurrency:
+		return false
 	case h.bulkPermits > 0 && h.bulkPermits+raw > h.hot.BulkPendingBytes:
 		// A chunk larger than the whole pool is admitted alone.
 		return false
@@ -158,6 +164,9 @@ func (h *hotWriter) committed(b *hotBatch) {
 	defer h.mu.Unlock()
 	h.addPendingLocked(b.class, -b.raw)
 	h.bulkPermits -= b.permit
+	if b.class == ClassBulk {
+		h.bulkFrozen--
+	}
 	h.committedNext = b.last() + 1
 	h.cfg.Metrics.setHotUnfolded(h.unfoldedLocked())
 	h.signalLocked()

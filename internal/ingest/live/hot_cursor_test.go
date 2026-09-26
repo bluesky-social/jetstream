@@ -273,6 +273,7 @@ func testSplitCommitRelayCursor(t *testing.T, kind storagefake.FaultKind) {
 	open := func(hc *ingest.HotConfig) *Consumer {
 		hc.Uploader = up
 		hc.BatchMaxEvents = 1
+		hc.MaxCommitBatches = 1 // the fault's ordinal is a batch
 		hc.BatchMaxAge = time.Hour
 		hc.BlockMaxAge = time.Hour
 		c, err := Open(Config{
@@ -445,12 +446,13 @@ func TestConsumer_Hot_ChainStateCommitsWithLastRow(t *testing.T) {
 		SyncStateStore:    ss,
 		MaxEventsPerBlock: 16,
 		Hot: &ingest.HotConfig{
-			Session:        s,
-			Uploader:       up,
-			BatchMaxEvents: 1,
-			BatchMaxAge:    time.Hour,
-			BlockMaxAge:    time.Hour,
-			OnFailure:      func(err error) { failed <- err },
+			Session:          s,
+			Uploader:         up,
+			BatchMaxEvents:   1,
+			MaxCommitBatches: 1, // the fault's ordinal is a batch
+			BatchMaxAge:      time.Hour,
+			BlockMaxAge:      time.Hour,
+			OnFailure:        func(err error) { failed <- err },
 		},
 	})
 	require.NoError(t, err)

@@ -28,6 +28,7 @@ const (
 	DefaultHotBatchMaxAge        = 15 * time.Millisecond
 	DefaultBlockMaxAge           = 30 * time.Second
 	DefaultUploadConcurrency     = 8
+	DefaultMaxCommitBatches      = 32
 	DefaultInlineBytesPerSec     = 4 << 20
 	DefaultOverflowBatchMaxEvent = 1024
 	DefaultOverflowBatchMaxBytes = 1 << 20
@@ -151,6 +152,10 @@ type HotConfig struct {
 	// UploadConcurrency bounds the writer's pointer batch uploads in flight.
 	// The process-wide PUT bound (design §10.5 rule 7) is the blob store's.
 	UploadConcurrency int
+	// MaxCommitBatches bounds the consecutive ready batches one transaction
+	// commits (group commit), and so the transaction's size. 1 commits each
+	// batch alone.
+	MaxCommitBatches int
 
 	// Admission control (design §10.5). InlineBytesPerSec is the live
 	// inline token bucket's rate over encoded frame bytes; the burst is one
@@ -203,7 +208,7 @@ func (c *Config) validateHot() error {
 		return fmt.Errorf("%w: hot mode takes neither AsyncFlushWorkers nor Catalog", ErrInvalidConfig)
 	case c.MaxEventsPerBlock < 0 || c.ReadLogRetentionBytes < 0:
 		return fmt.Errorf("%w: MaxEventsPerBlock and ReadLogRetentionBytes must be >= 0", ErrInvalidConfig)
-	case h.BatchMaxEvents < 0 || h.BatchMaxBytes < 0 || h.BatchMaxAge < 0 || h.BlockMaxAge < 0 || h.UploadConcurrency < 0,
+	case h.BatchMaxEvents < 0 || h.BatchMaxBytes < 0 || h.BatchMaxAge < 0 || h.BlockMaxAge < 0 || h.UploadConcurrency < 0 || h.MaxCommitBatches < 0,
 		h.OverflowMaxEvents < 0 || h.OverflowMaxBytes < 0 || h.OverflowMaxAge < 0 || h.BulkChunkMaxEvents < 0,
 		h.BulkPendingBytes < 0 || h.PendingBytes < 0 || h.MaxUnfoldedEvents < 0:
 		return fmt.Errorf("%w: Hot limits must be >= 0", ErrInvalidConfig)
@@ -232,6 +237,9 @@ func (h *HotConfig) applyDefaults() {
 	}
 	if h.UploadConcurrency == 0 {
 		h.UploadConcurrency = DefaultUploadConcurrency
+	}
+	if h.MaxCommitBatches == 0 {
+		h.MaxCommitBatches = DefaultMaxCommitBatches
 	}
 	if h.InlineBytesPerSec == 0 {
 		h.InlineBytesPerSec = DefaultInlineBytesPerSec
@@ -308,6 +316,8 @@ type hotWriter struct {
 	// bulkPermits is the bulk permits held (rule 6); bulkCredit is the part
 	// of it taken for the chunk being appended, not yet attached to a batch.
 	bulkPermits, bulkCredit int64
+	// bulkFrozen is the bulk batches frozen and not yet committed (rule 7).
+	bulkFrozen int
 	// committedNext and foldedNext bound the committed-but-unfolded events
 	// (rule 9).
 	committedNext, foldedNext uint64
@@ -629,8 +639,9 @@ func (h *hotWriter) usableLocked() error {
 // 3-5). A bulk batch and a live overflow batch are pointer batches. A live
 // batch commits inline if the token bucket pays for it. Otherwise a batch
 // that reached an ordinary cut (events, bytes, age) enters overflow and keeps
-// growing, and one that must freeze now (class change, block close, a
-// barrier) becomes a pointer batch.
+// growing to the overflow limits, and one that must freeze now (class change,
+// block close, a barrier) or is already at those limits becomes a pointer
+// batch.
 func (h *hotWriter) cutLocked(forced bool) {
 	b := h.batch
 	if b == nil {
@@ -644,11 +655,13 @@ func (h *hotWriter) cutLocked(forced bool) {
 	case h.bucket == nil:
 	case h.bucket.take(b.raw):
 		b.tokens = b.raw
-	case !forced:
+	case !forced && b.n < h.hot.OverflowMaxEvents && b.raw < h.hot.OverflowMaxBytes:
 		b.overflow = true
 		h.kickAger()
 		return
 	default:
+		// Includes a batch already at the overflow limits (they may be
+		// below the ordinary ones): growing it would pass them.
 		pointer = true
 	}
 	h.freezeLocked(pointer)
@@ -668,6 +681,7 @@ func (h *hotWriter) freezeLocked(pointer bool) {
 	if b.class == ClassBulk {
 		b.permit += h.bulkCredit
 		h.bulkCredit = 0
+		h.bulkFrozen++
 	}
 	h.addPendingLocked(b.class, b.raw)
 	b.ready = make(chan struct{})
@@ -760,7 +774,7 @@ func (h *hotWriter) commitLoop() {
 			// not all commit must not be folded: the next session rebuilds
 			// from what did.
 		case it.batch != nil:
-			if err := h.commitBatch(it.batch); err != nil {
+			if err := h.commitBatches(h.group(it.batch)); err != nil {
 				h.fail(err)
 			}
 		case it.meta != nil:
@@ -788,74 +802,129 @@ func (h *hotWriter) dequeue() hotItem {
 	}
 }
 
+// group waits for b to be ready and takes the consecutive batches behind it
+// that are ready too, to commit in one transaction (group commit, design
+// §10.5). It never waits for a later batch: the group is what the committer
+// can commit now. A batch whose prepare failed ends the group, so the ones
+// ahead of it still commit.
+func (h *hotWriter) group(b *hotBatch) []*hotBatch {
+	<-b.ready
+	g := []*hotBatch{b}
+	if b.err != nil {
+		return g
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for len(g) < h.hot.MaxCommitBatches && len(h.queue) > 0 {
+		next := h.queue[0].batch
+		if next == nil {
+			break
+		}
+		select {
+		case <-next.ready:
+		default:
+			return g
+		}
+		if next.err != nil {
+			break
+		}
+		g = append(g, next)
+		h.queue[0] = hotItem{}
+		h.queue = h.queue[1:]
+	}
+	return g
+}
+
 func (h *hotWriter) hook() DurableBatchHook {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.cfg.OnDurableBatch
 }
 
-// commitBatch is design §10.4: one transaction, then the hook's callbacks,
-// the durable watermark, and the doorbell.
-func (h *hotWriter) commitBatch(b *hotBatch) error {
-	<-b.ready
-	if b.err != nil {
-		return b.err
-	}
-	if b.pointer {
-		if err := h.crash(crashpoint.AfterHotBatchUploadBeforeCommit); err != nil {
-			return err
+// commitBatches is design §10.4 for a group of consecutive ready batches:
+// one transaction, then, batch by batch in seq order, the hook's callbacks
+// and the durable watermark, then the doorbell. The hook runs once per
+// batch, each into its own op batch, so every prepare sample reaches it in
+// order as it does with one batch per transaction.
+func (h *hotWriter) commitBatches(bs []*hotBatch) error {
+	for _, b := range bs {
+		if b.err != nil {
+			return b.err
 		}
 	}
-	return obs.Span(h.ctx, func(ctx context.Context) error {
-		trace.SpanFromContext(ctx).SetAttributes(
-			attribute.Int64("first_seq", int64(b.first)),
-			attribute.Int("events", b.n),
-			attribute.String("class", b.class.String()),
-			attribute.Bool("pointer", b.pointer),
-		)
-		next := b.last() + 1
-		ops := metastore.NewOpBatch(nil)
-		var afterCommit func()
-		var afterDone func(error)
-		if hook := h.hook(); hook != nil {
-			var err error
-			afterCommit, afterDone, err = hook(ctx, ops, next, false, b.prepareValue)
-			if err != nil {
-				return fmt.Errorf("ingest: on_durable_batch: %w", err)
+	for _, b := range bs {
+		if b.pointer {
+			if err := h.crash(crashpoint.AfterHotBatchUploadBeforeCommit); err != nil {
+				return err
 			}
 		}
-		hb := catalog.HotBatch{
-			FirstSeq:       b.first,
-			LastSeq:        b.last(),
-			MinWitnessedUS: b.info.MinWitnessedAt,
-			MaxWitnessedUS: b.info.MaxWitnessedAt,
-			Meta:           ops.Ops(),
+	}
+	first, last := bs[0], bs[len(bs)-1]
+	return obs.Span(h.ctx, func(ctx context.Context) error {
+		events := int(last.last() - first.first + 1)
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.Int64("first_seq", int64(first.first)),
+			attribute.Int("events", events),
+			attribute.Int("batches", len(bs)),
+		)
+		hbs := make([]catalog.HotBatch, len(bs))
+		afterCommit := make([]func(), len(bs))
+		var afterDone []func(error)
+		var err error
+		defer func() {
+			for _, done := range afterDone {
+				done(err)
+			}
+		}()
+		hook := h.hook()
+		for i, b := range bs {
+			ops := metastore.NewOpBatch(nil)
+			if hook != nil {
+				var done func(error)
+				var herr error
+				afterCommit[i], done, herr = hook(ctx, ops, b.last()+1, false, b.prepareValue)
+				if done != nil {
+					afterDone = append(afterDone, done)
+				}
+				if herr != nil {
+					err = fmt.Errorf("ingest: on_durable_batch: %w", herr)
+					return err
+				}
+			}
+			hbs[i] = catalog.HotBatch{
+				FirstSeq:       b.first,
+				LastSeq:        b.last(),
+				MinWitnessedUS: b.info.MinWitnessedAt,
+				MaxWitnessedUS: b.info.MaxWitnessedAt,
+				Meta:           ops.Ops(),
+			}
+			if b.pointer {
+				hbs[i].Object = b.ref
+			} else {
+				hbs[i].Frame = b.frame
+			}
 		}
-		if b.pointer {
-			hb.Object = b.ref
-		} else {
-			hb.Frame = b.frame
+		var res []catalog.HotBatchCommit
+		if res, err = h.hot.Session.CommitHotBatches(ctx, hbs); err != nil {
+			return fmt.Errorf("ingest: commit hot batch [%d,%d]: %w", first.first, last.last(), err)
 		}
-		res, err := h.hot.Session.CommitHotBatch(ctx, hb)
-		if afterDone != nil {
-			defer afterDone(err)
+		rev := res[0].Revision
+		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("revision", int64(rev)))
+		if cerr := h.crash(crashpoint.AfterHotBatchCommitBeforeAck); cerr != nil {
+			return cerr
 		}
-		if err != nil {
-			return fmt.Errorf("ingest: commit hot batch [%d,%d]: %w", b.first, b.last(), err)
+		for i, b := range bs {
+			b.objectID = res[i].ObjectID
+			h.committed(b)
+			h.readLog.advanceDurable(b.last() + 1)
+			if afterCommit[i] != nil {
+				afterCommit[i]()
+			}
+			h.cfg.Metrics.observeHotBatch(b.class, b.pointer, b.n)
 		}
-		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("revision", int64(res.Revision)))
-		if err := h.crash(crashpoint.AfterHotBatchCommitBeforeAck); err != nil {
-			return err
-		}
-		b.objectID = res.ObjectID
-		h.committed(b)
-		h.readLog.advanceDurable(next)
-		if afterCommit != nil {
-			afterCommit()
-		}
-		h.cfg.Metrics.observeHotBatch(b.class, b.pointer, b.n)
+		h.cfg.Metrics.observeHotCommit(len(bs))
 		if h.hot.OnCommit != nil {
-			h.hot.OnCommit(res.Revision)
+			h.hot.OnCommit(rev)
 		}
 		return nil
 	})

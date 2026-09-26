@@ -89,6 +89,12 @@ type Config struct {
 	// after either outcome. All three run under the writer mutex: do not
 	// call Writer methods or perform unbounded I/O.
 	//
+	// In hot mode one transaction may commit several consecutive batches
+	// (group commit, design §10.5): the hook runs for each, in order, before
+	// the transaction; then each batch's afterCommit runs in order, then
+	// each afterDone. A hook must not assume that the next hook call means
+	// the previous batch failed; afterDone reports that.
+	//
 	// force requests a checkpoint without a new block on DrainDurability,
 	// Close, or SealActiveAndClose. It does not make pending events
 	// durable. Metadata tied to events must still be gated by nextSeq.

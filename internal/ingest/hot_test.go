@@ -22,6 +22,7 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -206,7 +207,7 @@ func requireSameEvent(t *testing.T, want, got segment.Event) {
 
 // hookRec is a DurableBatchHook that checks the §10.4 contract as it runs:
 // nextSeq only grows, the prepare value is the one sampled at freeze, and
-// afterCommit sees its commit durable.
+// afterCommit sees its commit durable and runs in batch order.
 type hookRec struct {
 	t       *testing.T
 	env     *hotEnv
@@ -219,6 +220,8 @@ type hookRec struct {
 	forces    int
 	doneErrs  []error
 	committed int
+	// lastCommitted is the nextSeq of the last afterCommit.
+	lastCommitted uint64
 }
 
 func (r *hookRec) onAppend(ev *segment.Event) error {
@@ -249,13 +252,17 @@ func (r *hookRec) hook(_ context.Context, b metastore.Batch, nextSeq uint64, for
 		require.Equal(r.t, r.env.committedNext(), l.DurableSeq(), "the read log waits for the commit")
 	}
 	after := func() {
-		require.Equal(r.t, nextSeq, r.env.committedNext(), "afterCommit runs after the commit")
+		// A group commit's batches all commit before the first afterCommit.
+		require.GreaterOrEqual(r.t, r.env.committedNext(), nextSeq, "afterCommit runs after the commit")
 		if l := r.log.Load(); l != nil {
 			require.Equal(r.t, nextSeq, l.DurableSeq())
 		}
 		r.mu.Lock()
+		defer r.mu.Unlock()
+		// A forced metadata commit may repeat the previous nextSeq.
+		require.GreaterOrEqual(r.t, nextSeq, r.lastCommitted, "afterCommit runs in batch order")
+		r.lastCommitted = nextSeq
 		r.committed++
-		r.mu.Unlock()
 	}
 	done := func(err error) {
 		r.mu.Lock()
@@ -315,6 +322,7 @@ func runHotSwarm(t *testing.T, rng *rand.Rand) {
 		BulkPendingBytes:   int64(1 + rng.IntN(8000)),
 		PendingBytes:       int64(1 + rng.IntN(16000)),
 		MaxUnfoldedEvents:  int64(maxBlock + rng.IntN(3*maxBlock)),
+		MaxCommitBatches:   []int{0, 1, 2}[rng.IntN(3)],
 	}
 	pointers := rng.IntN(2) == 0
 	if pointers {
@@ -553,7 +561,8 @@ func TestHot_CommitFailure(t *testing.T) {
 				rec := &hookRec{t: t, env: env}
 				var failures atomic.Int32
 				w := env.open(Config{
-					Hot:                      &HotConfig{BatchMaxEvents: 5, OnFailure: func(error) { failures.Add(1) }},
+					// One batch per transaction, so the fault's ordinal is a batch.
+					Hot:                      &HotConfig{BatchMaxEvents: 5, MaxCommitBatches: 1, OnFailure: func(error) { failures.Add(1) }},
 					OnAppend:                 rec.onAppend,
 					DurableBatchPrepareValue: rec.prepare,
 				})
@@ -591,6 +600,94 @@ func TestHot_CommitFailure(t *testing.T) {
 			})
 		})
 	}
+}
+
+// groupEnv stalls a bulk pointer batch on its upload, then freezes three
+// inline live batches behind it, so all four are ready when the upload
+// finishes.
+func groupEnv(t *testing.T, env *hotEnv, m *Metrics, rec *hookRec) (*Writer, chan struct{}) {
+	t.Helper()
+	gate := make(chan struct{})
+	w := env.open(Config{
+		MaxEventsPerBlock:        64,
+		Metrics:                  m,
+		OnAppend:                 rec.onAppend,
+		DurableBatchPrepareValue: rec.prepare,
+		OnDurableBatch:           rec.hook,
+		Hot: &HotConfig{
+			Uploader:           &gatedUploader{up: env.up, gate: gate},
+			BatchMaxEvents:     2,
+			BatchMaxAge:        time.Hour,
+			BlockMaxAge:        time.Hour,
+			BulkChunkMaxEvents: 2,
+			InlineBytesPerSec:  -1,
+		},
+	})
+	rng := rand.New(rand.NewPCG(13, 13))
+	require.NoError(t, w.AppendBatch(WithClass(t.Context(), ClassBulk), sizedEvents(rng, 2)))
+	require.NoError(t, w.AppendBatch(t.Context(), sizedEvents(rng, 6)))
+	synctest.Wait()
+	require.Equal(t, uint64(1), env.committedNext(), "everything waits on the upload")
+	return w, gate
+}
+
+// Group commit (design §10.5): consecutive ready batches commit in one
+// transaction, and every hook's afterCommit and afterDone still runs, in
+// batch order.
+func TestHot_GroupCommit(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		env := newHotEnv(t)
+		m := NewMetrics(prometheus.NewRegistry())
+		rec := &hookRec{t: t, env: env}
+		w, gate := groupEnv(t, env, m, rec)
+		close(gate)
+		require.NoError(t, w.Flush(t.Context()))
+		require.Equal(t, uint64(9), env.committedNext())
+
+		rows := env.rows()
+		require.Equal(t, []rowShape{{1, 2, false}, {3, 4, true}, {5, 6, true}, {7, 8, true}}, shapes(rows))
+		for _, r := range rows {
+			require.Equal(t, rows[0].Revision, r.Revision, "one transaction")
+		}
+		var hist dto.Metric
+		require.NoError(t, m.HotCommitBatches.Write(&hist))
+		require.Equal(t, uint64(1), hist.GetHistogram().GetSampleCount())
+		require.Equal(t, 4.0, hist.GetHistogram().GetSampleSum())
+
+		rec.mu.Lock()
+		require.Equal(t, 4, rec.batches)
+		require.Equal(t, 4, rec.committed)
+		require.Equal(t, []error{nil, nil, nil, nil}, rec.doneErrs)
+		rec.mu.Unlock()
+		require.NoError(t, w.Close())
+	})
+}
+
+// A failed group commits none of its batches, and every batch's afterDone
+// sees the error.
+func TestHot_GroupCommitFailure(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		env := newHotEnv(t)
+		env.db.InjectFaults(&storagefake.Fault{Kind: storagefake.FaultCommitFails, TxKind: catalog.TxHotBatch, Ordinal: 1})
+		rec := &hookRec{t: t, env: env}
+		w, gate := groupEnv(t, env, nil, rec)
+		close(gate)
+		require.Error(t, w.Flush(t.Context()))
+		require.Error(t, w.Close())
+		require.Equal(t, uint64(1), env.committedNext())
+		require.Empty(t, env.rows())
+
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		require.Equal(t, 4, rec.batches)
+		require.Zero(t, rec.committed)
+		require.Len(t, rec.doneErrs, 4)
+		for _, err := range rec.doneErrs {
+			require.Error(t, err)
+		}
+	})
 }
 
 // A hook failure afterDone sees the commit error; a hook error ends the

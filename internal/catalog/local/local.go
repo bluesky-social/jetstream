@@ -284,7 +284,13 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 	)
 	for i, f := range files {
 		gen, err := readGeneration(c.fs, f.Path)
-		if err != nil {
+		switch {
+		case err == nil:
+		case errors.Is(err, io.EOF) && attached && i == len(files)-1:
+			// A rotating writer creates its next file before writing the
+			// header, and Snapshot reads that tail from the writer anyway.
+			continue
+		default:
 			return fmt.Errorf("catalog/local: %s: %w", f.Path, err)
 		}
 		if gen == 0 {

@@ -27,6 +27,7 @@ func flush(t *testing.T, s *StateStore) error {
 	b := s.s.NewBatch()
 	s.StageFlush(b)
 	if err := b.Commit(t.Context()); err != nil {
+		s.AbortStaged()
 		return err
 	}
 	s.CommitStaged()
@@ -433,6 +434,7 @@ func TestStateStore_FailedPipelinedBatchCarriesForward(t *testing.T) {
 	next := s.Snapshot()
 
 	s.StageSnapshot(raw.NewBatch(), failed) // never committed
+	s.AbortStaged()
 	batch := raw.NewBatch()
 	s.StageSnapshot(batch, next)
 	require.Equal(t, 2, batch.Len())
@@ -442,5 +444,78 @@ func TestStateStore_FailedPipelinedBatchCarriesForward(t *testing.T) {
 		durable, err := New(raw).LoadChain(t.Context(), did)
 		require.NoError(t, err)
 		require.NotNil(t, durable, "did=%s", did)
+	}
+}
+
+// A group commit stages several batches before committing them together.
+// None of them restages another's entries, and each CommitStaged clears
+// the oldest staged batch's captures.
+func TestStateStore_GroupCommitStagesEachBatchOnce(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	dids := []atmos.DID{
+		parseDID(t, "did:plc:vvvvvvvvvvvvvvvvvvvvvvvv"),
+		parseDID(t, "did:plc:wwwwwwwwwwwwwwwwwwwwwwww"),
+	}
+	promote := func(did atmos.DID, rev string) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+		s.PromoteChain(did, rev)
+	}
+	promote(dids[0], "3lrev1")
+	first := s.Snapshot()
+	promote(dids[1], "3lrev1")
+	promote(dids[0], "3lrev2")
+	second := s.Snapshot()
+
+	group := raw.NewBatch()
+	s.StageSnapshot(group, first)
+	require.Equal(t, 1, group.Len())
+	s.StageSnapshot(group, second)
+	require.Equal(t, 3, group.Len(), "the second batch stages only its own promotions")
+	require.NoError(t, group.Commit(t.Context()))
+	s.CommitStaged()
+	s.CommitStaged()
+
+	for i, want := range []string{"3lrev2", "3lrev1"} {
+		durable, err := New(raw).LoadChain(t.Context(), dids[i])
+		require.NoError(t, err)
+		require.NotNil(t, durable)
+		require.Equal(t, want, durable.Rev)
+	}
+	next := raw.NewBatch()
+	s.StageFlush(next)
+	require.Zero(t, next.Len(), "both batches' captures were cleared")
+}
+
+// A failed group takes every batch staged in it: the next batch restages
+// what they held that is still current, once.
+func TestStateStore_FailedGroupCarriesEveryBatch(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	a := parseDID(t, "did:plc:xxxxxxxxxxxxxxxxxxxxxxxx")
+	b := parseDID(t, "did:plc:yyyyyyyyyyyyyyyyyyyyyyyy")
+	promote := func(did atmos.DID, rev string) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+		s.PromoteChain(did, rev)
+	}
+	promote(a, "3lrev1")
+	s.StageSnapshot(raw.NewBatch(), s.Snapshot())
+	promote(b, "3lrev1")
+	promote(a, "3lrev2")
+	s.StageSnapshot(raw.NewBatch(), s.Snapshot())
+	s.AbortStaged()
+
+	retry := raw.NewBatch()
+	s.StageFlush(retry)
+	require.Equal(t, 2, retry.Len())
+	require.NoError(t, retry.Commit(t.Context()))
+	s.CommitStaged()
+	for did, want := range map[atmos.DID]string{a: "3lrev2", b: "3lrev1"} {
+		durable, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.NotNil(t, durable, "did=%s", did)
+		require.Equal(t, want, durable.Rev)
 	}
 }

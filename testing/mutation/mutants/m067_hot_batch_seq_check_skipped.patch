@@ -1,7 +1,7 @@
 mutant: m067_hot_batch_seq_check_skipped
 target: internal/catalog/scripts.go
 failure-mode: |
-  CommitHotBatch no longer locks and checks the seq key against the batch's
+  CommitHotBatches no longer locks and checks the seq key against the batch's
   first seq (design §10.2). A leader whose in-memory seq diverged from the
   catalog would commit a batch that overlaps or skips the committed range,
   and the script overwrites the seq key anyway.
@@ -15,13 +15,13 @@ tiers: disagg
 diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
 --- a/internal/catalog/scripts.go
 +++ b/internal/catalog/scripts.go
-@@ -267,9 +267,6 @@ func (s *Session) CommitHotBatch(ctx context.Context, b HotBatch) (HotBatchCommi
+@@ -299,9 +299,6 @@
  	}
- 	var out HotBatchCommit
+ 	out := make([]HotBatchCommit, len(bs))
  	rev, err := s.run(ctx, TxHotBatch, func(tx Tx, rev uint64) error {
--		if err := checkSeq(ctx, tx, Main, b.FirstSeq); err != nil {
+-		if err := checkSeq(ctx, tx, Main, bs[0].FirstSeq); err != nil {
 -			return err
 -		}
- 		row := HotBatchRow{
- 			FirstSeq:       b.FirstSeq,
- 			LastSeq:        b.LastSeq,
+ 		for i, b := range bs {
+ 			row := HotBatchRow{
+ 				FirstSeq:       b.FirstSeq,

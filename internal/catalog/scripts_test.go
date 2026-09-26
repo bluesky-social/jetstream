@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -649,4 +650,167 @@ func TestScripts_ConcurrentSessionsSerialize(t *testing.T) {
 			require.True(t, found)
 		}
 	})
+}
+
+// A group commit is one transaction: every row shares its revision, the
+// hooks' ops apply in batch order (last write wins), and seq/next moves once.
+func TestScripts_CommitHotBatchesGroup(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		h.hot(1, 2)
+		ptr := h.object([]byte("grouped pointer batch"))
+		cursor := func(v string) []metastore.Op {
+			return []metastore.Op{{Kind: metastore.OpSet, Key: []byte("relay/cursor"), Value: []byte(v)}}
+		}
+		out, err := h.s.CommitHotBatches(ctx, []catalog.HotBatch{
+			{FirstSeq: 3, LastSeq: 4, Frame: []byte("a"), Meta: cursor("1")},
+			{FirstSeq: 5, LastSeq: 5, Object: ptr, Meta: cursor("2")},
+			{FirstSeq: 6, LastSeq: 8, Frame: []byte("c"), Meta: cursor("3")},
+		})
+		require.NoError(t, err)
+		require.Len(t, out, 3)
+		require.Zero(t, out[0].ObjectID)
+		require.Equal(t, ptr.ID, out[1].ObjectID)
+		for _, c := range out {
+			require.Equal(t, out[0].Revision, c.Revision)
+		}
+		v, _ := h.meta(catalog.MainSeqKey)
+		require.Equal(t, catalog.EncodeSeq(9), v)
+		v, _ = h.meta("relay/cursor")
+		require.Equal(t, "3", string(v))
+
+		snap, err := h.snapshot()
+		require.NoError(t, err)
+		require.Len(t, snap.HotBatches, 4)
+		for _, r := range snap.HotBatches[1:] {
+			require.Equal(t, out[0].Revision, r.Revision)
+		}
+		require.Less(t, snap.HotBatches[0].Revision, out[0].Revision)
+		h.hot(9, 9)
+		require.NoError(t, h.s.Err())
+	})
+}
+
+// A group that does not tile, or is empty, is rejected before any
+// transaction and ends the session.
+func TestScripts_CommitHotBatchesRejects(t *testing.T) {
+	t.Parallel()
+	for name, bs := range map[string][]catalog.HotBatch{
+		"empty":     nil,
+		"gap":       {{FirstSeq: 1, LastSeq: 1, Frame: []byte("a")}, {FirstSeq: 3, LastSeq: 3, Frame: []byte("b")}},
+		"overlap":   {{FirstSeq: 1, LastSeq: 2, Frame: []byte("a")}, {FirstSeq: 2, LastSeq: 3, Frame: []byte("b")}},
+		"bad batch": {{FirstSeq: 1, LastSeq: 1, Frame: []byte("a")}, {FirstSeq: 2, LastSeq: 2}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			eachBackend(t, func(t *testing.T, be backend) {
+				h := newHarness(t, be)
+				_, err := h.s.CommitHotBatches(t.Context(), bs)
+				require.Error(t, err)
+				require.Error(t, h.s.Err(), "a rejected script ends the session")
+				snap, err := h.snapshot()
+				require.NoError(t, err)
+				require.Empty(t, snap.HotBatches)
+			})
+		})
+	}
+}
+
+// gatedDB holds the first transaction of kind at Begin until gate closes,
+// and counts the transactions of that kind.
+type gatedDB struct {
+	catalog.DB
+	kind  catalog.TxKind
+	gate  chan struct{}
+	mu    sync.Mutex
+	count int
+}
+
+func (d *gatedDB) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, error) {
+	if kind == d.kind {
+		d.mu.Lock()
+		d.count++
+		first := d.count == 1
+		d.mu.Unlock()
+		if first {
+			<-d.gate
+		}
+	}
+	return d.DB.Begin(ctx, kind)
+}
+
+// BeginUploads calls that arrive while a transaction is in flight share the
+// next one, and each still gets its own slots.
+func TestScripts_BeginUploadsGroup(t *testing.T) {
+	t.Parallel()
+	for _, fault := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fault=%v", fault), func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				fake := storagefake.New(storagefake.Config{})
+				lock := fake.NewLease()
+				require.NoError(t, lock.Acquire(t.Context(), time.Hour))
+				db := &gatedDB{DB: fake, kind: catalog.TxObjects, gate: make(chan struct{})}
+				s := catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: lock.Epoch()})
+				if fault {
+					fake.InjectFaults(&storagefake.Fault{Kind: storagefake.FaultCommitFails, TxKind: catalog.TxObjects, Ordinal: 2})
+				}
+				req := func(n int) []catalog.UploadRequest {
+					reqs := make([]catalog.UploadRequest, n)
+					for i := range reqs {
+						_, _ = rand.Read(reqs[i].Key[:])
+						_, _ = rand.Read(reqs[i].SHA256[:])
+						reqs[i].Length = 1
+					}
+					return reqs
+				}
+				type result struct {
+					slots []catalog.UploadSlot
+					err   error
+				}
+				call := func(n int) chan result {
+					ch := make(chan result, 1)
+					go func() {
+						slots, _, err := s.BeginUploads(t.Context(), req(n), time.Hour)
+						ch <- result{slots, err}
+					}()
+					return ch
+				}
+				first := call(1)
+				synctest.Wait()
+				rest := []chan result{call(1), call(2), call(3)}
+				synctest.Wait()
+				close(db.gate)
+
+				r := <-first
+				require.NoError(t, r.err)
+				require.Len(t, r.slots, 1)
+				ids := map[uint64]bool{r.slots[0].ObjectID: true}
+				for i, ch := range rest {
+					r := <-ch
+					if fault {
+						require.Error(t, r.err, "the calls sharing a failed transaction all fail")
+						continue
+					}
+					require.NoError(t, r.err)
+					require.Len(t, r.slots, i+1)
+					for _, sl := range r.slots {
+						require.False(t, sl.Dedup)
+						require.False(t, ids[sl.ObjectID], "slot IDs are distinct")
+						ids[sl.ObjectID] = true
+					}
+				}
+				require.Equal(t, 2, db.count, "the queued calls share one transaction")
+				if !fault {
+					require.NoError(t, s.Err())
+					// The lead is free again: a later call runs at once.
+					r := <-call(1)
+					require.NoError(t, r.err)
+					require.Equal(t, 3, db.count)
+				}
+			})
+		})
+	}
 }

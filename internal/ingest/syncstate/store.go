@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -72,14 +73,17 @@ type StateStore struct {
 	unsnappedIdent   map[atmos.DID]int64
 	unsnappedAccount map[atmos.DID]int64
 
-	// captured* record exactly which promoted values the most recent
-	// StageFlush wrote into its batch. CommitStaged clears only those,
-	// so a promotion that lands between StageFlush and CommitStaged is
-	// never silently discarded (it flushes with the next batch).
-	capturedChain   map[atmos.DID][]byte
-	capturedHosting map[atmos.DID][]byte
-	capturedIdent   map[atmos.DID]int64
-	capturedAccount map[atmos.DID]int64
+	// staged records exactly which promoted values each StageSnapshot wrote
+	// into its batch, oldest first, for batches that have neither committed
+	// nor failed. CommitStaged clears only the oldest's, so a promotion that
+	// lands between StageSnapshot and CommitStaged is never silently
+	// discarded (it flushes with the next batch). Several can be staged at
+	// once: a group commit stages each of its batches before committing
+	// them in one transaction.
+	staged []*Snapshot
+	// failed merges what AbortStaged took from staged; the next
+	// StageSnapshot carries the entries that are still current.
+	failed *Snapshot
 }
 
 type pendingChainState struct {
@@ -109,10 +113,18 @@ func New(s metastore.Store) *StateStore {
 }
 
 func (p *StateStore) resetUnsnappedLocked() {
-	p.unsnappedChain = make(map[atmos.DID][]byte)
-	p.unsnappedHosting = make(map[atmos.DID][]byte)
-	p.unsnappedIdent = make(map[atmos.DID]int64)
-	p.unsnappedAccount = make(map[atmos.DID]int64)
+	s := newSnapshot()
+	p.unsnappedChain, p.unsnappedHosting = s.chain, s.hosting
+	p.unsnappedIdent, p.unsnappedAccount = s.ident, s.account
+}
+
+func newSnapshot() *Snapshot {
+	return &Snapshot{
+		chain:   make(map[atmos.DID][]byte),
+		hosting: make(map[atmos.DID][]byte),
+		ident:   make(map[atmos.DID]int64),
+		account: make(map[atmos.DID]int64),
+	}
 }
 
 func chainKey(did atmos.DID) []byte {
@@ -380,6 +392,13 @@ type Snapshot struct {
 	ident, account map[atmos.DID]int64
 }
 
+func (s *Snapshot) forget(did atmos.DID) {
+	delete(s.chain, did)
+	delete(s.hosting, did)
+	delete(s.ident, did)
+	delete(s.account, did)
+}
+
 // Snapshot captures the state promoted since the previous Snapshot. A
 // durable batch whose writes are prepared before they commit (async flush,
 // pipelined hot batches) must snapshot when it samples its relay cursor,
@@ -416,20 +435,22 @@ func (p *StateStore) StageFlush(b metastore.Batch) {
 // StageSnapshot adds snap's verifier state writes to b and records them so
 // CommitStaged can clear exactly them. Pending (not yet promoted) entries
 // are never flushed: their event rows are not durable yet.
+//
+// Each staged batch must end in CommitStaged or AbortStaged, in staging
+// order.
 func (p *StateStore) StageSnapshot(b metastore.Batch, snap *Snapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Batches stage and commit one at a time, so a capture still here was
-	// staged into a batch that failed to commit. Its entries that are still
-	// current ride with this batch, as they would have in a full snapshot.
-	carry(snap.chain, p.capturedChain, p.promotedChain, bytes.Equal)
-	carry(snap.hosting, p.capturedHosting, p.promotedHosting, bytes.Equal)
-	carry(snap.ident, p.capturedIdent, p.promotedIdent, func(a, b int64) bool { return a == b })
-	carry(snap.account, p.capturedAccount, p.promotedAccount, func(a, b int64) bool { return a == b })
-	p.capturedChain = snap.chain
-	p.capturedHosting = snap.hosting
-	p.capturedIdent = snap.ident
-	p.capturedAccount = snap.account
+	// Entries staged into a batch that failed to commit and still current
+	// ride with this batch, as they would have in a full snapshot.
+	if f := p.failed; f != nil {
+		carry(snap.chain, f.chain, p.promotedChain, bytes.Equal)
+		carry(snap.hosting, f.hosting, p.promotedHosting, bytes.Equal)
+		carry(snap.ident, f.ident, p.promotedIdent, func(a, b int64) bool { return a == b })
+		carry(snap.account, f.account, p.promotedAccount, func(a, b int64) bool { return a == b })
+		p.failed = nil
+	}
+	p.staged = append(p.staged, snap)
 	for did, val := range snap.chain {
 		b.Set(chainKey(did), val)
 	}
@@ -457,38 +478,63 @@ func carry[V any](dst, failed, promoted map[atmos.DID]V, equal func(a, b V) bool
 	}
 }
 
-// CommitStaged clears the promoted entries captured by the most recent
-// StageSnapshot after that batch commits successfully. Entries promoted
+// CommitStaged clears the promoted entries the oldest staged batch
+// captured, after that batch commits successfully. Entries promoted
 // (or re-saved) after the capture are left in place for the next flush
 // — clearing the whole map here would silently discard a write that
 // was never in the batch.
 func (p *StateStore) CommitStaged() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for did, captured := range p.capturedChain {
+	if len(p.staged) == 0 {
+		return
+	}
+	s := p.staged[0]
+	p.staged[0] = nil
+	p.staged = p.staged[1:]
+	for did, captured := range s.chain {
 		if cur, ok := p.promotedChain[did]; ok && bytes.Equal(cur, captured) {
 			delete(p.promotedChain, did)
 		}
 	}
-	for did, captured := range p.capturedHosting {
+	for did, captured := range s.hosting {
 		if cur, ok := p.promotedHosting[did]; ok && bytes.Equal(cur, captured) {
 			delete(p.promotedHosting, did)
 		}
 	}
-	for did, captured := range p.capturedIdent {
+	for did, captured := range s.ident {
 		if cur, ok := p.promotedIdent[did]; ok && cur == captured {
 			delete(p.promotedIdent, did)
 		}
 	}
-	for did, captured := range p.capturedAccount {
+	for did, captured := range s.account {
 		if cur, ok := p.promotedAccount[did]; ok && cur == captured {
 			delete(p.promotedAccount, did)
 		}
 	}
-	p.capturedChain = nil
-	p.capturedHosting = nil
-	p.capturedIdent = nil
-	p.capturedAccount = nil
+}
+
+// AbortStaged records that every staged batch not yet committed failed.
+// Writers commit in order and nothing after a failure, so a failed batch
+// takes every later staged batch with it. The next StageSnapshot restages
+// what they held that is still current.
+func (p *StateStore) AbortStaged() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.staged) == 0 {
+		return
+	}
+	if p.failed == nil {
+		p.failed = newSnapshot()
+	}
+	// Oldest first, so a later capture of the same DID wins.
+	for _, s := range p.staged {
+		maps.Copy(p.failed.chain, s.chain)
+		maps.Copy(p.failed.hosting, s.hosting)
+		maps.Copy(p.failed.ident, s.ident)
+		maps.Copy(p.failed.account, s.account)
+	}
+	p.staged = nil
 }
 
 // Delete atomically removes both chain and hosting state for did in one
@@ -512,10 +558,12 @@ func (p *StateStore) Delete(ctx context.Context, did atmos.DID) error {
 	delete(p.unsnappedHosting, did)
 	delete(p.unsnappedIdent, did)
 	delete(p.unsnappedAccount, did)
-	delete(p.capturedChain, did)
-	delete(p.capturedHosting, did)
-	delete(p.capturedIdent, did)
-	delete(p.capturedAccount, did)
+	for _, s := range p.staged {
+		s.forget(did)
+	}
+	if p.failed != nil {
+		p.failed.forget(did)
+	}
 	p.mu.Unlock()
 
 	b := p.s.NewBatch()

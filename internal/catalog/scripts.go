@@ -77,6 +77,13 @@ type Session struct {
 
 	mu  sync.Mutex
 	err error
+
+	// uploads groups concurrent BeginUploads calls into one transaction.
+	uploads struct {
+		sync.Mutex
+		busy  bool
+		queue []*uploadCall
+	}
 }
 
 // NewSession returns a Session for epoch.
@@ -262,38 +269,70 @@ type HotBatchCommit struct {
 
 // CommitHotBatch is the §10.4 batch transaction.
 func (s *Session) CommitHotBatch(ctx context.Context, b HotBatch) (HotBatchCommit, error) {
-	if err := b.validate(); err != nil {
-		return HotBatchCommit{}, s.fail(err)
+	out, err := s.CommitHotBatches(ctx, []HotBatch{b})
+	if err != nil {
+		return HotBatchCommit{}, err
 	}
-	var out HotBatchCommit
+	return out[0], nil
+}
+
+// CommitHotBatches commits consecutive hot batches in one §10.4 transaction
+// (group commit, §10.5): every row shares the revision, the hooks' ops apply
+// in batch order, and seq/next moves once, past the last batch. Every leader
+// transaction serializes on the fence row, so on a PostgreSQL whose commits
+// wait for a WAL flush, one transaction per batch caps the whole leader near
+// 1/flush-latency transactions a second (§22.2).
+func (s *Session) CommitHotBatches(ctx context.Context, bs []HotBatch) ([]HotBatchCommit, error) {
+	if len(bs) == 0 {
+		return nil, s.fail(errors.New("catalog: commit of no hot batches"))
+	}
+	var meta []metastore.Op
+	for i, b := range bs {
+		if err := b.validate(); err != nil {
+			return nil, s.fail(err)
+		}
+		if i > 0 && b.FirstSeq != bs[i-1].LastSeq+1 {
+			return nil, s.fail(fmt.Errorf("catalog: hot batch [%d,%d] does not follow [%d,%d]",
+				b.FirstSeq, b.LastSeq, bs[i-1].FirstSeq, bs[i-1].LastSeq))
+		}
+		meta = append(meta, b.Meta...)
+	}
+	out := make([]HotBatchCommit, len(bs))
 	rev, err := s.run(ctx, TxHotBatch, func(tx Tx, rev uint64) error {
-		if err := checkSeq(ctx, tx, Main, b.FirstSeq); err != nil {
+		if err := checkSeq(ctx, tx, Main, bs[0].FirstSeq); err != nil {
 			return err
 		}
-		row := HotBatchRow{
-			FirstSeq:       b.FirstSeq,
-			LastSeq:        b.LastSeq,
-			EventCount:     uint32(b.LastSeq - b.FirstSeq + 1),
-			MinWitnessedUS: b.MinWitnessedUS,
-			MaxWitnessedUS: b.MaxWitnessedUS,
-			Epoch:          s.epoch,
-			Revision:       rev,
-			Frame:          b.Frame,
-		}
-		if b.Frame == nil {
-			id, err := resolve(ctx, tx, b.Object)
-			if err != nil {
+		for i, b := range bs {
+			row := HotBatchRow{
+				FirstSeq:       b.FirstSeq,
+				LastSeq:        b.LastSeq,
+				EventCount:     uint32(b.LastSeq - b.FirstSeq + 1),
+				MinWitnessedUS: b.MinWitnessedUS,
+				MaxWitnessedUS: b.MaxWitnessedUS,
+				Epoch:          s.epoch,
+				Revision:       rev,
+				Frame:          b.Frame,
+			}
+			if b.Frame == nil {
+				id, err := resolve(ctx, tx, b.Object)
+				if err != nil {
+					return err
+				}
+				row.ObjectID, out[i].ObjectID = id, id
+			}
+			if err := tx.InsertHotBatch(ctx, row); err != nil {
 				return err
 			}
-			row.ObjectID, out.ObjectID = id, id
 		}
-		if err := tx.InsertHotBatch(ctx, row); err != nil {
-			return err
-		}
-		return tx.ApplyMeta(ctx, withSeq(Main, b.LastSeq+1, b.Meta))
+		return tx.ApplyMeta(ctx, withSeq(Main, bs[len(bs)-1].LastSeq+1, meta))
 	})
-	out.Revision = rev
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Revision = rev
+	}
+	return out, nil
 }
 
 func (b HotBatch) validate() error {
@@ -666,27 +705,98 @@ type UploadSlot struct {
 // transaction: dedup against available objects whose unreferenced age is
 // under maxUnrefAge (gc_delay/2), and insert uploading rows for the rest.
 // The committed rows make orphaned uploads visible to GC.
+//
+// Concurrent calls share a transaction (group commit, §10.5): a call that
+// arrives while another's transaction is in flight queues, and the next
+// transaction serves the whole queue. Every leader transaction serializes on
+// the fence row, and each pointer batch needs one of these, so on a
+// PostgreSQL whose commits wait for a WAL flush they would otherwise take
+// as much of the leader's commit capacity as the hot batches (§22.2). A
+// failure ends the session, so the calls sharing it share its fate either
+// way.
 func (s *Session) BeginUploads(ctx context.Context, reqs []UploadRequest, maxUnrefAge time.Duration) ([]UploadSlot, time.Time, error) {
 	for _, r := range reqs {
 		if r.Length <= 0 {
 			return nil, time.Time{}, s.fail(fmt.Errorf("catalog: upload of %d bytes", r.Length))
 		}
 	}
-	slots := make([]UploadSlot, len(reqs))
+	c := &uploadCall{reqs: reqs, maxUnrefAge: maxUnrefAge, lead: make(chan struct{}), done: make(chan struct{})}
+	u := &s.uploads
+	u.Lock()
+	u.queue = append(u.queue, c)
+	if !u.busy {
+		u.busy = true
+		close(c.lead)
+	}
+	u.Unlock()
+	select {
+	case <-c.done:
+	case <-c.lead:
+		s.leadUploads(ctx)
+	}
+	<-c.done
+	return c.slots, c.committed, c.err
+}
+
+// uploadCall is one BeginUploads call waiting for a transaction. lead is
+// closed when the call must run the next transaction itself.
+type uploadCall struct {
+	reqs        []UploadRequest
+	maxUnrefAge time.Duration
+	lead, done  chan struct{}
+
+	slots     []UploadSlot
+	committed time.Time
+	err       error
+}
+
+// leadUploads runs one transaction for every queued call, then hands the
+// lead to the first call that queued meanwhile, so no call waits for more
+// than the transaction in flight and its own.
+func (s *Session) leadUploads(ctx context.Context) {
+	u := &s.uploads
+	u.Lock()
+	calls := u.queue
+	u.queue = nil
+	u.Unlock()
+
+	slots, committed, err := s.beginUploads(ctx, calls)
+	for i, c := range calls {
+		if err == nil {
+			c.slots, c.committed = slots[i], committed
+		}
+		c.err = err
+		close(c.done)
+	}
+
+	u.Lock()
+	if len(u.queue) > 0 {
+		close(u.queue[0].lead)
+	} else {
+		u.busy = false
+	}
+	u.Unlock()
+}
+
+func (s *Session) beginUploads(ctx context.Context, calls []*uploadCall) ([][]UploadSlot, time.Time, error) {
+	slots := make([][]UploadSlot, len(calls))
 	_, err := s.run(ctx, TxObjects, func(tx Tx, rev uint64) error {
 		var fresh []NewObject
-		var at []int
-		for i, r := range reqs {
-			row, found, err := tx.FindAvailableObject(ctx, r.SHA256, maxUnrefAge)
-			if err != nil {
-				return err
+		var at [][2]int
+		for i, c := range calls {
+			slots[i] = make([]UploadSlot, len(c.reqs))
+			for j, r := range c.reqs {
+				row, found, err := tx.FindAvailableObject(ctx, r.SHA256, c.maxUnrefAge)
+				if err != nil {
+					return err
+				}
+				if found {
+					slots[i][j] = UploadSlot{ObjectID: row.ID, Dedup: true}
+					continue
+				}
+				fresh = append(fresh, NewObject(r))
+				at = append(at, [2]int{i, j})
 			}
-			if found {
-				slots[i] = UploadSlot{ObjectID: row.ID, Dedup: true}
-				continue
-			}
-			fresh = append(fresh, NewObject(r))
-			at = append(at, i)
 		}
 		if len(fresh) == 0 {
 			return nil
@@ -698,8 +808,8 @@ func (s *Session) BeginUploads(ctx context.Context, reqs []UploadRequest, maxUnr
 		if len(ids) != len(fresh) {
 			return fmt.Errorf("inserted %d object rows, want %d", len(ids), len(fresh))
 		}
-		for j, i := range at {
-			slots[i] = UploadSlot{ObjectID: ids[j]}
+		for k, ij := range at {
+			slots[ij[0]][ij[1]] = UploadSlot{ObjectID: ids[k]}
 		}
 		return nil
 	})

@@ -398,20 +398,30 @@ func (c *Consumer) onDurableBatch(ctx context.Context, b metastore.Batch, _ uint
 		// can't leave a durable identity row unguarded (#234).
 		if prep.sync != nil {
 			c.cfg.SyncStateStore.StageSnapshot(b, prep.sync)
-			return func() { c.cfg.SyncStateStore.CommitStaged() }, nil, nil
+			return func() { c.cfg.SyncStateStore.CommitStaged() }, c.abortStaged, nil
 		}
 		return nil, nil, nil
 	}
 	b.Set([]byte(c.cfg.CursorKey), metastore.EncodeVersionedUint64LE(cursorV1, uint64(cur)))
+	var afterDone func(error)
 	if prep.sync != nil {
 		c.cfg.SyncStateStore.StageSnapshot(b, prep.sync)
+		afterDone = c.abortStaged
 	}
 	return func() {
 		if c.cfg.SyncStateStore != nil {
 			c.cfg.SyncStateStore.CommitStaged()
 		}
 		c.cfg.Metrics.setUpstreamCursor(cur)
-	}, nil, nil
+	}, afterDone, nil
+}
+
+// abortStaged is a durable batch's afterDone: a batch that failed to commit
+// hands its verifier state to the next one staged.
+func (c *Consumer) abortStaged(err error) {
+	if err != nil {
+		c.cfg.SyncStateStore.AbortStaged()
+	}
 }
 
 func (c *Consumer) saveCursorAndSyncState(cur int64) error {
@@ -419,11 +429,15 @@ func (c *Consumer) saveCursorAndSyncState(cur int64) error {
 		return fmt.Errorf("livestream: refuse to save negative cursor %d to %s", cur, c.cfg.CursorKey)
 	}
 	b := c.cfg.Store.NewBatch()
-	afterCommit, _, err := c.onDurableBatch(context.Background(), b, 0, true, c.prepareDurable(cur))
+	afterCommit, afterDone, err := c.onDurableBatch(context.Background(), b, 0, true, c.prepareDurable(cur))
 	if err != nil {
 		return err
 	}
-	if err := b.Commit(context.Background()); err != nil {
+	err = b.Commit(context.Background())
+	if afterDone != nil {
+		afterDone(err)
+	}
+	if err != nil {
 		return fmt.Errorf("livestream: save %s: %w", c.cfg.CursorKey, err)
 	}
 	if afterCommit != nil {

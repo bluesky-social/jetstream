@@ -3,7 +3,7 @@ target: internal/ingest/hot.go
 failure-mode: |
   The hot writer runs the durable batch hook (relay cursor plus verifier
   sync state) only for the batch that closes a block, as the local writer's
-  per-block durability did, instead of in every hot batch transaction
+  per-block durability did, instead of for every hot batch it commits
   (design §10.4). Batches in the middle of a block commit rows without the
   cursor that covers them. After a leader change the successor resumes
   from an older cursor with older chain state and archives whole events a
@@ -18,12 +18,12 @@ tiers: disagg
 diff --git a/internal/ingest/hot.go b/internal/ingest/hot.go
 --- a/internal/ingest/hot.go
 +++ b/internal/ingest/hot.go
-@@ -817,7 +817,7 @@ func (h *hotWriter) commitBatch(b *hotBatch) error {
- 		ops := metastore.NewOpBatch(nil)
- 		var afterCommit func()
- 		var afterDone func(error)
--		if hook := h.hook(); hook != nil {
-+		if hook := h.hook(); hook != nil && b.start+b.n >= h.cfg.MaxEventsPerBlock {
- 			var err error
- 			afterCommit, afterDone, err = hook(ctx, ops, next, false, b.prepareValue)
- 			if err != nil {
+@@ -879,7 +879,7 @@
+ 		hook := h.hook()
+ 		for i, b := range bs {
+ 			ops := metastore.NewOpBatch(nil)
+-			if hook != nil {
++			if hook != nil && b.start+b.n >= h.cfg.MaxEventsPerBlock {
+ 				var done func(error)
+ 				var herr error
+ 				afterCommit[i], done, herr = hook(ctx, ops, b.last()+1, false, b.prepareValue)

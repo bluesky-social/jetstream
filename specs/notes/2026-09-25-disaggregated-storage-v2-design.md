@@ -353,7 +353,10 @@ referencing transaction runs step 6 (see the end of this section). Steps:
    check on a deduped object is a real bug.
 3. Insert `objects(key = new uuid, sha256, byte_length, state = 'uploading')`.
    This is a leader write transaction (fenced). One transaction may insert rows
-   for several pending uploads at once. A committed `uploading` row makes an
+   for several pending uploads at once. Concurrent uploads also share it:
+   `Session.BeginUploads` queues a call that arrives while another's step 3
+   is in flight, and the next transaction serves the whole queue (S2.23,
+   §22.2). A committed `uploading` row makes an
    orphaned upload visible to GC. No PUT happens without one, so a fenced-out
    leader cannot start new uploads.
 4. PUT the bytes.
@@ -728,14 +731,28 @@ After the commit succeeds:
   `Flush` waits on today);
 - ring the local follower's in-process doorbell.
 
-On failure: run `afterDone(err)` and end the session. A hook that returns an
+**Group commit.** One transaction may commit several consecutive batches:
+the committer takes every batch at the head of the queue whose frame (and
+upload) is ready, up to `MaxCommitBatches` (default 32). The transaction runs
+the fence and the `seq/next` check once, inserts each row with the shared
+revision, applies each hook's ops in batch order, and moves `seq/next` once, past
+the last batch. Every leader transaction serializes on the fence row, so on a
+PostgreSQL whose commits wait for a WAL flush, one transaction per batch caps
+the leader near one batch per flush (§22.2). A group only takes batches that
+are already ready. It never waits to fill, so an idle writer still commits each
+batch as soon as it is ready. After the commit, each batch's `afterCommit` runs
+in order, then each `afterDone`.
+
+On failure: run `afterDone(err)` for every batch of the group and end the
+session. A hook that returns an
 error also ends the session, because it runs in the committer with no caller to
 return the error to. `DrainDurability` and `Close` commit hook output with no
 events as a metadata transaction, and skip it when the hook stages nothing.
 
 **DurableBatchHook.** It keeps its current two-phase contract. The only change
 is the batch type, which becomes `metastore.Batch` instead of `*pebble.Batch`
-(§12). The hook runs once per committed hot batch, in the committer goroutine.
+(§12). The hook runs once per committed hot batch, in the committer goroutine,
+even when a group commit puts several batches in one transaction.
 `nextSeq` is `last_seq + 1` of that batch. `prepareValue` is the value sampled at
 freeze time. As today, the hook must not call Writer methods or do unbounded
 I/O.
@@ -813,7 +830,9 @@ Rules:
    Then it freezes as a pointer batch. Any other cut of an overflow batch also
    freezes it as a pointer batch. A cut that cannot wait (class change, block
    close, Flush, DrainDurability, Close) of a normal live batch the bucket cannot
-   pay for also makes a pointer batch, even a small one. Overflow ends with the
+   pay for also makes a pointer batch, even a small one. So does an ordinary
+   cut of a batch already at the overflow limits, which a configuration may
+   set below the ordinary ones. Overflow ends with the
    overflow batch: the next live batch tries the bucket afresh. The overflow
    limits are code constants (§18).
 5. **Bulk batches are always pointer batches.** A bulk batch holds at most 4096
@@ -830,7 +849,10 @@ Rules:
 7. **Upload concurrency.** At most `JETSTREAM_S3_UPLOAD_CONCURRENCY` (default 8)
    uploads run at once, across all writer and maintainer work. The process-wide
    bound is the blob store's PUT limit. The writer separately bounds its
-   in-flight uploads, at the same default.
+   in-flight uploads, at the same default. A bulk chunk also waits while as
+   many bulk batches are frozen and uncommitted as the writer may upload at
+   once. Uploads beyond that only queue, and every live batch frozen behind
+   them waits for them to commit (§22.2).
 8. **Total cap.** If frozen-but-uncommitted raw bytes exceed
    `JETSTREAM_HOT_PENDING_BYTES` (default 256MiB), every append blocks, live
    included. This is the last-resort backstop. Live appenders blocking means the
@@ -858,9 +880,11 @@ Commits stay strictly in seq order, so a live inline batch that follows a pointe
 batch waits for the pointer's upload and read-back. It also waits for every
 bulk batch frozen ahead of it to commit. On a PostgreSQL whose commits cost a
 real WAL flush, that wait was about a second while the 64MiB bulk permit pool
-alone set queue depth (§22.2). S2.23 therefore bounds the bulk batches frozen
-but not yet committed, and commits consecutive ready batches in one
-transaction. Measured results are in §22.2.
+alone set queue depth (§22.2). S2.23 therefore added three things. Rule 7
+bounds the bulk batches frozen but not yet committed. Group commit (§10.4)
+commits consecutive ready batches in one transaction. Concurrent object
+registrations share a transaction too (§7.3 step 3). With them, live p99 stays
+under 36ms beside 30k bulk events/s on the disk server (§22.2).
 
 ### 10.6 Direct mode
 
@@ -2019,6 +2043,8 @@ Bulk recovery, with 3,000 live events/s:
 | 4M, unpaced | disk | 36k/s | 6,742/7,102ms | |
 | 30k/s paced, 256KiB bulk permits | disk | 30k/s | 26.5/66.7ms | experiment |
 
+The rows above are from before S2.23. The bullets below explain them.
+
 - **Live latency misses the target during bulk recovery on the disk server.**
   §10.5 assumed a live batch waits behind about one S3 PUT. It actually waits
   behind every bulk batch frozen ahead of it, and the 64MiB bulk permit pool
@@ -2037,6 +2063,38 @@ Bulk recovery, with 3,000 live events/s:
   hot batches in one transaction.
 - Unpaced bulk on tmpfs misses too (415/609ms), for the same queue-depth
   reason.
+
+After S2.23, with 3,000 live events/s:
+
+| Bulk | PG | Bulk achieved | End-to-end p50/p99 | Hot batches per txn |
+|---|---|---|---|---|
+| none | disk | — | 13.8/22.0ms | 1.0 |
+| 10k/s paced | disk | 10k/s | 14.1/25.8ms | 1.1 |
+| 30k/s paced (3 runs) | disk | 30k/s | 16.6–16.9/33.5–35.4ms | 1.4 |
+| 4M, unpaced | disk | 140k/s | 41.0/89.6ms | 4.3 |
+| 30k/s paced | tmpfs | 30k/s | 8.2/17.7ms | 1.1 |
+| 1M, unpaced | tmpfs | 386k/s | 19.8/71.8ms | 3.3 |
+
+- **The target holds on the disk server.** Live p99 stays within 40ms beside
+  30k bulk events/s, down from 1.9s. Unpaced bulk runs 3.9 times faster
+  (140k against 36k events/s), and its live p99 falls from 7.1s to 90ms.
+- Each part moved a different number. Measured one after another on the
+  disk server:
+  - Rule 7's frozen-bulk bound plus hot batch group commit gave 39.4–41.6ms
+    at 30k/s paced, and 105k/s at 72/122ms unpaced.
+  - Sharing object registrations then gave 33.5–35.4ms paced, and 140k/s at
+    41/90ms unpaced.
+- Paced bulk groups little: 1.4 hot batches per transaction and nearly one
+  object transaction per pointer batch. The bound on queued batches does most
+  of the work there. Unpaced bulk groups 4.3 hot batches per transaction, which
+  is where its throughput comes from.
+- On the disk server every transaction still costs a 4ms WAL flush on the
+  fence row. At 30k/s paced the leader runs about 170 transactions a second:
+  about 105 hot batch, 58 object, and 8 fold. The remaining p99 is queueing
+  behind them. Bulk beyond about 30k/s paced therefore needs fewer
+  transactions per event, not a faster path.
+- `cmd/storagebench write` reports hot batches per transaction, and
+  `jetstream_hot_commit_batches` shows it in production.
 
 Seal. A 256MiB segment seals in 1.40s (tmpfs) to 1.61s (disk). The seal
 transaction itself is 18–28ms. The rest is reading back the active blocks,
@@ -2096,6 +2154,7 @@ All metrics use the existing `obs` package. Names:
   metastore reads), `jetstream_pg_txn_errors_total{kind}`
 - `jetstream_hot_batches_total{class, storage=inline|pointer}`,
   `jetstream_hot_batch_events` (histogram),
+  `jetstream_hot_commit_batches` (histogram, batches per group commit),
   `jetstream_hot_unfolded_events` (gauge), `jetstream_hot_pending_bytes{class}`
 - `jetstream_admission_wait_seconds{class}`,
   `jetstream_hot_inline_tokens` (gauge)

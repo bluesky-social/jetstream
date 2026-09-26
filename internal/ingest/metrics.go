@@ -36,6 +36,9 @@ type Metrics struct {
 	// §23), labelled by admission class and inline or pointer storage.
 	HotBatches     *prometheus.CounterVec
 	HotBatchEvents prometheus.Histogram
+	// HotCommitBatches is the hot batches per commit transaction (group
+	// commit, design §10.5).
+	HotCommitBatches prometheus.Histogram
 	// Hot mode admission control (design §10.5, §23).
 	HotUnfoldedEvents prometheus.Gauge
 	HotPendingBytes   *prometheus.GaugeVec
@@ -144,6 +147,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Events per committed hot batch.",
 			Buckets: []float64{1, 4, 16, 64, 128, 256, 512, 1024, 4096},
 		}),
+		HotCommitBatches: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name:    "commit_batches",
+			Help:    "Hot batches committed per transaction.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32},
+		}),
 		HotUnfoldedEvents: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: "hot",
 			Name: "unfolded_events",
@@ -174,7 +183,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.SeqReservedEnd, m.SeqReservationHeadroom,
 		m.SeqGapCount, m.SeqGapWidth,
 		m.SeqGapsRegistered, m.SeqGapValuesRegistered,
-		m.HotBatches, m.HotBatchEvents,
+		m.HotBatches, m.HotBatchEvents, m.HotCommitBatches,
 		m.HotUnfoldedEvents, m.HotPendingBytes, m.HotInlineTokens, m.AdmissionWait,
 	)
 	return m
@@ -291,6 +300,12 @@ func (m *Metrics) observeHotBatch(class Class, pointer bool, events int) {
 	}
 	m.HotBatches.WithLabelValues(class.String(), storage).Inc()
 	m.HotBatchEvents.Observe(float64(events))
+}
+
+func (m *Metrics) observeHotCommit(batches int) {
+	if m != nil {
+		m.HotCommitBatches.Observe(float64(batches))
+	}
 }
 
 func (m *Metrics) setHotUnfolded(v uint64) {

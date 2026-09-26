@@ -202,6 +202,25 @@ func TestHot_TokenBucketOverflow(t *testing.T) {
 			require.Equal(t, []rowShape{{1, 1, false}, {2, 2, false}, {3, 3, false}}, shapes(env.rows()))
 		})
 	})
+	t.Run("limits below ordinary", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			// A batch that reaches its ordinary cut already at the overflow
+			// limits freezes as a pointer batch rather than grow past them.
+			env := newHotEnv(t)
+			w := env.open(Config{MaxEventsPerBlock: 64, Hot: &HotConfig{
+				Uploader:          env.up,
+				BatchMaxEvents:    4,
+				BatchMaxAge:       time.Hour,
+				OverflowMaxEvents: 2,
+				OverflowMaxAge:    time.Hour,
+				InlineBytesPerSec: 1,
+			}})
+			require.NoError(t, w.AppendBatch(t.Context(), sizedEvents(rand.New(rand.NewPCG(8, 9)), 8)))
+			require.NoError(t, w.Close())
+			require.Equal(t, []rowShape{{1, 4, false}, {5, 8, false}}, shapes(env.rows()))
+		})
+	})
 	t.Run("disabled", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
@@ -449,5 +468,38 @@ func TestHot_LiveLatencyUnderBulkFlood(t *testing.T) {
 		require.LessOrEqual(t, worst, batchAge+upload+5*time.Millisecond, "worst live latency")
 		require.Greater(t, worst, batchAge, "live batches did queue behind pointer uploads")
 		require.Greater(t, bulkEnd.Sub(start), 500*time.Millisecond, "the flood overlaps the live traffic")
+	})
+}
+
+// Rule 7: bulk waits while as many bulk batches are frozen and uncommitted
+// as uploads may be in flight, however much of the byte pool is left.
+func TestHot_BulkFrozenCap(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		env := newHotEnv(t)
+		gate := make(chan struct{})
+		w := env.open(Config{MaxEventsPerBlock: 64, Hot: &HotConfig{
+			Uploader:           &gatedUploader{up: env.up, gate: gate},
+			UploadConcurrency:  2,
+			BatchMaxAge:        time.Millisecond,
+			BlockMaxAge:        time.Hour,
+			BulkChunkMaxEvents: 4,
+			BulkPendingBytes:   1 << 30,
+		}})
+		rng := rand.New(rand.NewPCG(12, 12))
+		bulkDone := make(chan error, 1)
+		go func() { bulkDone <- w.AppendBatch(WithClass(t.Context(), ClassBulk), sizedEvents(rng, 20)) }()
+		synctest.Wait()
+		require.Equal(t, uint64(9), w.NextSeq(), "two frozen bulk batches fill the upload slots")
+
+		// Live is not held back by the cap.
+		live := sizedEvent(rng)
+		require.NoError(t, w.Append(t.Context(), &live))
+		require.Equal(t, uint64(9), live.Seq)
+
+		close(gate)
+		require.NoError(t, <-bulkDone)
+		require.NoError(t, w.Close())
+		requireTiles(t, env.rows(), 22)
 	})
 }

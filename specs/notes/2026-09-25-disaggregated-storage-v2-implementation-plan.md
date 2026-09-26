@@ -1006,7 +1006,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     - PG WAL volume per day.
   - Add a load driver (a simulator traffic mode or a `cmd/` tool) that runs
     against `just up`, so these can be repeated.
-- [ ] **S2.23 Live latency under bulk recovery** (M). Deps: S2.22.
+- [x] **S2.23 Live latency under bulk recovery** (M). Deps: S2.22.
   - S2.22 found that live latency on a disk-backed PG was about 1s p50 and
     1.9s p99 during paced bulk recovery (3,000 live plus 30k bulk events/s),
     against the 20-40ms target (design §22.2). Two causes:
@@ -1240,13 +1240,51 @@ mode.
 | Mutant refresh churn in stage 1 hides regressions | S1.x | Refresh STALE mutants in the same PR that moved their target; the reviewer checks the refreshed diff is the same bug |
 | The storagefake drifts from PostgreSQL | D1, D3 | One primitive contract suite runs against both in CI (`test-storage`) |
 | CI Docker egress breaks `test-storage` | S2.20 | Pin images by digest (already done); allowlist from the `release.yml` precedent; retry workflow if runner-loss becomes common |
-| Stage 2 performance misses the 20-40ms live latency target | S2.8, S2.9 | S2.22 measured it: steady state meets the target; bulk recovery on a disk-backed PG misses it, and S2.23 fixes that. Batch age and token bucket are config |
+| Stage 2 performance misses the 20-40ms live latency target | S2.8, S2.9 | S2.22 measured it and S2.23 closed the gap: 33.5–35.4ms p99 live beside 30k paced bulk events/s on a disk-backed PG. Bulk beyond about 30k/s paced needs fewer transactions per event. Batch age and token bucket are config |
 | The metadata write path is slower on PG than Pebble at bootstrap rates | S3 | S3.6 measures fenced transactions per second before stage 3 exits |
 
 ## Decisions log
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.23 (2026-09-25): Live latency under bulk recovery.**
+  - Rule 7 bound (design §10.5): bulk batches frozen but not yet committed
+    are capped at `UploadConcurrency`, separately from the byte pool. Live no
+    longer queues behind hundreds of bulk batches.
+  - Hot batch group commit (design §10.4): the commit loop commits every
+    consecutive ready batch at the queue head in one fenced transaction, up to
+    `HotConfig.MaxCommitBatches` (default 32).
+    - `catalog.CommitHotBatches` takes the slice, checks contiguity, and
+      writes one revision. `CommitHotBatch` wraps it.
+    - The hook runs once per batch into the shared op batch. Then each
+      batch's afterCommit runs in seq order, then each afterDone.
+      `OnDurableBatch`'s doc now says this.
+    - A failed group fails every batch in it.
+    - `jetstream_hot_commit_batches` gives the batches per transaction.
+  - Deviation, not in the plan: `Session.BeginUploads` also group commits.
+    Calls that arrive while an objects transaction is in flight share the
+    next one. On the disk server this took p99 from 39.4–41.6ms to
+    33.5–35.4ms.
+  - Syncstate staging is a FIFO with `AbortStaged`. A batch may now be staged
+    while an earlier one is uncommitted, so a failed batch drops its own
+    snapshot instead of the newest one. The live consumer and storagebench
+    call `AbortStaged` from afterDone.
+  - Fixed two bugs the new tests found. Both predate S2.23.
+    - A hot batch already at the overflow limits kept growing when those
+      limits were below the ordinary ones (swarm seed 154). It now becomes a
+      pointer batch.
+    - catalog/local refresh failed on a rotating writer's fresh tail file
+      before its header was written ("read header: EOF", about 1 in 400
+      runs). Refresh now skips that attached tail.
+  - Results (design §22.2): at 3,000 live events/s, live p99 is 33.5–35.4ms
+    beside 30k paced bulk events/s on disk PG, down from 1.9s. Unpaced bulk
+    runs at 140k events/s, up from 36k, with live p99 at 90ms.
+  - Refreshed mutants m064 and m067 for the moved commit loop. The unit
+    tests still kill both.
+  - An `internal/metastore/pg` TestReadOnly failure happened once in
+    `just test-storage`. It did not recur in six more suite runs or 100
+    isolated runs. Not investigated further.
 
 - **S2.22 (2026-09-25): stage 2 measurements.**
   - Load driver: `cmd/storagebench`, run with `just storagebench` against
