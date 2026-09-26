@@ -38,7 +38,7 @@ The durability ordering between these two is the invariant that keeps a crash sa
 
 #### Storage seams
 
-Core packages (ingest, orchestrator, subscribe, xrpcapi, repoexport, status, manifest) reach storage only through interfaces, so a disaggregated backend (S3 plus PostgreSQL, `specs/notes/2026-09-25-disaggregated-storage-v2-design.md`) can replace the local one without touching call sites. Only local mode exists today.
+Core packages (ingest, orchestrator, subscribe, xrpcapi, repoexport, status, manifest) reach storage only through interfaces, so a disaggregated backend (S3 plus PostgreSQL, `specs/notes/2026-09-25-disaggregated-storage-v2-design.md`) can replace the local one without touching call sites. Disaggregated mode (`JETSTREAM_STORAGE=disaggregated`, after `jetstream storage init`) runs bootstrap, merge and steady state over `internal/catalog`, `internal/metastore/pg` and `internal/objstore/s3`. Compaction is off in that mode until stage 4 of the plan, and nothing runs it in production yet. The table lists the local implementations.
 
 | Interface | Package | Local implementation |
 |---|---|---|
