@@ -3,9 +3,11 @@
 // storagebench write` drives the hot writer at production rates, `just
 // storagebench footers` times a pod start over a pop1-sized synthetic
 // catalog, `just storagebench bootstrap` drives a bootstrapping leader's
-// writers and reports fenced transactions per second, and `just storagebench
-// retryscan` times the failed-repo retry pass's scan of metadata_kv. Each run creates a scratch database and a fresh object prefix,
-// and drops the database when it finishes.
+// writers and reports fenced transactions per second, `just storagebench
+// retryscan` times the failed-repo retry pass's scan of metadata_kv, and
+// `just storagebench compaction` measures the leader's tombstone rebuild and
+// a compaction pass's block fetches. Each run creates a scratch database and
+// a fresh object prefix, and drops the database when it finishes.
 //
 // The PostgreSQL URL holds a password, so it is only ever printed through
 // pgstore.RedactURL.
@@ -95,7 +97,7 @@ func newApp() *cli.Command {
 			return nil
 		},
 		Commands: []*cli.Command{
-			writeCommand(), footersCommand(), calibrateCommand(), bootstrapCommand(), retryScanCommand(),
+			writeCommand(), footersCommand(), calibrateCommand(), bootstrapCommand(), retryScanCommand(), compactionCommand(),
 		},
 	}
 }

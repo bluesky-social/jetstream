@@ -1397,6 +1397,15 @@ Compaction policy, schedule, triggers, tombstone kinds, and the `compaction/seq`
 watermark do not change (`docs/README.md` §3.3). Only the mechanics change: a
 rewrite fetches only affected blocks.
 
+As measured (S4.6, §22.4), "affected" is by DID, not by record, which narrows
+backfill-shaped segments well and live-shaped segments not at all. A live
+block holds about 3,700 distinct DIDs, so at a pass's tombstone volume almost
+every live block has a tombstoned DID with a matching collection, and every
+pass reads every block of every live-shaped segment in the archive. That is
+no worse than local mode, which reads every block of each segment its
+segment bloom admits, but a pass's reads grow with the archive's age. Plan
+S5.7 decides what to do about it.
+
 ### 12.1 Pass
 
 1. Force-rotate the `main` writer, as today, so every tombstone below the pass
@@ -1541,6 +1550,12 @@ pass.
 The tombstone set is memory only. On session start, rebuild it by reading every
 `main` event above `compaction/seq` (sealed blocks, active blocks, hot batches)
 through `BlockRef`s. Measure the time this takes (§22).
+
+As built (S4.6), the rebuild keeps 16 block reads in flight
+(`tombstoneRebuildConcurrency`) and merges each block's fold as it finishes.
+Merging keeps each key's highest seq, so the order does not matter. Live
+ingest waits for the rebuild, and one GET at a time made a 4h backlog take
+minutes (§22.4).
 
 ### 12.6 Compaction working memory
 
@@ -2141,9 +2156,9 @@ this document.
 | Live event latency, end to end, idle and during bulk recovery | 20–40ms target | 2 |
 | Fenced transactions/s during bootstrap (block commits plus metadata writes) | fence serializes all leader writes | 3 (done, §22.3) |
 | Seal duration | fold backlog during seal | 2 |
-| Fraction of blocks fetched per compaction pass | selective compaction benefit | 4 |
+| Fraction of blocks fetched per compaction pass | selective compaction benefit | 4 (done, §22.4) |
 | Pod start: footer load time and manifest memory at pop1 size | readiness time; memory budget | 2 |
-| Tombstone rebuild time on session start | failover time | 4 |
+| Tombstone rebuild time on session start | failover time | 4 (done, §22.4) |
 | Retry-scan cost against `metadata_kv` | 9GB-per-pass estimate | 3 (done, §22.3) |
 | PostgreSQL WAL volume per day | sizing | 2 |
 | `next_seq - readable_log_durable_seq` in local mode (pop1 shows 7) | looks wrong; explain before relying on the readable log | 1 (done, below) |
@@ -2457,6 +2472,118 @@ At pop1's 40M rows:
   exceeds PostgreSQL's default 128MB `shared_buffers`. A cold pop1 pass reads
   from disk.
 - Every 4h, that averages about 1MB/s: accepted (§14.3).
+
+### 22.4 Stage 4 results
+
+Measured 2026-09-26 with `cmd/storagebench compaction` on the §22.2
+workstation, against the `just up` MinIO and the tmpfs PostgreSQL. The bench
+seals real segments of 680 blocks of 4,096 events (about 238MiB each) into
+`main`:
+
+- history below the compaction watermark `W`: backfill-profile segments
+  (whole repos, about 620 events on average, DIDs uniform over a 40M
+  universe) and live-profile segments (the calibrated live mix, 35% of events
+  from 2,000 hot accounts, about 90% distinct DIDs per block);
+- a window above `W`: four live segments, about 1h at 3,000 events/s. Its
+  deletes target records created earlier, either in the window itself or in
+  the history below `W`.
+
+Every measurement starts from a fresh pod with a cold object cache. MinIO is
+local, so a block fetch takes about 0.7ms. S3 takes tens of milliseconds, so
+the extrapolations below assume 15–35ms per GET.
+
+**Tombstone rebuild on session start.** This is
+`rebuildLiveTombstones`'s fold of every block above `W`, here the 1h window:
+2,720 blocks, 953MiB, 11.1M events, about 690k record tombstones.
+
+| | one block at a time | 16 in flight |
+|---|---|---|
+| Elapsed | 4.53s | 0.74s |
+| Per block, fetch / decode and fold | 0.7ms / 0.9ms | 1.5ms / 1.6ms |
+
+- Live ingest does not start until the rebuild finishes (`runSteadyState`),
+  so the rebuild adds directly to failover time.
+- A new leader's backlog above `W` is up to one compaction interval (4h):
+  about 10.5k blocks and 3.7GiB. One GET at a time against S3, that is about
+  10.5k × 16–36ms, 2.8–6.3 minutes with ingest stopped. S4.6 therefore made
+  the rebuild keep 16 reads in flight (§12.5): about 11–24s, or about
+  150–330MiB/s from S3. The CPU cost, about 1.6ms per block under
+  contention, is about 1s of a 16-way rebuild.
+- If passes keep failing, the backlog grows until the 32M tombstone cap
+  forces a pass. At the bench's 6.2% tombstone rate that is about 48h
+  (126k blocks), or about 2–5 minutes at 16 in flight.
+
+**Blocks fetched per compaction pass.** One pass over the window, at four
+window fractions. The tombstone collection decodes every block in (`W`,
+target]. Then the pass runs `segment.SparseRewrite` of every sealed segment
+with the production drop rule and probe limit, without uploading or
+publishing. Rows are blocks that the rewrite fetched, out of each profile's
+blocks.
+
+Run A: three backfill, three live, and four window segments, with half of
+the deletes targeting history records.
+
+| window | tombstones (records, DIDs) | backfill | live | window | rewrite total |
+|---|---|---|---|---|---|
+| 7.7 min | 94k, 59k | 100% | 100% (all dense) | 12.5% | 65% |
+| 15.5 min | 186k, 108k | 100% | 100% (all dense) | 25% | 70% |
+| 31 min | 363k, 202k | 100% | 100% (all dense) | 50% | 80% |
+| 62 min | 690k, 378k | 100% | 100% (all dense) | 100% | 100% |
+
+Run B: six backfill, one live, and four window segments, with every delete
+targeting a record from the window.
+
+| window | tombstones (records, DIDs) | backfill | live | window | rows dropped in history |
+|---|---|---|---|---|---|
+| 7.7 min | 92k, 62k | 1.2% | 100% (not dense) | 12.5% | 0 |
+| 15.5 min | 185k, 122k | 2.5% | 100% (dense) | 25% | 0 |
+| 31 min | 370k, 241k | 4.8% | 100% (dense) | 50% | 1 |
+| 62 min | 739k, 479k | 8.9% | 100% (dense) | 100% | 1 |
+
+The rewrites took 2–10s over 8 workers, and the tombstone collection, one
+block at a time, took 4.7–4.8s for the full window.
+
+- **Window segments.** A rewrite reads the blocks at or below the highest
+  tombstone seq, which are the blocks the collection just decoded. Segments
+  above that seq are skipped without a footer fetch.
+- **Run A's history is the upper bound, not pop1.** Six history segments
+  absorb every history-targeted delete, so every block there has about 60
+  rows to drop and must be read. A pop1 archive spreads those deletes over
+  thousands of segments.
+- **Backfill segments narrow well, by DID overlap alone.** In run B no
+  history record is targeted, and the backfill fraction grows linearly with
+  the tombstoned DIDs, about 1.9e-7 per DID. The cause is true DID overlap,
+  not bloom false positives: at 1h, about 477k × 4,490/40M ≈ 53 tombstoned
+  DIDs have their repo in each segment, about 62 blocks, against 60.5
+  measured. The segment bloom's false positives (about 0.1% of the probes)
+  add almost nothing, because the per-block blooms reject them. In general
+  the fraction is about (tombstoned DIDs / all DIDs) × (DIDs per block + 1).
+  At the bench's rates a 4h pass has about 1.9M tombstoned DIDs, and it
+  would read about 30% of pop1's 4.76M backfill blocks (§22.2). Real deletes
+  come from the active accounts, fewer than the bench's uniform draw, so the
+  real fraction is lower. The S5.4 soak should measure it.
+- **Live segments do not narrow.** Every live block was read in both runs,
+  including run B at 7.7 min, where the rewrite was not dense and dropped
+  nothing. A live block holds about 3,700 distinct DIDs. The expected number
+  of tombstoned DIDs in it is about 3,700 × (tombstoned DIDs / active DIDs),
+  far above one at any pass's volume, and almost every tombstone is in a
+  collection that every live block holds (likes are 72%). The segments also
+  go dense once more than 6,168 tombstoned DIDs pass the segment bloom
+  (4M probes / 680 blocks), which run A passed at its smallest window.
+- **So a pass reads every block of every live-shaped segment** in the
+  archive. At 3,000 events/s that is about 93 segments (63k blocks, 22GiB) a
+  day. After 30 days a pass reads about 650GiB, and after a year about
+  7.9TiB, 23M GETs, every 4h. Local mode already does the same from local
+  disk (§12). Plan S5.7 must decide before the archive grows. Options:
+  - an exact per-block range of each create's rkey TID time, which would
+    route a record tombstone to the blocks created near its record. It is
+    exact, so forged or backdated TIDs only widen their own block's range.
+    It is a footer format change.
+  - record-key filters kept outside the manifest;
+  - compacting old live history less often than the recent archive.
+- **Metrics.** `jetstream_compaction_blocks_examined_total` and
+  `jetstream_compaction_blocks_fetched_total` report the same ratio in
+  production.
 
 ## 23. Metrics
 

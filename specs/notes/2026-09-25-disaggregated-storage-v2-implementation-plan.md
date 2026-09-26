@@ -1172,7 +1172,7 @@ Design §12, §13, and §26 stage 4.
   - Sparse compaction miscounts `unique_did_count`.
   - Recommended extras: publish skips the source-generation check, and the
     sparse rewrite keeps a stale collection count.
-- [ ] **S4.6 Stage 4 measurements** (S). Deps: S4.2.
+- [x] **S4.6 Stage 4 measurements** (S). Deps: S4.2.
   - Fraction of blocks fetched per compaction pass, and tombstone rebuild time
     on session start. Record both in the design.
 
@@ -1243,6 +1243,24 @@ Design §15.4, §17, §20 layer 5, and §26 stage 5.
   - Check: `just storagebench bootstrap` against a disk-backed server, and the
     layer 3 lifecycle oracle.
   - Must land before a pop instance bootstraps in disaggregated mode.
+- [ ] **S5.7 Compaction reads of live history** (M). Found by S4.6 (design
+  §22.4).
+  - Compaction narrows by DID. A live block holds about 3,700 distinct DIDs,
+    so every pass reads every block of every live-shaped segment in the
+    archive: about 22GiB more per day of archive at 3,000 events/s, about
+    650GiB per pass after 30 days and 7.9TiB after a year. Local mode does
+    the same from disk.
+  - Options: an exact per-block range of creates' rkey TID times in the
+    footer, which routes a record tombstone to the blocks near its record's
+    creation (a segment format change, reviewed against `docs/README.md`);
+    record-key filters kept outside the manifest; or compacting old live
+    history less often.
+  - Also: `collectCompactionTombstones` decodes the pass's blocks one at a
+    time (4.8s for 1h of traffic from local MinIO). It is background work,
+    but on S3 a 4h pass spends minutes there.
+  - Check: `just storagebench compaction` with a multi-day live history, and
+    the S5.4 soak's `jetstream_compaction_blocks_fetched_total` ratio.
+  - Decide before a disaggregated pop instance's archive is weeks old.
 
 **Exit:** a 24h soak passes the end-state oracle check, and the measurements
 are reported. Only after this: deploy the new pop instance in disaggregated
@@ -1261,12 +1279,42 @@ mode.
 | CI Docker egress breaks `test-storage` | S2.20 | Pin images by digest (already done); allowlist from the `release.yml` precedent; retry workflow if runner-loss becomes common |
 | Stage 2 performance misses the 20-40ms live latency target | S2.8, S2.9 | S2.22 measured it and S2.23 closed the gap: 33.5–35.4ms p99 live beside 30k paced bulk events/s on a disk-backed PG. Bulk beyond about 30k/s paced needs fewer transactions per event. Batch age and token bucket are config |
 | The metadata write path is slower on PG than Pebble at bootstrap rates | S3 | S3.6 measured it (design §22.3): on disk the fence saturates at about 222 transactions/s, and discovery's one transaction per DID takes 77% of them, about 65h for pop1. S5.6 batches discovery before a pop instance bootstraps |
+| Compaction reads grow with the archive's age | S4 | S4.6 measured it (design §22.4): DID blooms narrow backfill-shaped segments to about the tombstoned DIDs' share, but every live-shaped block is read on every pass. S5.7 decides a record-level filter or a tiered schedule before the archive is weeks old |
 
 ## Decisions log
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S4.6 (2026-09-26): Stage 4 measurements.**
+  - New `cmd/storagebench compaction`, results in design §22.4. It seals
+    backfill-profile and live-profile history below the watermark and a
+    window of live traffic above it into `main` on real PG and S3, times
+    the session-start tombstone rebuild, and runs one pass's reads with the
+    production drop rule at four window sizes, without publishing.
+  - Tombstone rebuild: 1h of traffic above the watermark (2,720 blocks,
+    11.1M events) took 4.5s one block at a time from local MinIO. On S3, a
+    4h backlog read that way would take 2.8–6.3 minutes, and live ingest
+    waits for it. `rebuildLiveTombstones` now keeps 16 reads in flight
+    (`tombstoneRebuildConcurrency`) and merges each block's fold in any
+    order, since `Snapshot.Merge` keeps the highest seq per key: 0.74s here,
+    about 11–24s projected on S3. `TestRebuildLiveTombstones_ConcurrentKeepsNewest`
+    checks the result against incremental `Observe` over 48 blocks, and
+    fails against a last-writer-wins merge. Design §12.5 now says so.
+  - Blocks fetched per pass:
+    - Window blocks: the rewrite reads the blocks the tombstone collection
+      just decoded.
+    - Backfill-shaped history: about (tombstoned DIDs / all DIDs) × (DIDs
+      per block + 1), almost all true DID overlap. It was 1.2–8.9% for 7.7
+      to 62 minutes of traffic. At the bench's rates a 4h pass reads about
+      30% of pop1's backfill blocks, and fewer if real deletes come from
+      fewer accounts.
+    - Live-shaped history: 100% at every window size, dense or not, even
+      with nothing to drop. A live block has about 3,700 distinct DIDs.
+      Design §12 claimed a rewrite "fetches only affected blocks"; for live
+      history it does not, and a pass reads the whole live archive. That is
+      what local mode already does from disk, but it grows with the
+      archive's age. S5.7 and a risk row are added.
 - **S4.5 (2026-09-26): Stage 4 mutants.**
   - m073–m077 are all KILLED at the `disagg` tier:
     - m073 (GC skips the claim re-check), unit only:

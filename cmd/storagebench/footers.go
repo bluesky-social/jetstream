@@ -55,6 +55,9 @@ type builtSegment struct {
 	footer catalog.ObjectRef
 	bytes  int64
 	infos  []segment.BlockInfo
+	// blocks are the uploaded block objects, one per info. Nil means the
+	// blocks were not uploaded and get rows only.
+	blocks []catalog.ObjectRef
 }
 
 func runFooters(ctx context.Context, cmd *cli.Command) error {
@@ -299,7 +302,8 @@ func buildSegment(ctx context.Context, gen *generator, uploader *protocol.Upload
 // commitSegment writes the rows catalog.Session.Seal leaves behind for
 // segment idx, in one fenced transaction, without the active blocks it
 // would have folded first: one block commit per block would make a
-// pop1-sized fixture take hours. Block objects are rows only.
+// pop1-sized fixture take hours. Block objects are rows only unless the
+// segment uploaded them.
 func commitSegment(ctx context.Context, b *bench, epoch, idx uint64, s builtSegment) (err error) {
 	tx, err := b.pg.Begin(ctx, catalog.TxSeal)
 	if err != nil {
@@ -317,20 +321,36 @@ func commitSegment(ctx context.Context, b *bench, epoch, idx uint64, s builtSegm
 	if !ok {
 		return errors.New("lost the lease")
 	}
-	objs := make([]catalog.NewObject, len(s.infos))
-	for i, info := range s.infos {
-		_, _ = rand.Read(objs[i].Key[:])
-		_, _ = rand.Read(objs[i].SHA256[:])
-		objs[i].Length = int64(info.CompressedSize)
-	}
-	ids, err := tx.InsertObjects(ctx, objs)
-	if err != nil {
+	// An uploaded object is pending until the transaction that first
+	// references it makes it available.
+	available := func(ref catalog.ObjectRef) error {
+		if !ref.Pending {
+			return nil
+		}
+		_, err := tx.SetObjectAvailable(ctx, ref.ID)
 		return err
 	}
-	if s.footer.Pending {
-		if _, err := tx.SetObjectAvailable(ctx, s.footer.ID); err != nil {
+	var ids []uint64
+	if s.blocks == nil {
+		objs := make([]catalog.NewObject, len(s.infos))
+		for i, info := range s.infos {
+			_, _ = rand.Read(objs[i].Key[:])
+			_, _ = rand.Read(objs[i].SHA256[:])
+			objs[i].Length = int64(info.CompressedSize)
+		}
+		if ids, err = tx.InsertObjects(ctx, objs); err != nil {
 			return err
 		}
+	} else {
+		for _, ref := range s.blocks {
+			if err := available(ref); err != nil {
+				return err
+			}
+			ids = append(ids, ref.ID)
+		}
+	}
+	if err := available(s.footer); err != nil {
+		return err
 	}
 	gen, err := tx.InsertGeneration(ctx, catalog.GenerationRow{
 		Namespace:      catalog.Main,
