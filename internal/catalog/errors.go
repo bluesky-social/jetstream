@@ -30,6 +30,8 @@ const (
 	SourceMeta       = "meta"       // a catalog-owned metadata value is malformed
 	SourceHotBatch   = "hot_batch"  // a hot batch row or frame is malformed
 	SourceGeneration = "generation" // a generation header or footer is malformed
+	SourceCompaction = "compaction" // a compaction publish or watermark disagrees with the catalog
+	SourceGC         = "gc"         // a GC claim is still referenced
 )
 
 // CorruptionError is storage corruption or a broken catalog invariant (design

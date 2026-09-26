@@ -510,6 +510,209 @@ func (t *tx) DeleteNamespace(ctx context.Context, ns catalog.Namespace) error {
 	return nil
 }
 
+func (t *tx) SegmentForUpdate(ctx context.Context, ns catalog.Namespace, idx uint64) (catalog.SegmentRow, bool, error) {
+	if err := t.stmt(ctx, "segment_for_update", true); err != nil {
+		return catalog.SegmentRow{}, false, err
+	}
+	row, ok := t.s.segments.get(segKey(ns, idx))
+	return row, ok, nil
+}
+
+func (t *tx) Generation(ctx context.Context, id uint64) (catalog.GenerationRow, bool, error) {
+	if err := t.stmt(ctx, "generation", false); err != nil {
+		return catalog.GenerationRow{}, false, err
+	}
+	g, ok := t.view().generations.get(id)
+	g.Header = bytes.Clone(g.Header)
+	return g, ok, nil
+}
+
+// genBlocksOf returns a generation's blocks in ordinal order.
+func genBlocksOf(s *state, gen uint64) []catalog.GenerationBlockRow {
+	prefix := genBlockPrefix(gen)
+	ks := s.genBlocks.keys()
+	i, _ := slices.BinarySearch(ks, prefix)
+	var out []catalog.GenerationBlockRow
+	for _, k := range ks[i:] {
+		if !strings.HasPrefix(k, prefix) {
+			break
+		}
+		row, _ := s.genBlocks.get(k)
+		out = append(out, row)
+	}
+	return out
+}
+
+func (t *tx) BlocksOfGeneration(ctx context.Context, id uint64) ([]catalog.GenerationBlockRow, error) {
+	if err := t.stmt(ctx, "blocks_of_generation", false); err != nil {
+		return nil, err
+	}
+	return genBlocksOf(t.view(), id), nil
+}
+
+func (t *tx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) (bool, error) {
+	if err := t.stmt(ctx, "set_segment_generation", true); err != nil {
+		return false, err
+	}
+	if err := t.bigints("segments", gen, revision); err != nil {
+		return false, err
+	}
+	if gen == 0 {
+		return false, t.abort(violation("segments_check", "sealed segment needs a generation"))
+	}
+	k := segKey(ns, idx)
+	row, ok := t.s.segments.get(k)
+	if !ok || row.State != catalog.Sealed {
+		return false, nil
+	}
+	row.GenerationID, row.Revision = gen, revision
+	t.s.segments.set(k, row)
+	return true, nil
+}
+
+func (t *tx) DeleteGeneration(ctx context.Context, id uint64) (bool, error) {
+	if err := t.stmt(ctx, "delete_generation", true); err != nil {
+		return false, err
+	}
+	if _, ok := t.s.generations.get(id); !ok {
+		return false, nil
+	}
+	for _, gb := range genBlocksOf(t.s, id) {
+		t.s.genBlocks.del(genBlockKey(id, gb.Ordinal))
+	}
+	t.s.generations.del(id)
+	return true, nil
+}
+
+// referenced returns every object ID some row references: the four §13
+// NOT EXISTS checks, evaluated once for the whole statement.
+func referenced(s *state) map[uint64]bool {
+	refs := map[uint64]bool{}
+	for _, h := range s.hotBatches.all() {
+		if h.ObjectID != 0 {
+			refs[h.ObjectID] = true
+		}
+	}
+	for _, a := range s.activeBlocks.all() {
+		refs[a.ObjectID] = true
+	}
+	for _, gb := range s.genBlocks.all() {
+		refs[gb.ObjectID] = true
+	}
+	for _, g := range s.generations.all() {
+		refs[g.FooterObjectID] = true
+	}
+	return refs
+}
+
+func (t *tx) MarkUnreferenced(ctx context.Context, after uint64, limit int) (catalog.MarkPage, error) {
+	if err := t.stmt(ctx, "mark_unreferenced", true); err != nil {
+		return catalog.MarkPage{}, err
+	}
+	var page catalog.MarkPage
+	refs := referenced(t.s)
+	now := t.now()
+	ks := t.s.objects.keys()
+	i, _ := slices.BinarySearch(ks, after+1)
+	for _, id := range ks[i:] {
+		if page.Scanned >= limit {
+			break
+		}
+		row, _ := t.s.objects.get(id)
+		if row.State != catalog.ObjectAvailable || !row.UnreferencedAt.IsZero() {
+			continue
+		}
+		page.Scanned++
+		page.Last = id
+		if refs[id] {
+			continue
+		}
+		row.UnreferencedAt = now
+		t.s.objects.set(id, row)
+		page.Marked++
+	}
+	return page, nil
+}
+
+func (t *tx) ClaimObjects(ctx context.Context, gcDelay, orphanAge time.Duration, limit int) ([]catalog.ObjectRow, error) {
+	if err := t.stmt(ctx, "claim_objects", true); err != nil {
+		return nil, err
+	}
+	now := t.now()
+	var out []catalog.ObjectRow
+	for _, id := range t.s.objects.keys() {
+		if len(out) >= limit {
+			break
+		}
+		row, _ := t.s.objects.get(id)
+		switch {
+		case row.State == catalog.ObjectAvailable && !row.UnreferencedAt.IsZero() && row.UnreferencedAt.Before(now.Add(-gcDelay)):
+			// Leaving 'available' leaves the partial unique index too.
+			t.s.objectsBySHA.del(string(row.SHA256[:]))
+		case row.State == catalog.ObjectUploading && row.CreatedAt.Before(now.Add(-orphanAge)):
+		default:
+			continue
+		}
+		out = append(out, row)
+		row.State = catalog.ObjectDeleting
+		t.s.objects.set(id, row)
+	}
+	return out, nil
+}
+
+func (t *tx) DeletingObjects(ctx context.Context, limit int) ([]catalog.ObjectRow, error) {
+	if err := t.stmt(ctx, "deleting_objects", false); err != nil {
+		return nil, err
+	}
+	s := t.view()
+	var out []catalog.ObjectRow
+	for _, id := range s.objects.keys() {
+		if len(out) >= limit {
+			break
+		}
+		if row, _ := s.objects.get(id); row.State == catalog.ObjectDeleting {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (t *tx) ReferencedObjects(ctx context.Context, ids []uint64) ([]uint64, error) {
+	if err := t.stmt(ctx, "referenced_objects", false); err != nil {
+		return nil, err
+	}
+	refs := referenced(t.view())
+	var out []uint64
+	for _, id := range sortedUnique(ids) {
+		if refs[id] {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+func (t *tx) ForgetObjects(ctx context.Context, ids []uint64) (int, error) {
+	if err := t.stmt(ctx, "forget_objects", true); err != nil {
+		return 0, err
+	}
+	refs := referenced(t.s)
+	n := 0
+	for _, id := range sortedUnique(ids) {
+		row, ok := t.s.objects.get(id)
+		if !ok || row.State != catalog.ObjectDeleting {
+			continue
+		}
+		if refs[id] {
+			// Every referencing foreign key is ON DELETE NO ACTION.
+			return 0, t.abort(violation("objects_referenced", "object %d is still referenced", id))
+		}
+		t.s.objects.del(id)
+		t.s.objectKeys.del(string(row.Key[:]))
+		n++
+	}
+	return n, nil
+}
+
 func (t *tx) Notify(ctx context.Context, revision uint64) error {
 	// NOTIFY serializes committers on a global lock in PostgreSQL too.
 	if err := t.stmt(ctx, "notify", true); err != nil {

@@ -634,14 +634,260 @@ func checkSealList(sl Seal, hdr segment.Header, rows []ActiveBlockRow) error {
 	return nil
 }
 
-// ErrNotImplemented is returned by scripts whose stage has not landed.
-var ErrNotImplemented = errors.New("catalog: not implemented")
+// Publish describes a compacted generation of a sealed Main segment
+// (§12.2): the output of segment.SparseRewrite with its new objects
+// uploaded.
+type Publish struct {
+	Segment uint64
+	// Source is the generation the rewrite read. It must still be the
+	// segment's current generation.
+	Source uint64
+	// Header is the rewritten 256-byte header.
+	Header []byte
+	Footer ObjectRef
+	// Blocks is the new generation's block list, in ordinal order: one
+	// entry per source block.
+	Blocks []PublishBlock
+}
 
-// PublishGeneration publishes a compacted generation (§12.2). It lands with
-// compaction in stage 4; disaggregated mode refuses to enable compaction
-// until then (plan D5).
-func (s *Session) PublishGeneration(context.Context) error {
-	return fmt.Errorf("catalog: PublishGeneration: %w until stage 4", ErrNotImplemented)
+// PublishBlock is one block of a Publish.
+type PublishBlock struct {
+	// Object is the re-encoded block's object, or, when Reused, the source
+	// generation's object at the same ordinal.
+	Object           ObjectRef
+	Reused           bool
+	CompressedLength int64
+}
+
+// PublishCommit is the result of PublishGeneration.
+type PublishCommit struct {
+	Revision       uint64
+	GenerationID   uint64
+	FooterObjectID uint64
+	// ObjectIDs are the new generation's block objects in ordinal order,
+	// after resolving pending objects.
+	ObjectIDs []uint64
+}
+
+// PublishGeneration is the §12.2 publish transaction: it replaces a sealed
+// Main segment's current generation with a compacted one. Only the leader
+// compacts, so a source generation that is no longer current, a reused block
+// that is not the source's, or a header whose envelope differs from the
+// source's is corruption.
+func (s *Session) PublishGeneration(ctx context.Context, p Publish) (PublishCommit, error) {
+	hdr, err := segment.ReadSealedHeader(bytes.NewReader(p.Header))
+	if err != nil {
+		return PublishCommit{}, s.fail(fmt.Errorf("catalog: publish segment %d: %w", p.Segment, err))
+	}
+	switch {
+	case p.Source == 0 || p.Footer.ID == 0:
+		return PublishCommit{}, s.fail(fmt.Errorf("catalog: publish segment %d: no source generation or footer", p.Segment))
+	case int(hdr.BlockCount) != len(p.Blocks):
+		return PublishCommit{}, s.fail(fmt.Errorf("catalog: publish segment %d: header has %d blocks; publish lists %d",
+			p.Segment, hdr.BlockCount, len(p.Blocks)))
+	}
+	for i, b := range p.Blocks {
+		if b.Object.ID == 0 || b.CompressedLength <= 0 || (b.Reused && b.Object.Pending) {
+			return PublishCommit{}, s.fail(fmt.Errorf("catalog: publish segment %d: bad block %d", p.Segment, i))
+		}
+	}
+	out := PublishCommit{ObjectIDs: make([]uint64, len(p.Blocks))}
+	rev, err := s.run(ctx, TxCompaction, func(tx Tx, rev uint64) error {
+		seg, found, err := tx.SegmentForUpdate(ctx, Main, p.Segment)
+		if err != nil {
+			return err
+		}
+		if !found || seg.State != Sealed || seg.GenerationID != p.Source {
+			return Corruptf(SourceCompaction, "main segment %d is not sealed at generation %d (found=%t, %v)",
+				p.Segment, p.Source, found, seg)
+		}
+		src, found, err := tx.Generation(ctx, p.Source)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return Corruptf(SourceCompaction, "main segment %d names missing generation %d", p.Segment, p.Source)
+		}
+		srcBlocks, err := tx.BlocksOfGeneration(ctx, p.Source)
+		if err != nil {
+			return err
+		}
+		if err := checkPublish(p, hdr, src, srcBlocks); err != nil {
+			return err
+		}
+		var reused []uint64
+		for i, b := range p.Blocks {
+			if b.Reused {
+				out.ObjectIDs[i] = b.Object.ID
+				reused = append(reused, b.Object.ID)
+				continue
+			}
+			if out.ObjectIDs[i], err = resolve(ctx, tx, b.Object); err != nil {
+				return err
+			}
+		}
+		if len(reused) > 0 {
+			if err := refCheck(ctx, tx, reused...); err != nil {
+				return err
+			}
+		}
+		footerID, err := resolve(ctx, tx, p.Footer)
+		if err != nil {
+			return err
+		}
+		gen, err := tx.InsertGeneration(ctx, GenerationRow{
+			Namespace:      Main,
+			Segment:        p.Segment,
+			Header:         p.Header,
+			FooterObjectID: footerID,
+			Revision:       rev,
+		})
+		if err != nil {
+			return err
+		}
+		gbs := make([]GenerationBlockRow, len(p.Blocks))
+		for i, b := range p.Blocks {
+			gbs[i] = GenerationBlockRow{GenerationID: gen, Ordinal: i, ObjectID: out.ObjectIDs[i], CompressedLength: b.CompressedLength}
+		}
+		if err := tx.InsertGenerationBlocks(ctx, gbs); err != nil {
+			return err
+		}
+		ok, err := tx.SetSegmentGeneration(ctx, Main, p.Segment, gen, rev)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return Corruptf(SourceCompaction, "main segment %d stopped being sealed mid-publish", p.Segment)
+		}
+		if ok, err = tx.DeleteGeneration(ctx, p.Source); err != nil {
+			return err
+		}
+		if !ok {
+			return Corruptf(SourceCompaction, "generation %d vanished mid-publish", p.Source)
+		}
+		out.GenerationID, out.FooterObjectID = gen, footerID
+		return nil
+	})
+	out.Revision = rev
+	return out, err
+}
+
+// checkPublish checks a compacted generation against its source. A rewrite
+// keeps every block and the seq and witnessed envelope, drops at least one
+// row, and reuses only the source's own objects at their own ordinals.
+func checkPublish(p Publish, hdr segment.Header, src GenerationRow, srcBlocks []GenerationBlockRow) error {
+	srcHdr, err := segment.ReadSealedHeader(bytes.NewReader(src.Header))
+	if err != nil {
+		return Corruptf(SourceGeneration, "main segment %d generation %d header: %v", p.Segment, src.ID, err)
+	}
+	switch {
+	case src.Namespace != Main || src.Segment != p.Segment:
+		return Corruptf(SourceCompaction, "generation %d belongs to %s segment %d, not main segment %d",
+			src.ID, src.Namespace, src.Segment, p.Segment)
+	case int(srcHdr.BlockCount) != len(srcBlocks) || len(srcBlocks) != len(p.Blocks):
+		return Corruptf(SourceCompaction, "main segment %d: source has %d blocks (header %d); rewrite has %d",
+			p.Segment, len(srcBlocks), srcHdr.BlockCount, len(p.Blocks))
+	case hdr.MinSeq != srcHdr.MinSeq || hdr.MaxSeq != srcHdr.MaxSeq ||
+		hdr.MinWitnessedAt != srcHdr.MinWitnessedAt || hdr.MaxWitnessedAt != srcHdr.MaxWitnessedAt:
+		return Corruptf(SourceCompaction, "main segment %d: rewrite covers seqs [%d,%d] witnessed [%d,%d]; source covers [%d,%d] [%d,%d]",
+			p.Segment, hdr.MinSeq, hdr.MaxSeq, hdr.MinWitnessedAt, hdr.MaxWitnessedAt,
+			srcHdr.MinSeq, srcHdr.MaxSeq, srcHdr.MinWitnessedAt, srcHdr.MaxWitnessedAt)
+	case hdr.EventCount >= srcHdr.EventCount:
+		return Corruptf(SourceCompaction, "main segment %d: rewrite has %d events; source has %d",
+			p.Segment, hdr.EventCount, srcHdr.EventCount)
+	}
+	for i, b := range p.Blocks {
+		sb := srcBlocks[i]
+		if sb.Ordinal != i {
+			return Corruptf(SourceCompaction, "main segment %d generation %d block ordinal %d at position %d", p.Segment, src.ID, sb.Ordinal, i)
+		}
+		if b.Reused && (b.Object.ID != sb.ObjectID || b.CompressedLength != sb.CompressedLength) {
+			return Corruptf(SourceCompaction, "main segment %d block %d reuses object %d (%d bytes); source has object %d (%d bytes)",
+				p.Segment, i, b.Object.ID, b.CompressedLength, sb.ObjectID, sb.CompressedLength)
+		}
+	}
+	return nil
+}
+
+// CompareAndSetMeta sets key to value in one fenced transaction if its
+// stored value is prior, where a nil prior means absent. Any other stored
+// value is corruption: only the leader writes the keys it guards, so the
+// leader's in-memory prior cannot legitimately be stale. It backs the
+// §12.1 compaction/seq advance.
+func (s *Session) CompareAndSetMeta(ctx context.Context, key string, prior, value []byte) (uint64, error) {
+	if value == nil {
+		return 0, s.fail(fmt.Errorf("catalog: compare-and-set of %s to nil", key))
+	}
+	return s.run(ctx, TxMetadata, func(tx Tx, rev uint64) error {
+		got, found, err := tx.MetaGetForUpdate(ctx, []byte(key))
+		if err != nil {
+			return err
+		}
+		if found != (prior != nil) || !bytes.Equal(got, prior) {
+			return Corruptf(SourceCompaction, "%s is %x (found=%t); expected %x (found=%t)", key, got, found, prior, prior != nil)
+		}
+		return tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte(key), Value: value}})
+	})
+}
+
+// GCMark is one page of the §13 mark, in one fenced transaction.
+func (s *Session) GCMark(ctx context.Context, after uint64, limit int) (MarkPage, error) {
+	var page MarkPage
+	_, err := s.run(ctx, TxGC, func(tx Tx, rev uint64) error {
+		var err error
+		page, err = tx.MarkUnreferenced(ctx, after, limit)
+		return err
+	})
+	return page, err
+}
+
+// GCClaim is the §13 claim, in one fenced transaction. It returns the
+// objects the caller deletes next. Deleting rows left by a GC run that did
+// not finish come first, as they are; only when there are none does it
+// claim fresh objects. A fresh claim re-runs the reference checks: §7.4
+// clears unreferenced_at on every reference, so a claimed object that is
+// referenced is corruption.
+func (s *Session) GCClaim(ctx context.Context, gcDelay, orphanAge time.Duration, limit int) ([]ObjectRow, error) {
+	var out []ObjectRow
+	_, err := s.run(ctx, TxGC, func(tx Tx, rev uint64) error {
+		rows, err := tx.DeletingObjects(ctx, limit)
+		if err != nil || len(rows) > 0 {
+			out = rows
+			return err
+		}
+		if rows, err = tx.ClaimObjects(ctx, gcDelay, orphanAge, limit); err != nil {
+			return err
+		}
+		ids := make([]uint64, len(rows))
+		for i, r := range rows {
+			ids[i] = r.ID
+		}
+		refs, err := tx.ReferencedObjects(ctx, ids)
+		if err != nil {
+			return err
+		}
+		if len(refs) > 0 {
+			return Corruptf(SourceGC, "claimed objects %v are referenced", refs)
+		}
+		out = rows
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GCForget is the §13 forget, in one fenced transaction: it deletes the
+// rows of deleted objects that are still deleting, and returns how many.
+func (s *Session) GCForget(ctx context.Context, ids []uint64) (int, error) {
+	var n int
+	_, err := s.run(ctx, TxGC, func(tx Tx, rev uint64) error {
+		var err error
+		n, err = tx.ForgetObjects(ctx, ids)
+		return err
+	})
+	return n, err
 }
 
 // InitNamespace creates ns's first active segment if the namespace has no

@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -48,6 +49,8 @@ func Run(t *testing.T, newBackend func(t *testing.T) Backend) {
 		{"SegmentConstraints", testSegmentConstraints},
 		{"ActiveBlockConstraints", testActiveBlockConstraints},
 		{"GenerationConstraints", testGenerationConstraints},
+		{"ReplaceGeneration", testReplaceGeneration},
+		{"GC", testGC},
 		{"DeleteNamespace", testDeleteNamespace},
 		{"ReaderSnapshot", testReaderSnapshot},
 		{"AbortedTransaction", testAbortedTransaction},
@@ -632,6 +635,221 @@ func testGenerationConstraints(t *testing.T, b Backend) {
 			row := catalog.GenerationBlockRow{GenerationID: gen, ObjectID: footer, CompressedLength: 1}
 			return tx.InsertGenerationBlocks(ctx, []catalog.GenerationBlockRow{row, row})
 		})
+	})
+}
+
+// sealedMain seals main segment 0 with blocks as its only generation and
+// returns the generation ID.
+func sealedMain(t *testing.T, b Backend, epoch uint64, footer uint64, blocks ...uint64) uint64 {
+	t.Helper()
+	initMain(t, b, epoch)
+	var gen uint64
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		var err error
+		gen, err = tx.InsertGeneration(ctx, catalog.GenerationRow{Namespace: catalog.Main, Header: header(), FooterObjectID: footer, Revision: rev})
+		require.NoError(t, err)
+		gbs := make([]catalog.GenerationBlockRow, len(blocks))
+		for i, obj := range blocks {
+			gbs[i] = catalog.GenerationBlockRow{GenerationID: gen, Ordinal: i, ObjectID: obj, CompressedLength: int64(10 + i)}
+		}
+		require.NoError(t, tx.InsertGenerationBlocks(ctx, gbs))
+		ok, err := tx.SealSegment(ctx, catalog.Main, 0, gen, rev)
+		require.NoError(t, err)
+		require.True(t, ok)
+	})
+	return gen
+}
+
+func testReplaceGeneration(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	f1 := availableObject(t, b, epoch, []byte("f1"))
+	f2 := availableObject(t, b, epoch, []byte("f2"))
+	b1 := availableObject(t, b, epoch, []byte("b1"))
+	b2 := availableObject(t, b, epoch, []byte("b2"))
+	src := sealedMain(t, b, epoch, f1, b1, b2)
+	var gen uint64
+	r := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		seg, found, err := tx.SegmentForUpdate(ctx, catalog.Main, 0)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, catalog.Sealed, seg.State)
+		require.Equal(t, src, seg.GenerationID)
+		_, found, err = tx.SegmentForUpdate(ctx, catalog.Main, 1)
+		require.NoError(t, err)
+		require.False(t, found)
+
+		g, found, err := tx.Generation(ctx, src)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, f1, g.FooterObjectID)
+		require.Equal(t, header(), g.Header)
+		_, found, err = tx.Generation(ctx, 1<<40)
+		require.NoError(t, err)
+		require.False(t, found)
+		gbs, err := tx.BlocksOfGeneration(ctx, src)
+		require.NoError(t, err)
+		require.Equal(t, []catalog.GenerationBlockRow{
+			{GenerationID: src, Ordinal: 0, ObjectID: b1, CompressedLength: 10},
+			{GenerationID: src, Ordinal: 1, ObjectID: b2, CompressedLength: 11},
+		}, gbs)
+
+		gen, err = tx.InsertGeneration(ctx, catalog.GenerationRow{Namespace: catalog.Main, Header: header(), FooterObjectID: f2, Revision: rev})
+		require.NoError(t, err)
+		require.NoError(t, tx.InsertGenerationBlocks(ctx, []catalog.GenerationBlockRow{
+			{GenerationID: gen, Ordinal: 0, ObjectID: b1, CompressedLength: 10},
+		}))
+		ok, err := tx.SetSegmentGeneration(ctx, catalog.Main, 0, gen, rev)
+		require.NoError(t, err)
+		require.True(t, ok)
+		ok, err = tx.DeleteGeneration(ctx, src)
+		require.NoError(t, err)
+		require.True(t, ok)
+		ok, err = tx.DeleteGeneration(ctx, src)
+		require.NoError(t, err)
+		require.False(t, ok)
+		gbs, err = tx.BlocksOfGeneration(ctx, src)
+		require.NoError(t, err)
+		require.Empty(t, gbs, "deleting a generation deletes its blocks")
+	})
+	segs, err := read(t, b).SegmentsSince(ctxT(t), 0)
+	require.NoError(t, err)
+	require.Equal(t, []catalog.SegmentRow{{Namespace: catalog.Main, Index: 0, State: catalog.Sealed, GenerationID: gen, Revision: r}}, segs)
+
+	// Only a sealed segment changes generation.
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.Main, Index: 1, State: catalog.Active, Revision: rev}))
+		ok, err := tx.SetSegmentGeneration(ctx, catalog.Main, 1, gen, rev)
+		require.NoError(t, err)
+		require.False(t, ok)
+		ok, err = tx.SetSegmentGeneration(ctx, catalog.Main, 2, gen, rev)
+		require.NoError(t, err)
+		require.False(t, ok)
+	})
+}
+
+func testGC(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	footer := availableObject(t, b, epoch, []byte("footer"))
+	blk := availableObject(t, b, epoch, []byte("block"))
+	loose := []uint64{
+		availableObject(t, b, epoch, []byte("loose 1")),
+		availableObject(t, b, epoch, []byte("loose 2")),
+		availableObject(t, b, epoch, []byte("loose 3")),
+	}
+	var uploading uint64
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		ids, err := tx.InsertObjects(ctx, []catalog.NewObject{newObject(t, []byte("uploading"))})
+		require.NoError(t, err)
+		uploading = ids[0]
+	})
+	sealedMain(t, b, epoch, footer, blk)
+	ptr := availableObject(t, b, epoch, []byte("pointer"))
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		h := hot(1, 1, nil, ptr)
+		h.Revision = rev
+		require.NoError(t, tx.InsertHotBatch(ctx, h))
+	})
+
+	// Pages of two over footer, blk, loose..., ptr: the scan counts the
+	// available unmarked rows it passes, referenced or not.
+	var pages []catalog.MarkPage
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		var after uint64
+		for {
+			page, err := tx.MarkUnreferenced(ctx, after, 2)
+			require.NoError(t, err)
+			pages = append(pages, page)
+			if page.Scanned < 2 {
+				break
+			}
+			after = page.Last
+		}
+	})
+	require.Equal(t, []catalog.MarkPage{
+		{Scanned: 2, Last: blk, Marked: 0},
+		{Scanned: 2, Last: loose[1], Marked: 2},
+		{Scanned: 2, Last: ptr, Marked: 1},
+		{Scanned: 0, Last: 0, Marked: 0},
+	}, pages)
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		page, err := tx.MarkUnreferenced(ctx, 0, 100)
+		require.NoError(t, err)
+		require.Equal(t, 3, page.Scanned, "marked rows are not scanned again")
+		require.Zero(t, page.Marked)
+		refs, err := tx.ReferencedObjects(ctx, []uint64{ptr, loose[0], footer, blk, footer, uploading, 1 << 40})
+		require.NoError(t, err)
+		require.Equal(t, []uint64{footer, blk, ptr}, refs, "sorted and deduplicated")
+	})
+
+	// Referencing a marked row clears the mark (§7.4).
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		missing, err := tx.RefCheck(ctx, []uint64{loose[2]})
+		require.NoError(t, err)
+		require.Empty(t, missing)
+	})
+	states, err := read(t, b).ObjectStates(ctxT(t))
+	require.NoError(t, err)
+	require.Equal(t, map[catalog.ObjectState]int64{catalog.ObjectAvailable: 6, catalog.ObjectUploading: 1}, states)
+
+	var claimed []catalog.ObjectRow
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		none, err := tx.ClaimObjects(ctx, time.Hour, time.Hour, 100)
+		require.NoError(t, err)
+		require.Empty(t, none)
+		claimed, err = tx.ClaimObjects(ctx, -time.Hour, -time.Hour, 2)
+		require.NoError(t, err)
+		require.Len(t, claimed, 2, "the limit holds")
+		require.Equal(t, []uint64{loose[0], loose[1]}, []uint64{claimed[0].ID, claimed[1].ID})
+		require.Equal(t, catalog.ObjectAvailable, claimed[0].State, "the pre-claim state")
+		require.False(t, claimed[0].UnreferencedAt.IsZero())
+		more, err := tx.ClaimObjects(ctx, -time.Hour, -time.Hour, 100)
+		require.NoError(t, err)
+		require.Len(t, more, 1)
+		require.Equal(t, uploading, more[0].ID)
+		require.Equal(t, catalog.ObjectUploading, more[0].State)
+		claimed = append(claimed, more...)
+		_, found, err := tx.FindAvailableObject(ctx, sha256.Sum256([]byte("loose 1")), 0)
+		require.NoError(t, err)
+		require.False(t, found, "a claimed row is not a dedup candidate")
+	})
+	// The same bytes can become available again under a new row.
+	availableObject(t, b, epoch, []byte("loose 1"))
+
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		rows, err := tx.DeletingObjects(ctx, 2)
+		require.NoError(t, err)
+		require.Equal(t, []uint64{loose[0], loose[1]}, []uint64{rows[0].ID, rows[1].ID})
+		require.Equal(t, catalog.ObjectDeleting, rows[0].State)
+		require.Equal(t, claimed[0].Key, rows[0].Key)
+		n, err := tx.ForgetObjects(ctx, []uint64{loose[0], loose[1], uploading, ptr, 1 << 40})
+		require.NoError(t, err)
+		require.Equal(t, 3, n, "only deleting rows are forgotten")
+		rows, err = tx.DeletingObjects(ctx, 100)
+		require.NoError(t, err)
+		require.Empty(t, rows)
+	})
+	objs, err := read(t, b).Objects(ctxT(t), []uint64{loose[0], loose[1], uploading, ptr})
+	require.NoError(t, err)
+	require.Len(t, objs, 1)
+	require.Equal(t, ptr, objs[0].ID)
+
+	// A deleting row that is still referenced cannot be forgotten: the
+	// forget is the last line of defense after the claim's re-check.
+	doomed := availableObject(t, b, epoch, []byte("doomed"))
+	failing(t, b, epoch, func(ctx context.Context, tx catalog.Tx) error {
+		page, err := tx.MarkUnreferenced(ctx, 0, 100)
+		if err != nil || page.Marked != 1 {
+			return errors.Join(fmt.Errorf("unexpected mark %+v", page), err)
+		}
+		rows, err := tx.ClaimObjects(ctx, -time.Hour, -time.Hour, 100)
+		if err != nil || len(rows) != 1 || rows[0].ID != doomed {
+			return errors.Join(fmt.Errorf("unexpected claim %v", rows), err)
+		}
+		if err := tx.InsertHotBatch(ctx, hot(2, 2, nil, doomed)); err != nil {
+			return errors.Join(errors.New("unexpected insert"), err)
+		}
+		_, err = tx.ForgetObjects(ctx, []uint64{doomed})
+		return err
 	})
 }
 

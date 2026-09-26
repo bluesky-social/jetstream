@@ -110,6 +110,39 @@ type Tx interface {
 	// and active block row of ns.
 	DeleteNamespace(ctx context.Context, ns Namespace) error
 
+	// SegmentForUpdate returns one segments row, row-locked.
+	SegmentForUpdate(ctx context.Context, ns Namespace, idx uint64) (SegmentRow, bool, error)
+	// Generation returns one segment_generations row.
+	Generation(ctx context.Context, id uint64) (GenerationRow, bool, error)
+	// BlocksOfGeneration returns a generation's blocks in ordinal order.
+	BlocksOfGeneration(ctx context.Context, id uint64) ([]GenerationBlockRow, error)
+	// SetSegmentGeneration points a sealed segment at generation gen.
+	// ok=false when the segment is not sealed.
+	SetSegmentGeneration(ctx context.Context, ns Namespace, idx, gen, revision uint64) (ok bool, err error)
+	// DeleteGeneration deletes a segment_generations row and, by cascade,
+	// its generation_blocks. ok=false when no row has that ID.
+	DeleteGeneration(ctx context.Context, id uint64) (ok bool, err error)
+
+	// MarkUnreferenced is one page of the §13 mark: of the available
+	// objects with unreferenced_at NULL and object_id > after, it takes the
+	// first limit by object_id and sets unreferenced_at = now() on the ones
+	// no row references.
+	MarkUnreferenced(ctx context.Context, after uint64, limit int) (MarkPage, error)
+	// ClaimObjects is the §13 claim: up to limit objects that are available
+	// with unreferenced_at older than gcDelay, or uploading with created_at
+	// older than orphanAge, move to deleting. The returned rows carry the
+	// state they had before the claim.
+	ClaimObjects(ctx context.Context, gcDelay, orphanAge time.Duration, limit int) ([]ObjectRow, error)
+	// DeletingObjects returns up to limit deleting objects in object_id
+	// order: the claims of a GC run that did not finish.
+	DeletingObjects(ctx context.Context, limit int) ([]ObjectRow, error)
+	// ReferencedObjects runs the §13 NOT EXISTS checks for every ID and
+	// returns, sorted and deduplicated, the ones some row references.
+	ReferencedObjects(ctx context.Context, ids []uint64) ([]uint64, error)
+	// ForgetObjects deletes the deleting rows among ids and returns how many
+	// it deleted.
+	ForgetObjects(ctx context.Context, ids []uint64) (int, error)
+
 	// Notify queues pg_notify('jetstream_catalog', revision) for commit.
 	Notify(ctx context.Context, revision uint64) error
 
@@ -146,6 +179,9 @@ type ReadTx interface {
 	Objects(ctx context.Context, ids []uint64) ([]ObjectRow, error)
 	// MetaGet returns the values of the keys that exist.
 	MetaGet(ctx context.Context, keys [][]byte) (map[string][]byte, error)
+	// ObjectStates counts object rows by state
+	// (jetstream_objects{state}).
+	ObjectStates(ctx context.Context) (map[ObjectState]int64, error)
 	// Close ends the transaction.
 	Close(ctx context.Context) error
 }
@@ -181,6 +217,18 @@ type ObjectRow struct {
 	CreatedAt time.Time
 	// UnreferencedAt is zero when NULL.
 	UnreferencedAt time.Time
+}
+
+// MarkPage is the result of one Tx.MarkUnreferenced page.
+type MarkPage struct {
+	// Scanned is how many candidate rows the page covered; fewer than the
+	// limit means the mark is done.
+	Scanned int
+	// Last is the highest object_id the page covered, the next page's
+	// after. Zero when Scanned is.
+	Last uint64
+	// Marked is how many rows the page set unreferenced_at on.
+	Marked int
 }
 
 // NewObject is an uploading row to insert.

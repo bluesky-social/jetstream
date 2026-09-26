@@ -149,6 +149,17 @@ func (r *readTx) MetaGet(ctx context.Context, keys [][]byte) (map[string][]byte,
 	return out, nil
 }
 
+func (r *readTx) ObjectStates(ctx context.Context) (map[catalog.ObjectState]int64, error) {
+	if err := r.stmt(ctx, "object_states"); err != nil {
+		return nil, err
+	}
+	out := map[catalog.ObjectState]int64{}
+	for _, o := range r.s.objects.all() {
+		out[o.State]++
+	}
+	return out, nil
+}
+
 func (r *readTx) Close(context.Context) error {
 	r.closed = true
 	return nil

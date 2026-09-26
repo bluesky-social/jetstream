@@ -691,14 +691,6 @@ func TestScripts_ValidationEndsSession(t *testing.T) {
 	})
 }
 
-func TestScripts_PublishGenerationNotImplemented(t *testing.T) {
-	t.Parallel()
-	eachBackend(t, func(t *testing.T, be backend) {
-		h := newHarness(t, be)
-		require.ErrorIs(t, h.s.PublishGeneration(t.Context()), catalog.ErrNotImplemented)
-	})
-}
-
 func TestScripts_ConcurrentSessionsSerialize(t *testing.T) {
 	t.Parallel()
 	eachBackend(t, func(t *testing.T, be backend) {

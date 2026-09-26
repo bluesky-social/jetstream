@@ -238,7 +238,10 @@ func checkNamespace(s *Snapshot, ns Namespace, opts InvariantOptions) error {
 		if int(hdr.BlockCount) != len(gbs) {
 			return Corruptf(SourceInvariant, "invariant 1: %s segment %d header has %d blocks; catalog has %d", ns, seg.Index, hdr.BlockCount, len(gbs))
 		}
-		if hdr.EventCount == 0 {
+		if hdr.BlockCount == 0 {
+			// An empty seal covers no seqs. A compacted segment can hold
+			// no events, but its header keeps the source's seq bounds
+			// (§12.2), so it still tiles.
 			continue
 		}
 		if hdr.MinSeq != expect {

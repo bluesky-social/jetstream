@@ -1,6 +1,7 @@
 package pgstore
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -526,6 +527,177 @@ func (t *tx) DeleteNamespace(ctx context.Context, ns catalog.Namespace) error {
 		return t.fail("delete_namespace", err)
 	}
 	return nil
+}
+
+func (t *tx) SegmentForUpdate(ctx context.Context, ns catalog.Namespace, idx uint64) (catalog.SegmentRow, bool, error) {
+	r, err := scanSegment(t.tx.QueryRow(ctx,
+		`SELECT `+segmentCols+` FROM segments WHERE namespace = $1 AND segment_index = $2 FOR UPDATE`,
+		string(ns), clampSeq(idx)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return catalog.SegmentRow{}, false, nil
+	}
+	if err != nil {
+		return catalog.SegmentRow{}, false, t.fail("segment_for_update", err)
+	}
+	return r, true, nil
+}
+
+const generationCols = `generation_id, namespace, segment_index, header, footer_object_id, created_at, revision`
+
+func scanGeneration(row pgx.Row) (catalog.GenerationRow, error) {
+	var (
+		g  catalog.GenerationRow
+		ns string
+	)
+	err := row.Scan(&g.ID, &ns, &g.Segment, &g.Header, &g.FooterObjectID, &g.CreatedAt, &g.Revision)
+	g.Namespace = catalog.Namespace(ns)
+	return g, err
+}
+
+func (t *tx) Generation(ctx context.Context, id uint64) (catalog.GenerationRow, bool, error) {
+	g, err := scanGeneration(t.tx.QueryRow(ctx,
+		`SELECT `+generationCols+` FROM segment_generations WHERE generation_id = $1`, int64s([]uint64{id})[0]))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return catalog.GenerationRow{}, false, nil
+	}
+	if err != nil {
+		return catalog.GenerationRow{}, false, t.fail("generation", err)
+	}
+	return g, true, nil
+}
+
+func scanGenerationBlock(row pgx.CollectableRow) (catalog.GenerationBlockRow, error) {
+	var b catalog.GenerationBlockRow
+	err := row.Scan(&b.GenerationID, &b.Ordinal, &b.ObjectID, &b.CompressedLength)
+	return b, err
+}
+
+func (t *tx) BlocksOfGeneration(ctx context.Context, id uint64) ([]catalog.GenerationBlockRow, error) {
+	rows, err := t.tx.Query(ctx,
+		`SELECT generation_id, ordinal, object_id, compressed_length FROM generation_blocks
+		 WHERE generation_id = $1 ORDER BY ordinal`, int64s([]uint64{id})[0])
+	if err != nil {
+		return nil, t.fail("blocks_of_generation", err)
+	}
+	out, err := pgx.CollectRows(rows, scanGenerationBlock)
+	if err != nil {
+		return nil, t.fail("blocks_of_generation", err)
+	}
+	return out, nil
+}
+
+func (t *tx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) (bool, error) {
+	tag, err := t.tx.Exec(ctx,
+		`UPDATE segments SET current_generation_id = $3, revision = $4
+		 WHERE namespace = $1 AND segment_index = $2 AND state = 'sealed'`,
+		string(ns), clampSeq(idx), nullID(gen), revision)
+	if err != nil {
+		return false, t.fail("set_segment_generation", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (t *tx) DeleteGeneration(ctx context.Context, id uint64) (bool, error) {
+	// generation_blocks go with it (ON DELETE CASCADE).
+	tag, err := t.tx.Exec(ctx, `DELETE FROM segment_generations WHERE generation_id = $1`, int64s([]uint64{id})[0])
+	if err != nil {
+		return false, t.fail("delete_generation", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// unreferencedSQL is the four §13 NOT EXISTS checks for the object o.
+const unreferencedSQL = `NOT EXISTS (SELECT 1 FROM hot_batches h WHERE h.object_id = o.object_id)
+	AND NOT EXISTS (SELECT 1 FROM active_segment_blocks a WHERE a.object_id = o.object_id)
+	AND NOT EXISTS (SELECT 1 FROM generation_blocks g WHERE g.object_id = o.object_id)
+	AND NOT EXISTS (SELECT 1 FROM segment_generations s WHERE s.footer_object_id = o.object_id)`
+
+func (t *tx) MarkUnreferenced(ctx context.Context, after uint64, limit int) (catalog.MarkPage, error) {
+	var (
+		page catalog.MarkPage
+		last pgtype.Int8
+	)
+	err := t.tx.QueryRow(ctx,
+		`WITH page AS (
+		     SELECT object_id FROM objects
+		     WHERE state = 'available' AND unreferenced_at IS NULL AND object_id > $1
+		     ORDER BY object_id LIMIT $2),
+		 marked AS (
+		     UPDATE objects o SET unreferenced_at = now()
+		     FROM page p WHERE o.object_id = p.object_id AND `+unreferencedSQL+`
+		     RETURNING 1)
+		 SELECT (SELECT count(*) FROM page), (SELECT max(object_id) FROM page), (SELECT count(*) FROM marked)`,
+		clampSeq(after), limit).Scan(&page.Scanned, &last, &page.Marked)
+	if err != nil {
+		return catalog.MarkPage{}, t.fail("mark_unreferenced", err)
+	}
+	page.Last = uint64(last.Int64)
+	return page, nil
+}
+
+func collectObjects(rows pgx.Rows) ([]catalog.ObjectRow, error) {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.ObjectRow, error) {
+		return scanObject(row)
+	})
+}
+
+func (t *tx) ClaimObjects(ctx context.Context, gcDelay, orphanAge time.Duration, limit int) ([]catalog.ObjectRow, error) {
+	// The CTE's snapshot of each row is its pre-claim state; RETURNING
+	// reports it, so the caller knows which claims to re-check.
+	rows, err := t.tx.Query(ctx,
+		`WITH c AS (
+		     SELECT `+objectCols+` FROM objects
+		     WHERE (state = 'available' AND unreferenced_at < now() - $1::bigint * interval '1 microsecond')
+		        OR (state = 'uploading' AND created_at < now() - $2::bigint * interval '1 microsecond')
+		     ORDER BY object_id LIMIT $3 FOR UPDATE)
+		 UPDATE objects o SET state = 'deleting' FROM c WHERE o.object_id = c.object_id
+		 RETURNING c.object_id, c.key, c.sha256, c.byte_length, c.state, c.created_at, c.unreferenced_at`,
+		gcDelay.Microseconds(), orphanAge.Microseconds(), limit)
+	if err != nil {
+		return nil, t.fail("claim_objects", err)
+	}
+	out, err := collectObjects(rows)
+	if err != nil {
+		return nil, t.fail("claim_objects", err)
+	}
+	slices.SortFunc(out, func(a, b catalog.ObjectRow) int { return cmp.Compare(a.ID, b.ID) })
+	return out, nil
+}
+
+func (t *tx) DeletingObjects(ctx context.Context, limit int) ([]catalog.ObjectRow, error) {
+	rows, err := t.tx.Query(ctx,
+		`SELECT `+objectCols+` FROM objects WHERE state = 'deleting' ORDER BY object_id LIMIT $1`, limit)
+	if err != nil {
+		return nil, t.fail("deleting_objects", err)
+	}
+	out, err := collectObjects(rows)
+	if err != nil {
+		return nil, t.fail("deleting_objects", err)
+	}
+	return out, nil
+}
+
+func (t *tx) ReferencedObjects(ctx context.Context, ids []uint64) ([]uint64, error) {
+	rows, err := t.tx.Query(ctx,
+		`SELECT DISTINCT o.object_id FROM unnest($1::bigint[]) AS o(object_id)
+		 WHERE NOT (`+unreferencedSQL+`) ORDER BY o.object_id`, int64s(ids))
+	if err != nil {
+		return nil, t.fail("referenced_objects", err)
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowTo[uint64])
+	if err != nil {
+		return nil, t.fail("referenced_objects", err)
+	}
+	return out, nil
+}
+
+func (t *tx) ForgetObjects(ctx context.Context, ids []uint64) (int, error) {
+	tag, err := t.tx.Exec(ctx,
+		`DELETE FROM objects WHERE object_id = ANY($1::bigint[]) AND state = 'deleting'`, int64s(ids))
+	if err != nil {
+		return 0, t.fail("forget_objects", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 func (t *tx) Notify(ctx context.Context, revision uint64) error {

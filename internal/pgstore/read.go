@@ -104,19 +104,13 @@ func (r *readTx) SegmentsSince(ctx context.Context, rev uint64) ([]catalog.Segme
 
 func (r *readTx) Generations(ctx context.Context, ids []uint64) ([]catalog.GenerationRow, error) {
 	rows, err := r.tx.Query(ctx,
-		`SELECT generation_id, namespace, segment_index, header, footer_object_id, created_at, revision
+		`SELECT `+generationCols+`
 		 FROM segment_generations WHERE generation_id = ANY($1::bigint[]) ORDER BY generation_id`, int64s(ids))
 	if err != nil {
 		return nil, r.fail("generations", err)
 	}
 	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.GenerationRow, error) {
-		var (
-			g  catalog.GenerationRow
-			ns string
-		)
-		err := row.Scan(&g.ID, &ns, &g.Segment, &g.Header, &g.FooterObjectID, &g.CreatedAt, &g.Revision)
-		g.Namespace = catalog.Namespace(ns)
-		return g, err
+		return scanGeneration(row)
 	})
 	if err != nil {
 		return nil, r.fail("generations", err)
@@ -131,11 +125,7 @@ func (r *readTx) GenerationBlocks(ctx context.Context, ids []uint64) ([]catalog.
 	if err != nil {
 		return nil, r.fail("generation_blocks", err)
 	}
-	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.GenerationBlockRow, error) {
-		var b catalog.GenerationBlockRow
-		err := row.Scan(&b.GenerationID, &b.Ordinal, &b.ObjectID, &b.CompressedLength)
-		return b, err
-	})
+	out, err := pgx.CollectRows(rows, scanGenerationBlock)
 	if err != nil {
 		return nil, r.fail("generation_blocks", err)
 	}
@@ -237,6 +227,25 @@ func (r *readTx) MetaGet(ctx context.Context, keys [][]byte) (map[string][]byte,
 	})
 	if err != nil {
 		return nil, r.fail("meta_get", err)
+	}
+	return out, nil
+}
+
+func (r *readTx) ObjectStates(ctx context.Context) (map[catalog.ObjectState]int64, error) {
+	rows, err := r.tx.Query(ctx, `SELECT state, count(*) FROM objects GROUP BY state`)
+	if err != nil {
+		return nil, r.fail("object_states", err)
+	}
+	out := map[catalog.ObjectState]int64{}
+	var (
+		state string
+		n     int64
+	)
+	if _, err := pgx.ForEachRow(rows, []any{&state, &n}, func() error {
+		out[catalog.ObjectState(state)] = n
+		return nil
+	}); err != nil {
+		return nil, r.fail("object_states", err)
 	}
 	return out, nil
 }
