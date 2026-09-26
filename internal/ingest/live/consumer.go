@@ -226,6 +226,31 @@ func (c *Consumer) promoteSyncState(segEvts []segment.Event) {
 	}
 }
 
+// settleSyncState drops pending verifier state that evt's receipt makes
+// unpromotable. It runs before any drop path, so an event that verified but
+// is never appended still settles the entries behind it. Async resyncs are
+// skipped: atmos delivers them out of order, so later events' entries can be
+// behind them and still in flight.
+func (c *Consumer) settleSyncState(evt streaming.Event) {
+	if c.cfg.SyncStateStore == nil || evt.Resync == streaming.ResyncAsync {
+		return
+	}
+	var did, rev string
+	switch {
+	case evt.Commit != nil:
+		did, rev = evt.Commit.Repo, evt.Commit.Rev
+	case evt.Sync != nil:
+		did, rev = evt.Sync.DID, evt.Sync.Rev
+	case evt.Account != nil:
+		did = evt.Account.DID
+	case evt.Identity != nil:
+		did = evt.Identity.DID
+	default:
+		return
+	}
+	c.cfg.SyncStateStore.Settle(atmos.DID(did), rev, evt.Seq)
+}
+
 // dropStaleOrderedAsyncResync guards against atmos's async-resync
 // delivery race: the synthetic resync event travels on a separate
 // channel from the ordered result stream, so a post-resync #commit for
@@ -599,6 +624,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 		for _, evt := range batch {
 			c.cfg.Metrics.incEventsReceived()
+			c.settleSyncState(evt)
 
 			segEvts, err := ConvertEvent(evt, witnessedAt)
 			dme, isDropped := errors.AsType[*DroppedOpsError](err)

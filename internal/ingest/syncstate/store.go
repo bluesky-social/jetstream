@@ -103,25 +103,32 @@ type pending[K cmp.Ordered] struct {
 	key K
 }
 
-// maxPendingPerDID bounds a DID's queue. The verifier cannot run far ahead of
-// the appends, so it is reached only when events verify but never append
-// (malformed after verification, say) and no later event promotes past them.
-// Dropping the oldest then loses only that entry's promotion, which leaves
-// durable state older than the archive: a chain break and resync, not a lost
-// or duplicated event.
-const maxPendingPerDID = 64
-
 // savePending queues e as did's newest pending state. Entries at or above
 // e's key are superseded: the verifier's view of the DID moved back.
+//
+// Nothing here bounds the queue. Its entries past the consumer's current event
+// belong to events still in flight, which the verifier's pipeline depth bounds,
+// and each must stay until its own event promotes it. Settle drops the ones
+// behind the consumer.
 func savePending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, e pending[K]) {
 	q := m[did]
 	for len(q) > 0 && q[len(q)-1].key >= e.key {
 		q = q[:len(q)-1]
 	}
-	if len(q) >= maxPendingPerDID {
-		q = append(q[:0], q[len(q)-maxPendingPerDID+1:]...)
-	}
 	m[did] = append(q, e)
+}
+
+// settlePending drops did's entries whose key is below key, except the newest,
+// which is the verifier's current view.
+func settlePending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, key K) {
+	q := m[did]
+	i := 0
+	for i < len(q)-1 && q[i].key < key {
+		i++
+	}
+	if i > 0 {
+		m[did] = append(q[:0], q[i:]...)
+	}
 }
 
 // latestPending returns did's newest pending state.
@@ -438,6 +445,26 @@ func (p *StateStore) PromoteHosting(did atmos.DID, maxSeq int64) {
 	}
 	p.promotedHosting[did] = buf
 	p.unsnappedHosting[did] = buf
+}
+
+// Settle records that the consumer has received did's upstream event with
+// chain rev rev (empty when the event carries none) and relay seq seq, and
+// drops the pending entries of earlier events. The consumer handles events one
+// at a time in per-DID verification order, so every earlier event has already
+// appended and promoted its entry or been dropped, and an entry below this
+// event's keys can never promote again. Without this, a DID whose events keep
+// verifying but never appending would grow its queue without bound.
+//
+// Settle keeps the newest entry even when it is older: loads read it, and
+// dropping it would move the verifier's view back. It must not be called for
+// events delivered out of verification order (atmos's async resyncs).
+func (p *StateStore) Settle(did atmos.DID, rev string, seq int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if rev != "" {
+		settlePending(p.pendingChain, did, rev)
+	}
+	settlePending(p.pendingHosting, did, seq)
 }
 
 // Snapshot is the state promoted between two instants, for a later

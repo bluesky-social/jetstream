@@ -150,16 +150,18 @@ func Probe(ctx context.Context, b Blob, archiveID [16]byte) (err error) {
 	id := NewUUID()
 	key := FormatUUID(archiveID) + "/probe/" + FormatUUID(id)
 	data := []byte("jetstream probe " + FormatUUID(id))
-	if err := b.PutKey(ctx, key, data); err != nil {
-		return fmt.Errorf("objstore: probe put %s: %w", key, err)
-	}
 	// No catalog row references a probe object, so GC never reclaims one:
-	// delete it on every path. A failed start still reports its first error.
+	// delete it on every path, including a failed PUT, which may still have
+	// stored the object (a timeout after the store applied it). A failed
+	// start still reports its first error.
 	defer func() {
 		if derr := b.DeleteKey(context.WithoutCancel(ctx), key); derr != nil && err == nil {
 			err = fmt.Errorf("objstore: probe delete %s: %w", key, derr)
 		}
 	}()
+	if err := b.PutKey(ctx, key, data); err != nil {
+		return fmt.Errorf("objstore: probe put %s: %w", key, err)
+	}
 	got, err := b.GetKey(ctx, key)
 	if err != nil {
 		return fmt.Errorf("objstore: probe get %s: %w", key, err)

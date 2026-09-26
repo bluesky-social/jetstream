@@ -539,12 +539,17 @@ func (h *disaggHarness) checkMerged() {
 	require.Equal(t, uint64(len(main))+1, h.mainNext(), "main's seq/next after merge")
 	obs := disaggObserved(main)
 	require.NoError(t, CheckStructuralInvariants(obs), "main after merge")
-	if !h.mergeReplay {
+	if h.mergeReplay {
 		// A kill after a source's rows are flushed and before its cursor
-		// commits re-drains that source at new seqs, which regresses revs
-		// (CheckInvariants).
-		require.NoError(t, CheckInvariants(obs), "main after merge")
+		// commits re-drains that source at new seqs, which regresses revs.
+		// That must be the only damage: one run of rows directly followed by
+		// a copy of itself.
+		if lo, hi, ok := mergeReplayRun(obs); ok {
+			h.replayed = [2]uint64{lo, hi}
+			t.Logf("merge check: seqs %d-%d re-drained", lo, hi)
+		}
 	}
+	require.NoError(t, CheckInvariants(h.withoutReplayed(obs)), "main after merge, less the re-drained run")
 	h.requireSurvivors(main, "main after merge")
 	ground, err := GroundTruthFromWorld(h.w)
 	require.NoError(t, err)
@@ -552,8 +557,47 @@ func (h *disaggHarness) checkMerged() {
 	require.NoError(t, err)
 	require.NoError(t, Compare(ground, model), "main after merge")
 	h.expected = main
-	h.mergedRows = len(main)
 	t.Logf("merge check: main %d rows (replayed source: %t)", len(main), h.mergeReplay)
+}
+
+// mergeReplayRun finds the first copy of a merge source that a kill
+// re-drained. Merge writes the source's rows in order from its start, so the
+// flushed first copy is a run of rows directly followed by a run that begins
+// with the same rows at new seqs. It returns the first copy's seq range when
+// removing it leaves obs without a rev regression.
+func mergeReplayRun(obs []ObservedEvent) (lo, hi uint64, ok bool) {
+	same := func(a, b ObservedEvent) bool {
+		return a.WitnessedAt == b.WitnessedAt && a.Kind == b.Kind && a.DID == b.DID &&
+			a.Collection == b.Collection && a.Rkey == b.Rkey && a.Rev == b.Rev &&
+			bytes.Equal(a.Payload, b.Payload)
+	}
+	for i := range obs {
+		for k := 1; i+2*k <= len(obs); k++ {
+			j := 0
+			for j < k && same(obs[i+j], obs[i+k+j]) {
+				j++
+			}
+			if j < k {
+				continue
+			}
+			rest := append(slices.Clone(obs[:i]), obs[i+k:]...)
+			if checkPerDIDRevMonotonic(rest) == nil {
+				return obs[i].Seq, obs[i+k-1].Seq, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// withoutReplayed returns obs less the rows a kill re-drained during merge.
+func (h *disaggHarness) withoutReplayed(obs []ObservedEvent) []ObservedEvent {
+	lo, hi := h.replayed[0], h.replayed[1]
+	if lo == 0 {
+		return obs
+	}
+	return slices.DeleteFunc(slices.Clone(obs), func(ev ObservedEvent) bool {
+		return ev.Seq >= lo && ev.Seq <= hi
+	})
 }
 
 // disaggListGate lets backfill list the first PDS it asks and holds every

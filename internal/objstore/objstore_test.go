@@ -90,6 +90,7 @@ func TestProbe(t *testing.T) {
 		leftover bool
 	}{
 		{memblob.OpPut, memblob.FaultError, "probe put", false},
+		{memblob.OpPut, memblob.FaultErrorAfter, "probe put", false},
 		{memblob.OpPut, memblob.FaultDropPut, "probe get", false},
 		{memblob.OpGet, memblob.FaultError, "probe get", false},
 		{memblob.OpGet, memblob.FaultWrongBytes, "differ", false},

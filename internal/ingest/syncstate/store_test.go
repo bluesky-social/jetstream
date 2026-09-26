@@ -179,21 +179,85 @@ func TestStateStore_PipelinedHostingPromotesEach(t *testing.T) {
 	require.Equal(t, newer, *live, "the newer event stays pending")
 }
 
-// A DID whose events verify but never append cannot grow its queue without
-// bound; the newest entries survive.
-func TestStateStore_PendingQueueIsBounded(t *testing.T) {
+// The verifier can run thousands of events ahead of the appends, and a hot DID
+// can have all of them in flight. Each event's promotion must still find its
+// own entry: a drop-oldest cap lost it, so the batch committed the event's rows
+// and a cursor past it with the DID's durable state older than the archive.
+func TestStateStore_DeepPipelinePromotesOldest(t *testing.T) {
 	t.Parallel()
-	s := New(newTestStore(t))
+	raw := newTestStore(t)
+	s := New(raw)
 	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
-	for i := range 3 * maxPendingPerDID {
+	const inFlight = 500
+	for i := range inFlight {
 		rev := fmt.Sprintf("3lrev%04d", i)
 		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
 	}
-	require.Len(t, s.pendingChain[did], maxPendingPerDID)
-	last := fmt.Sprintf("3lrev%04d", 3*maxPendingPerDID-1)
-	require.Equal(t, last, s.pendingChain[did][maxPendingPerDID-1].key)
-	s.PromoteChain(did, last)
+	for i := range inFlight {
+		rev := fmt.Sprintf("3lrev%04d", i)
+		s.Settle(did, rev, int64(i))
+		s.PromoteChain(did, rev)
+		require.NoError(t, flush(t, s))
+		got, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.NotNil(t, got, "rev %s", rev)
+		require.Equal(t, rev, got.Rev, "each event's promotion makes its own state durable")
+	}
 	require.Empty(t, s.pendingChain)
+}
+
+// Events that verify but never append (malformed after verification, say)
+// leave their entries pending. Settling at each later event's receipt drops
+// them without hiding the verifier's newest view or any later event's entry.
+func TestStateStore_SettleBoundsUnappendedEvents(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
+	const n = 1000
+	rev := func(i int) string { return fmt.Sprintf("3lrev%04d", i) }
+	host := func(i int) atmossync.HostingState { return atmossync.HostingState{Active: i%2 == 0, Seq: int64(i)} }
+
+	// Two events are always in flight ahead of the one being received.
+	save := func(i int) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev(i), Data: fixedCID(t)}))
+		require.NoError(t, s.SaveHosting(t.Context(), did, host(i)))
+	}
+	save(0)
+	save(1)
+	for i := range n - 2 {
+		save(i + 2)
+		s.Settle(did, rev(i), int64(i))
+		require.LessOrEqual(t, len(s.pendingChain[did]), 3)
+		require.LessOrEqual(t, len(s.pendingHosting[did]), 3)
+	}
+	live, err := s.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, rev(n-1), live.Rev, "the verifier still reads its newest save")
+
+	// The received event's own entry and the in-flight ones still promote.
+	for i := n - 2; i < n; i++ {
+		s.Settle(did, rev(i), int64(i))
+		s.PromoteChain(did, rev(i))
+		s.PromoteHosting(did, int64(i))
+		require.NoError(t, flush(t, s))
+		got, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.Equal(t, rev(i), got.Rev)
+		gotHost, err := New(raw).LoadHosting(t.Context(), did)
+		require.NoError(t, err)
+		require.Equal(t, host(i), *gotHost)
+	}
+	require.Empty(t, s.pendingChain)
+	require.Empty(t, s.pendingHosting)
+
+	// A lone unappended entry older than the received event stays: it is the
+	// verifier's current view.
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev(n), Data: fixedCID(t)}))
+	s.Settle(did, rev(n+1), int64(n+1))
+	live, err = s.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, rev(n), live.Rev)
 }
 
 func TestStateStore_HostingRoundTrip(t *testing.T) {

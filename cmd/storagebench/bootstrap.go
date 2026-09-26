@@ -162,7 +162,7 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 	gctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	onFailure := func(err error) { cancel(err) }
-	openDirect := func(ns catalog.Namespace, batches *atomic.Int64, hook ingest.DurableBatchHook) (*ingest.Writer, error) {
+	openDirect := func(ns catalog.Namespace, batches *atomic.Int64, prepare func() any, hook ingest.DurableBatchHook) (*ingest.Writer, error) {
 		sealer, err := maintainer.OpenSegment(ctx, maintainer.SegmentConfig{
 			Session:         sess,
 			Namespace:       ns,
@@ -175,9 +175,10 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 			return nil, err
 		}
 		return ingest.Open(ingest.Config{
-			Store:     meta,
-			Logger:    b.logger,
-			Namespace: ns,
+			Store:                    meta,
+			Logger:                   b.logger,
+			Namespace:                ns,
+			DurableBatchPrepareValue: prepare,
 			OnDurableBatch: func(ctx context.Context, mb metastore.Batch, next uint64, force bool, v any) (func(), func(error), error) {
 				batches.Add(1)
 				return hook(ctx, mb, next, force, v)
@@ -191,16 +192,21 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 			},
 		})
 	}
-	mainW, err := openDirect(catalog.Main, &stats.mainBatches, completions.StageDurable)
+	mainW, err := openDirect(catalog.Main, &stats.mainBatches, nil, completions.StageDurable)
 	if err != nil {
 		return err
 	}
 	closeMain := sync.OnceValue(mainW.Close)
 	defer func() { _ = closeMain() }()
+	// The cursor is sampled when the batch is cut, as the live consumer's is:
+	// read at commit time, it can cover events in a later, uncommitted block.
+	// lastUpstream moves only after an Append returns, so a sample never runs
+	// ahead of the rows cut with it.
 	var lastUpstream atomic.Int64
 	liveW, err := openDirect(catalog.BootstrapLive, &stats.liveBatches,
-		func(_ context.Context, mb metastore.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
-			if c := lastUpstream.Load(); c > 0 {
+		func() any { return lastUpstream.Load() },
+		func(_ context.Context, mb metastore.Batch, _ uint64, _ bool, v any) (func(), func(error), error) {
+			if c, _ := v.(int64); c > 0 {
 				mb.Set([]byte(catalog.RelayCursorKey), metastore.EncodeVersionedUint64LE(1, uint64(c)))
 			}
 			return nil, nil, nil

@@ -58,14 +58,28 @@ Each DID now has a queue of pending entries, oldest first
 Promotion takes the newest entry at or below the appended event's rev (for
 hosting, its account seq) and drops the older entries, which it supersedes.
 Loads still read the newest entry. A save at or below a queued key replaces
-the entries from that key up. The queue is capped at 64 entries per DID. Only
-events that verify but never append can reach the cap, and dropping the
-oldest entry then costs a resync, not a lost or duplicated event.
+the entries from that key up.
+
+The first version of this fix capped the queue at 64 entries per DID and
+dropped the oldest on overflow, on the theory that only events that verify but
+never append could reach the cap. That was wrong. atmos buffers up to 4096
+verified results ahead of the consumer, so one hot DID can have far more than
+64 events in flight, and dropping the oldest lost an event's own entry. That
+was this same bug again (a Stage 3 sub-stage roast found it). The cap is gone.
+Instead, the consumer calls `StateStore.Settle` as it receives each event,
+before any drop path. Settle drops the DID's entries below the event's rev and
+seq, keeping the newest. Every earlier event has already promoted its entry or
+been dropped, so those entries can never promote again. Only in-flight events
+and one retained entry remain, which bounds the queue. Settle skips async
+resyncs, which atmos delivers out of order.
 
 ## Verification
 
 - `TestStateStore_PipelinedSavesPromoteEach` fails on the one-slot store and
   passes with the queue.
+- `TestStateStore_DeepPipelinePromotesOldest` fails on the capped queue and
+  passes with Settle. `TestStateStore_SettleBoundsUnappendedEvents` covers
+  the bound.
 - Before the fix, 19 of the 200 seed/mode pairs over seeds 100-199 failed at
   least once across the sweeps (about 4% of runs). With the fix: 400 of 400
   non-race runs (two passes), 200 of 200 race

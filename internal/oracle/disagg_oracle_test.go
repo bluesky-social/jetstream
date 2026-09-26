@@ -387,10 +387,11 @@ type disaggHarness struct {
 	// survivors are the rows generated after backfill finished, which
 	// merge must keep.
 	survivors []disaggKey
-	// mergeReplay is set when a kill re-drained a merge source, which
-	// leaves main's first mergedRows rows with duplicates.
+	// mergeReplay is set when a kill re-drained a merge source, which can
+	// leave a run of main's rows duplicated. replayed is that run's first
+	// copy as an inclusive seq range, zero when checkMerged found none.
 	mergeReplay bool
-	mergedRows  int
+	replayed    [2]uint64
 }
 
 func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
@@ -844,14 +845,10 @@ func (h *disaggHarness) checkStreams() string {
 		}
 		if ref == nil {
 			disaggRequireModel(t, want, groups, keys, h.sessionChanges(), name)
-			if h.mergeReplay {
-				// The merged prefix repeats a source's rows; checkMerged
-				// checked it as merge left it.
-				require.NoErrorf(t, CheckStructuralInvariants(v2), "%s", name)
-				require.NoErrorf(t, CheckInvariants(v2[min(h.mergedRows, len(v2)):]), "%s after merge", name)
-			} else {
-				require.NoErrorf(t, CheckInvariants(v2), "%s", name)
-			}
+			// The merged prefix may repeat a source's rows, which
+			// checkMerged located.
+			require.NoErrorf(t, CheckStructuralInvariants(v2), "%s", name)
+			require.NoErrorf(t, CheckInvariants(h.withoutReplayed(v2)), "%s, less the re-drained run", name)
 			model, err := Reconstruct(v2)
 			require.NoErrorf(t, err, "%s", name)
 			require.NoErrorf(t, Compare(ground, model), "%s", name)
