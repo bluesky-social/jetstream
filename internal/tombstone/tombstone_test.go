@@ -230,3 +230,49 @@ func TestRebuildEqualsIncremental(t *testing.T) {
 		require.Equal(t, incremental.Len(), rebuilt.Len(), "seed %d", seed)
 	}
 }
+
+// TestCompileMatchesShouldDrop checks that a sparse rewrite under a
+// compiled snapshot drops exactly the rows ShouldDrop drops, with the
+// same reasons.
+func TestCompileMatchesShouldDrop(t *testing.T) {
+	t.Parallel()
+	r := rand.New(rand.NewSource(4))
+	dids := []string{"did:plc:a", "did:plc:b", "did:plc:c"}
+	for range 50 {
+		snap := Snapshot{Records: map[RecordKey]uint64{}, DIDs: map[string]DIDTombstone{}}
+		for range r.Intn(3) {
+			snap.DIDs[dids[r.Intn(len(dids))]] = DIDTombstone{Seq: uint64(r.Intn(60)), Reason: fmt.Sprint("r", r.Intn(3))}
+		}
+		for range r.Intn(6) {
+			snap.Records[RecordKey{DID: dids[r.Intn(len(dids))], Collection: "c", Rkey: fmt.Sprint(r.Intn(3))}] = uint64(r.Intn(60))
+		}
+		b, err := segment.NewBlockBuilder(4)
+		require.NoError(t, err)
+		var frames [][]byte
+		want := map[uint64]string{}
+		for seq := uint64(1); seq <= 50; seq++ {
+			ev := segment.Event{Seq: seq, Kind: segment.Kind(1 + r.Intn(7)), DID: dids[r.Intn(len(dids))], Collection: "c", Rkey: fmt.Sprint(r.Intn(3))}
+			if drop, reason := snap.ShouldDrop(&ev); drop {
+				want[seq] = reason
+			}
+			if full, err := b.Append(ev); err != nil {
+				t.Fatal(err)
+			} else if full {
+				fr, _ := b.Encode()
+				frames = append(frames, fr)
+			}
+		}
+		if fr, _ := b.Encode(); fr != nil {
+			frames = append(frames, fr)
+		}
+		header, footer, _, err := segment.BuildSealed(segment.SliceFrameSource(frames))
+		require.NoError(t, err)
+		got := map[uint64]string{}
+		_, err = segment.SparseRewrite(header, footer, func(i int) ([]byte, error) { return frames[i], nil },
+			snap.Compile(0), segment.SparseOptions{OnDrop: func(ev *segment.Event, didLevel bool) {
+				got[ev.Seq] = snap.DropReason(ev, didLevel)
+			}})
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	}
+}

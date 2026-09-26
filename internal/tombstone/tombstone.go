@@ -14,11 +14,9 @@ import (
 	"github.com/jcalabro/atmos/api/comatproto"
 )
 
-type RecordKey struct {
-	DID        string
-	Collection string
-	Rkey       string
-}
+// RecordKey is segment.RecordKey, so a Snapshot's record map feeds a
+// sparse rewrite without a copy.
+type RecordKey = segment.RecordKey
 
 type DIDTombstone struct {
 	Seq    uint64
@@ -162,6 +160,26 @@ func (s Snapshot) ShouldDrop(ev *segment.Event) (bool, string) {
 		return true, "record"
 	}
 	return false, ""
+}
+
+// Compile builds the sparse-rewrite drop rule for s, bounded to rows at
+// or below maxSeq. It shares s.Records, so s must not change while the
+// result is in use.
+func (s Snapshot) Compile(maxSeq uint64) *segment.Tombstones {
+	dids := make(map[string]uint64, len(s.DIDs))
+	for did, ts := range s.DIDs {
+		dids[did] = ts.Seq
+	}
+	return segment.NewTombstones(dids, s.Records, maxSeq)
+}
+
+// DropReason is the reason ShouldDrop gives for a row a sparse rewrite
+// of s's compiled rule dropped.
+func (s Snapshot) DropReason(ev *segment.Event, didLevel bool) string {
+	if didLevel {
+		return s.DIDs[ev.DID].Reason
+	}
+	return "record"
 }
 
 func (s Snapshot) Merge(other Snapshot) {

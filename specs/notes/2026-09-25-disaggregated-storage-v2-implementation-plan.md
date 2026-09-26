@@ -1113,7 +1113,7 @@ recorded.
 
 Design §12, §13, and §26 stage 4.
 
-- [ ] **S4.1 Sparse rewrite (pure)** (L). Deps: S1.7.
+- [x] **S4.1 Sparse rewrite (pure)** (L). Deps: S1.7.
   - In `segment`: given a generation (header, footer, block fetcher) and a
     tombstone snapshot, run the §12.2 steps:
     - candidate blocks by per-block bloom plus seq plus collection bitmask;
@@ -1262,6 +1262,38 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S4.1 (2026-09-26): Sparse rewrite.**
+  - `segment.SparseRewrite(header, footer, fetch, tombstones, opts)` runs
+    the §12.2 steps over one generation and returns the changed frames by
+    ordinal, the reused ordinals, and the new header and footer. It does no
+    I/O beyond `fetch`.
+  - `segment.Tombstones` is the drop rule, compiled once per chunk by
+    `tombstone.Snapshot.Compile(chunkEnd)` and shared by the workers. It
+    indexes tombstones by DID so a block is selected only when a probe's
+    per-block bloom hits and its DID seq, or a record seq in a collection in
+    the block's bitmask, is above the block's `min_seq`.
+    `tombstone.RecordKey` is now an alias of `segment.RecordKey`, so the
+    record map passes through without a copy.
+  - Deviations, recorded in design §12.2 and §12.6:
+    - Past `DefaultSparseProbeLimit` (4M) probes the rewrite stops narrowing
+      and decodes every block below the highest tombstone seq, the old
+      `CompactionBloomNarrowMaxDIDs` fallback. This bounds a merge-tail pass
+      with millions of tombstoned DIDs.
+    - Record tombstones on rows with no collection match every block.
+    - Collection IDs keep the source order instead of first-seen order.
+    - One block is decoded at a time. `SparseOptions.Reserve` budgets each
+      decode. Re-encoded frames are held until upload and are not budgeted.
+  - Tests: the equivalence property test compares against `computeRewrite`
+    on the same Reader through two chained generations, with and without
+    narrowing. It requires byte-identical changed frames, equal block
+    indexes, headers, collection counts, per-block collection sets and rows,
+    and `VerifySealedMetadata` on both outputs. `FuzzSparseRewrite` does the
+    same over fuzz-derived segments and tombstones. Other tests cover
+    fetching only candidates, the vanished check, the memory hook, corrupt
+    input, and `Compile` against `ShouldDrop`. Nine hand-planted bugs
+    (vanished count, collection counts, removal rule, the vanished fetch,
+    the seq bound, the no-collection probe, the dense bound, offsets,
+    sentinel bitmasks) all fail the tests.
 - **Stage 3 exit (2026-09-26).**
   - Checks at `3564268` (S3.6), all passing:
     - `just`, and `just test-storage` against PG, SeaweedFS, and MinIO,
@@ -1282,7 +1314,7 @@ the PR that made them.
   - Carried forward: S5.6, discovery below one fenced transaction per DID,
     must land before a pop instance bootstraps in disaggregated mode.
   - The branch is not yet pushed, so CI's `test-storage` job has not run on
-    these commits. Its history still holds the 51MB binary S3.6 removed.
+    these commits.
 - **S3.6 (2026-09-26): Stage 3 measurements.**
   - Two new `cmd/storagebench` commands, results in design §22.3:
     - `bootstrap` runs a bootstrapping leader's discovery, download, and live

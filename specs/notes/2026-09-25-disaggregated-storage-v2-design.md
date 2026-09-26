@@ -1390,7 +1390,11 @@ object IDs).
 1. **Candidate blocks.** A block is a candidate if its per-block DID bloom hits a
    tombstoned DID, the block's `min_seq` is below that tombstone's seq, and, for
    a record tombstone, the block's collection bitmask contains the tombstone's
-   collection.
+   collection. A record tombstone on a row with no collection matches every
+   block, since such rows are in no bitmask. Past `segment.DefaultSparseProbeLimit`
+   bloom probes (tombstoned DIDs times blocks) the rewrite stops narrowing: every
+   block holding rows below the highest tombstone seq is a candidate, which is
+   what the old full rewrite did.
 2. **Decode and drop.** Fetch and decode each candidate. Apply the existing drop
    rule (drop `KindCreate` and `KindUpdate` rows superseded by a newer tombstone).
    Blocks that lose no rows are not changed. If no block changed, stop. The
@@ -1418,7 +1422,9 @@ object IDs).
      collections (`$account`, `$identity`, `$sync`) are never removed, because
      their rows are never dropped. Rebuild changed blocks' bitmasks exactly from
      their remaining rows. Remap unchanged blocks' bitmasks to the new collection
-     IDs.
+     IDs. Surviving collections keep their relative order, which can differ from
+     the first-seen order a full rewrite assigns; `VerifySealedMetadata` compares
+     collections by name.
 6. **New header.** `event_count` = old minus dropped rows. `unique_did_count` =
    old minus vanished DIDs. Keep `block_count`, the seq bounds, and the
    witnessed bounds. Recompute the offsets and the checksum.
@@ -1476,6 +1482,13 @@ A segment rewrite holds its decoded candidate blocks. With 8 workers and
 256MiB-segment worst cases, budget `JETSTREAM_COMPACTION_MEMORY_BYTES` (default
 2GiB). A worker waits for budget before decoding. Blocks are decoded one at a
 time into a per-worker buffer when possible.
+
+As built (S4.1), `segment.SparseRewrite` always decodes one block at a time:
+it reserves the block's compressed plus uncompressed size plus its decoded
+`Event` headers, decodes, drops, re-encodes, and releases. The budget covers
+decoding only. The re-encoded frames of changed blocks stay in memory until
+upload, unbudgeted; they are compressed and never larger than the blocks
+that were decoded.
 
 ### 12.7 Cache-Control deadline
 
