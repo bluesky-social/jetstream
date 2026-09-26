@@ -1,6 +1,6 @@
 # Disaggregated storage v2: implementation plan
 
-**Status: Stage 0 done (2026-09-25); Stage 1 done (2026-09-25); Stage 2 in progress.** This is the work tracker for
+**Status: Stage 0 done (2026-09-25); Stage 1 done (2026-09-25); Stage 2 done (2026-09-25).** This is the work tracker for
 `specs/notes/2026-09-25-disaggregated-storage-v2-design.md` (the "design"). It
 breaks the design's delivery stages (§26) into PR-sized tasks with file
 references, dependencies, checks, mutants, and exit criteria. The design says
@@ -33,7 +33,7 @@ Prerequisite already landed: the ephemeral dev environment (`just up` /
 |---|---|---|
 | 0 | Remove timestamp import (design §21) | done |
 | 1 | Storage interfaces; local mode moved onto them with no behavior change | done |
-| 2 | Steady state in disaggregated mode on fakes and real storage | in progress |
+| 2 | Steady state in disaggregated mode on fakes and real storage | done |
 | 3 | Bootstrap, merge, `storage init` | not started |
 | 4 | Sparse compaction and GC | not started |
 | 5 | `storage new-identity`, memory budgets, dashboards, 24h soak | not started |
@@ -1247,6 +1247,24 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **Stage 2 exit (2026-09-25).**
+  - Checks at `36a77fd` (S2.23), all passing:
+    - `just`, and `just test-storage` against PG, SeaweedFS, and MinIO.
+    - `just oracle-disagg` and `just oracle-disagg-sweep` (20 seeds).
+    - `just test-long ./internal/oracle` and `just oracle-sweep`.
+    - `just fuzz 30s` on `./internal/catalog`, `./internal/ingest/live`, and
+      `./segment`: 11 targets.
+    - `just mutation-gate` on a clean tree: 60 mutants match the baseline, and
+      m062–m069 are all KILLED in the `disagg` tier.
+  - `just bench ./segment` against `main`, 5 runs each: no time or
+    allocation-count regression (geomean -0.7%). ReaderOpen allocates about
+    47 more bytes per op.
+  - Stage 2 measurements are in design §22 (S2.22), and S2.23 re-measured
+    bulk recovery.
+  - Layer 4 passed locally on both object stores. CI's `test-storage` job runs
+    the same recipe, but has not run on these commits: the branch is not yet
+    pushed.
 
 - **S2.23 (2026-09-25): Live latency under bulk recovery.**
   - Rule 7 bound (design §10.5): bulk batches frozen but not yet committed
