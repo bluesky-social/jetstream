@@ -1167,7 +1167,7 @@ Design §12, §13, and §26 stage 4.
     across a compaction keep working until `GC_DELAY`.
   - Leader kills during rewrite upload, before publish, between chunks, and
     during each GC step.
-- [ ] **S4.5 Stage 4 mutants** (S). Deps: S4.4.
+- [x] **S4.5 Stage 4 mutants** (S). Deps: S4.4.
   - GC skips the re-check.
   - Sparse compaction miscounts `unique_did_count`.
   - Recommended extras: publish skips the source-generation check, and the
@@ -1267,6 +1267,28 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S4.5 (2026-09-26): Stage 4 mutants.**
+  - m073–m077 are all KILLED at the `disagg` tier:
+    - m073 (GC skips the claim re-check), unit only:
+      `TestScripts_GCClaimReferenced`. Every reference clears
+      `unreferenced_at`, so no correct run reaches the re-check.
+    - m074 (sparse rewrite miscounts `unique_did_count`) and m075 (sparse
+      rewrite keeps stale collection counts): the held reader now runs
+      `segment.VerifySealedMetadata` on every generation it sees while
+      current, and `TestSparseRewriteMatchesRewrite` catches both.
+    - m076 (compaction skips its refresh after a publish): the leader fails
+      loud on the next chunk's publish.
+    - m077 (GC ignores `GC_DELAY`): the held reader's late read finds the
+      objects gone.
+  - Deviation from the task's wording: removing `PublishGeneration`'s
+    source-generation check alone is an equivalent mutant, because a
+    replaced source is already deleted and the missing-generation check
+    fires first. m076 models the bug the check guards instead.
+  - The campaign at `51d744b` found m024, m028 and m045 STALE after S4.2
+    split the rewriters. `64c8d90` refreshed them to the same bugs, and
+    single runs killed all three at their original tiers. The baseline
+    records 68 mutants, all KILLED; `testing/mutation/RESULTS.md` has the
+    campaign.
 - **S4.4 (2026-09-26): Layer 3 with compaction and GC.**
   - Every pod runs delete compaction (2s interval, tombstone cap 4, so a
     pass has several chunks) and GC (1s interval, a 15s delay) on the fake

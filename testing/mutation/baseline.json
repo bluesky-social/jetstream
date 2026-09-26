@@ -1,5 +1,5 @@
 {
-  "commit": "f39304d16be5e0ef299973ee7844ac93b726e669",
+  "commit": "51d744b60c12f12c57beb132bc5731f6c55ff306",
   "mutants": [
     {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m002_watermark_floor_off_by_one","disposition":"KILLED","result":"KILLED@compaction","note":"oracle: superseded record row survived at/below the first-init watermark: seq=1 watermark=2 (m002 boundary miss is permanent: later fold win"},
@@ -63,6 +63,11 @@
     {"id":"m069_sync_state_promoted_after_append","disposition":"KILLED","result":"KILLED@disagg","note":"whole event archived twice after a leader crash; TestConsumer_Hot_ChainStateCommitsWithLastRow"},
     {"id":"m070_direct_block_seq_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"unit only: TestScripts_DirectSeqMismatch (correct leaders never reach the direct-mode seq check)"},
     {"id":"m071_merge_leaves_bootstrap_live_seq","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: catalog invariant 2, a seq key for bootstrap_live with no segments, after the final merge transaction"},
-    {"id":"m072_sync_state_newest_pending_only","disposition":"KILLED","result":"KILLED@disagg","note":"unit: TestStateStore_PipelinedSavesPromoteEach (the lifecycle oracle hits it in about 4% of runs)"}
+    {"id":"m072_sync_state_newest_pending_only","disposition":"KILLED","result":"KILLED@disagg","note":"unit: TestStateStore_PipelinedSavesPromoteEach (the lifecycle oracle hits it in about 4% of runs)"},
+    {"id":"m073_gc_claim_recheck_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"unit only: TestScripts_GCClaimReferenced"},
+    {"id":"m074_sparse_vanished_did_miscount","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader, segment verify: header unique_did_count mismatch (seeds 1, 5); unit: TestSparseRewriteMatchesRewrite"},
+    {"id":"m075_sparse_collection_count_stale","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader, segment verify: collection count mismatch (all 8 seeds); unit: TestSparseRewriteMatchesRewrite"},
+    {"id":"m076_compaction_skips_refresh_after_publish","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: leader exits on corruption, main segment not sealed at the source generation (seeds 2, 7, 8)"},
+    {"id":"m077_gc_ignores_delay","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader read late, object no longer available (all 8 seeds); unit: TestGC"}
   ]
 }

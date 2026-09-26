@@ -5,13 +5,14 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 63 active mutants on disk
-(m001–m072; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
-union baseline after disaggregated-storage lifecycle coverage (Stage 3 S3.5,
+**Current catalog (keep this line current): 68 active mutants on disk
+(m001–m077; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
+union baseline after disaggregated-storage compaction and GC coverage (Stage 4
+S4.5, m073–m077), disaggregated-storage lifecycle coverage (Stage 3 S3.5,
 m070–m072), disaggregated-storage coverage (Stage 2 S2.19, m062–m069),
 issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **63 killed, 0 survived,
+coverage: **68 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
@@ -29,6 +30,9 @@ cursor, follower serving, seal order, the commit scripts' seq and reference
 checks, and verifier state durability (the `disagg` tier).
 m070–m072 cover the disaggregated lifecycle: the direct-mode block seq check,
 merge's final transaction, and the per-DID pending sync-state queue.
+m073–m077 cover disaggregated compaction and GC: GC's claim re-check, the
+sparse rewrite's vanished-DID count and collection counts, the compaction
+refresh after a publish, and GC_DELAY.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -79,6 +83,54 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Campaign 2026-09-26 — S4.5 compaction and GC; m073–m077, m024/m028/m045 refresh
+
+A full-catalog campaign in the disposable clean worktree at `51d744b`, after
+the layer 3 oracle grew compaction, GC and a held reader that follows every
+sealed segment's generations (plan S4.4 and S4.5). Each `expected-tier` was
+written before the first run. 65 mutants were killed; m024, m028 and m045
+were STALE. S4.2 split the compaction rewrite into a local and a
+disaggregated rewriter behind `applyCompactionChunk`, and moved the local
+watermark save behind `advanceCompactionWatermark`, so `64c8d90` refreshed
+all three patches to the same bugs in the local rewriter. Single runs at
+`64c8d90` killed all three at their original tiers.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m073_gc_claim_recheck_skipped | KILLED@disagg | unit only: `TestScripts_GCClaimReferenced` |
+| m074_sparse_vanished_did_miscount | KILLED@disagg | oracle: held reader, `segment verify: header unique_did_count mismatch` (seeds 1 and 5 of 8); unit: `TestSparseRewriteMatchesRewrite` |
+| m075_sparse_collection_count_stale | KILLED@disagg | oracle: held reader, collection count mismatch (all 8 seeds); unit: `TestSparseRewriteMatchesRewrite` |
+| m076_compaction_skips_refresh_after_publish | KILLED@disagg | oracle: the leader exits on corruption, main segment not sealed at the source generation (seeds 2, 7 and 8) |
+| m077_gc_ignores_delay | KILLED@disagg | oracle: held reader's late read, object no longer available (all 8 seeds); unit: `TestGC` |
+| m024_compaction_over_drop_survivors (refreshed) | KILLED@default | unchanged from its last banked result |
+| m028_compaction_watermark_save_error_swallowed (refreshed) | KILLED@storefault | unchanged from its last banked result |
+| m045_compaction_rewrite_error_swallowed (refreshed) | KILLED@segmentfault | unchanged from its last banked result |
+
+Notes:
+
+- **m073 is unit-only by design**, like m067 and m070. Every reference
+  clears `unreferenced_at` (§7.4), so the re-check never fires in a correct
+  run and no oracle path reaches it.
+- **m076 models the bug the source check guards, not the check.** Removing
+  `PublishGeneration`'s source-generation check alone is an equivalent
+  mutant: a source that a later generation replaced has already been
+  deleted from the catalog, so the missing-generation check fires first.
+  The mutant instead drops the leader's refresh after a publishing chunk,
+  so the next chunk of the same pass rewrites a replaced generation. It
+  only fires when one pass spans more than one chunk (cap 4) and rewrites a
+  segment in two of them, hence three of eight seeds.
+- **The held reader is new** in the layer 3 oracle. It runs
+  `segment.VerifySealedMetadata` on each generation while it is current,
+  which is what kills m074 and m075 end to end: both leave every row
+  correct, so a row comparison alone cannot see them. m074 needs a DID whose rows span a
+  fetched and an unfetched block, which two of eight seeds produce.
+- The auto-extracted notes for m073–m077 quoted fault-injection log lines
+  and were rewritten by hand in `baseline.json`. Unchanged mutants keep
+  their previously banked notes.
+- The baseline now records 68 mutants: 68 killed, 0 survived, 0 STALE or
+  build-broken. The gate passes against the campaign result with the three
+  refreshed single runs merged in.
 
 ## Campaign 2026-09-26 — S3.5 lifecycle; m070–m072, m003/m006 refresh
 
