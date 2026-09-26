@@ -1,0 +1,25 @@
+mutant: m071_merge_leaves_bootstrap_live_seq
+target: internal/ingest/orchestrator/disagg.go
+failure-mode: |
+  Merge's final transaction deletes the bootstrap_live namespace and writes
+  phase=steady_state but leaves live_segments/seq/next behind (design
+  §10.10). The catalog then holds a seq counter for a namespace with no
+  segments, and a later bootstrap would resume bootstrap_live's seqs from
+  the stale counter instead of 1.
+expected-detection: |
+  The layer 3 oracle's after-merge wait (mergePending) requires the key to
+  be gone, so the run fails when merge never looks finished.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/ingest/orchestrator/disagg.go b/internal/ingest/orchestrator/disagg.go
+--- a/internal/ingest/orchestrator/disagg.go
++++ b/internal/ingest/orchestrator/disagg.go
+@@ -195,7 +195,6 @@ func (o *Orchestrator) writeInitialPhaseDisaggregated(ctx context.Context, enter
+ // finished one.
+ func (o *Orchestrator) finishMergeDisaggregated(ctx context.Context) error {
+ 	b := metastore.NewOpBatch(nil)
+-	b.Delete([]byte(catalog.BootstrapLiveSeqKey))
+ 	b.Delete([]byte(mergeNextSourceIdxKey))
+ 	if err := lifecycle.StagePhase(b, lifecycle.PhaseSteadyState, time.Now().UTC()); err != nil {
+ 		return err

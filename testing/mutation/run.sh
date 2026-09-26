@@ -387,18 +387,19 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          -run 'TestOracle_RelaySeq|TestProcessBatch_ReplayedAccountEvent'
                          -count=1 -timeout "$default_timeout") ;;
                 disagg)
-                    # Disaggregated-storage tier (Stage 2 S2.19): kills
-                    # mutants in the catalog scripts, the hot writer, the
-                    # follower, and live ingest's durable batch state
-                    # (m062-m069). Layers in one `go test`: the layer 3
-                    # oracle (leader failover over the fault mix, eight full
-                    # seeds, fake time, one child process per seed, no
+                    # Disaggregated-storage tier (Stage 2 S2.19, extended in
+                    # S3.5): kills mutants in the catalog scripts, the hot
+                    # and direct writers, merge, the follower, and live
+                    # ingest's durable batch state (m062-m072). Layers in
+                    # one `go test`: the layer 3 oracle (eight full seeds,
+                    # each a whole lifecycle from an empty catalog with
+                    # leader kills in bootstrap, merge and steady state;
+                    # fake time, one child process per seed, no
                     # containers), the catalog script and follower contract
-                    # tests, and the live/syncstate batch-boundary
-                    # regressions. Fast (~2s).
+                    # tests, and the live/syncstate regressions.
                     cmd=(env JETSTREAM_ORACLE_DISAGG_SEEDS=1,2,3,4,5,6,7,8 go test "${RACE_FLAG[@]}"
                          ./internal/oracle ./internal/catalog ./internal/catalog/follower ./internal/ingest/live ./internal/ingest/syncstate
-                         -run '^TestDisagg_Oracle$|^TestScripts_|^TestFollower_|^TestServe_|^TestConsumer_Hot_|^TestStateStore_StageSnapshot'
+                         -run '^TestDisagg_Oracle$|^TestScripts_|^TestFollower_|^TestServe_|^TestConsumer_Hot_|^TestStateStore_'
                          -count=1 -timeout "$default_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2

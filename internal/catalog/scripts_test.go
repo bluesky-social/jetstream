@@ -447,6 +447,31 @@ func TestScripts_SeqMismatch(t *testing.T) {
 	})
 }
 
+// A direct commit locks and checks its namespace's seq key as a hot batch
+// does (§10.6).
+func TestScripts_DirectSeqMismatch(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		for name, first := range map[string]uint64{"gap": 7, "overlap": 3} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				h := newHarness(t, be)
+				ctx := t.Context()
+				_, err := h.s.InitNamespace(ctx, catalog.BootstrapLive, nil)
+				require.NoError(t, err)
+				frame, info := block(t, 1, 4)
+				_, err = h.s.CommitBlock(ctx, catalog.Block{Namespace: catalog.BootstrapLive, Info: info, Object: h.object(frame)})
+				require.NoError(t, err)
+				frame, info = block(t, first, first+1)
+				_, err = h.s.CommitBlock(ctx, catalog.Block{Namespace: catalog.BootstrapLive, Info: info, Object: h.object(frame)})
+				requireCorruption(t, err, catalog.SourceSeq)
+				v, _ := h.meta(catalog.BootstrapLiveSeqKey)
+				require.Equal(t, catalog.EncodeSeq(5), v)
+			})
+		}
+	})
+}
+
 func TestScripts_SeqKeyCorrupt(t *testing.T) {
 	t.Parallel()
 	eachBackend(t, func(t *testing.T, be backend) {

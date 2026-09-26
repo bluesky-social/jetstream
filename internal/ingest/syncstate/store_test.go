@@ -172,6 +172,7 @@ func TestStateStore_PipelinedHostingPromotesEach(t *testing.T) {
 	require.NoError(t, flush(t, s))
 	durable, err := New(raw).LoadHosting(t.Context(), did)
 	require.NoError(t, err)
+	require.NotNil(t, durable, "promoting seq 10 must make its state durable")
 	require.Equal(t, older, *durable)
 	live, err := s.LoadHosting(t.Context(), did)
 	require.NoError(t, err)

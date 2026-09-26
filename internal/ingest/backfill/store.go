@@ -36,8 +36,8 @@ type Store struct {
 	afterComplete      func(context.Context, atmos.DID) error
 	afterCompleteError func(error)
 	crashInjector      crashpoint.Injector
-	countsMu           sync.Mutex
-	rosterMu           sync.Mutex
+	countsMu           chanMutex
+	rosterMu           chanMutex
 	completions        *completionBatcher
 	runMu              sync.Mutex
 	discoveredThisRun  map[atmos.DID]struct{}
@@ -61,7 +61,27 @@ func (s *Store) AtmosStore() atmosbackfill.Store { return atmosStoreAdapter{s} }
 // metrics may be nil; callbacks are no-ops in that case. Call SeedCounts
 // before the first write.
 func NewStore(db metastore.Store, metrics *Metrics) *Store {
-	return &Store{db: db, metrics: metrics}
+	return &Store{db: db, metrics: metrics, countsMu: newChanMutex(), rosterMu: newChanMutex()}
+}
+
+// chanMutex is a mutex built on a channel. countsMu and rosterMu are held
+// across metadata commits, and in disaggregated mode a commit is a catalog
+// transaction. testing/synctest counts a goroutine waiting on a channel as
+// durably blocked but not one waiting on a sync.Mutex, so the layer 3
+// oracle's seeded scheduler, which admits the next catalog call only once
+// every goroutine is durably blocked, would wedge on a sync.Mutex here.
+type chanMutex chan struct{}
+
+func newChanMutex() chanMutex { return make(chanMutex, 1) }
+
+func (m chanMutex) Lock() { m <- struct{}{} }
+
+func (m chanMutex) Unlock() {
+	select {
+	case <-m:
+	default:
+		panic("backfill: unlock of unlocked chanMutex")
+	}
 }
 
 // errCountsNotSeeded means a counts-maintaining write ran before SeedCounts.

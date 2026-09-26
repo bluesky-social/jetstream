@@ -36,7 +36,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/objstore/memblob"
-	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
@@ -44,19 +43,25 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// The layer 3 oracle (plan S2.18, design "Layer 3: deterministic
+// The layer 3 oracle (plans S2.18 and S3.5, design "Layer 3: deterministic
 // disaggregated oracle"). Real jetstreamd pods share one storagefake catalog
 // and one memblob store inside a synctest bubble. Reader pods never take the
 // lease and serve v1 and v2 subscribers; leader-capable pods contend for it
 // and are killed at seeded faults. Every storage and object store call is a
 // yield point of the seeded scheduler (D4).
 //
-// What it proves: across leader kills at every hot-path seam, lease loss, a
-// fenced stale leader, S3 PUT failures and wrong bytes, lost NOTIFYs, and a
-// slow follower, every reader delivers the model's events on both wire
-// protocols with dense seqs and each DID's order kept, readers agree with
-// each other exactly, every live pod serves the same archive to the real client, and the
-// catalog invariants hold after every commit.
+// The pods start from a catalog `storage init` just created and run the
+// whole lifecycle (disagg_lifecycle_test.go): bootstrap and merge, with the
+// leader killed in each, then steady-state waves of faults.
+//
+// What it proves: across leader kills at every direct-mode and hot-path
+// seam and every merge crashpoint, lease loss, a fenced stale leader, S3 PUT
+// failures and wrong bytes, lost NOTIFYs, and a slow follower, the catalog
+// at cutover and after merge reconstructs the world; every reader delivers
+// the model's events on both wire protocols with dense seqs and each DID's
+// order kept, readers agree with each other exactly, every live pod serves
+// the same archive to the real client, and the catalog invariants hold
+// after every commit.
 //
 // What it does not prove: PostgreSQL and S3 semantics. storagefake models
 // them (the design lists its deliberate differences); layer 4
@@ -209,11 +214,14 @@ func runDisaggChild(t *testing.T, seed, mode string) disaggResult {
 // disaggResult is what a child reports. The fields up to Fired are a pure
 // function of the seed; the rest depend on the interleaving.
 type disaggResult struct {
-	Seed     uint64   `json:"seed"`
-	Mode     string   `json:"mode"`
-	Readers  int      `json:"readers"`
-	Leaders  int      `json:"leaders"`
-	Plan     []string `json:"plan"`
+	Seed    uint64   `json:"seed"`
+	Mode    string   `json:"mode"`
+	Readers int      `json:"readers"`
+	Leaders int      `json:"leaders"`
+	Plan    []string `json:"plan"`
+	// Prelude is the frames generated before the pods start and at
+	// cutover.
+	Prelude  []int    `json:"prelude"`
 	Waves    []int    `json:"waves"`
 	Fired    []string `json:"fired"`
 	Events   int      `json:"events"`
@@ -234,7 +242,7 @@ type disaggResult struct {
 // MainNext), and when a fault fires decides how many extra events its
 // wave needed (Events). Each run still has to pass the model check.
 func (r disaggResult) deterministic() disaggResult {
-	return disaggResult{Seed: r.Seed, Mode: r.Mode, Readers: r.Readers, Leaders: r.Leaders, Plan: r.Plan, Waves: r.Waves, Fired: r.Fired}
+	return disaggResult{Seed: r.Seed, Mode: r.Mode, Readers: r.Readers, Leaders: r.Leaders, Plan: r.Plan, Prelude: r.Prelude, Waves: r.Waves, Fired: r.Fired}
 }
 
 // disaggFault is one scheduled fault kind.
@@ -255,6 +263,19 @@ const (
 	dfNotifyLost      = disaggFault("notify_lost")
 	dfSlowRead        = disaggFault("slow_read")
 	disaggCrashPrefix = "crash:"
+
+	// Bootstrap and merge faults (disagg_lifecycle_test.go).
+	dfCrashRepoComplete    = disaggFault("crash:" + crashpoint.AfterRepoComplete)
+	dfCrashDirectCut       = disaggFault("crash:" + crashpoint.AfterDirectBlockCutBeforeUpload)
+	dfCrashDirectUpload    = disaggFault("crash:" + crashpoint.AfterDirectBlockUploadBeforeCommit)
+	dfCrashDirectCommit    = disaggFault("crash:" + crashpoint.AfterDirectBlockCommitBeforeAck)
+	dfCommitLostBlock      = disaggFault("commit_lost:block")
+	dfCrashCloseBeforeSeal = disaggFault("crash:" + crashpoint.AfterBootstrapLiveCloseBeforeSeal)
+	dfCrashMergeFlush      = disaggFault("crash:" + crashpoint.AfterMergeDstFlushBeforeSourceCommit)
+	dfCrashMergeSeal       = disaggFault("crash:" + crashpoint.AfterMergeDstSealBeforeDiscovery)
+	dfCrashMergeDiscovery  = disaggFault("crash:" + crashpoint.AfterMergeDiscoveryBeforeCleanup)
+	dfCrashMergeCleanup    = disaggFault("crash:" + crashpoint.AfterMergeCleanupComplete)
+	dfCrashSteadyPhase     = disaggFault("crash:" + crashpoint.AfterSteadyPhaseBeforeSteadyRun)
 )
 
 var disaggAllFaults = []disaggFault{
@@ -264,28 +285,53 @@ var disaggAllFaults = []disaggFault{
 	dfNotifyLost, dfSlowRead,
 }
 
-// disaggPlan is the seeded schedule: pod counts, one fault per wave, and
-// each wave's event count. A final quiet wave has no fault.
+// disaggPlan is the seeded schedule: pod counts, the bootstrap faults in
+// order, the merge faults in phase order, one fault per steady-state wave,
+// and each wave's event count. A final quiet wave has no fault.
 type disaggPlan struct {
 	readers, leaders int
+	bootFaults       []disaggFault
+	mergeFaults      []disaggFault
 	faults           []disaggFault
-	waves            []int
-	quiet            int
+	// pre is the frames generated before the pods start; cutover, those
+	// generated while the leader holds the cutover barrier.
+	pre, cutover int
+	waves        []int
+	quiet        int
 }
 
 func newDisaggPlan(seed uint64, mode string) disaggPlan {
 	rng := rand.New(rand.NewPCG(seed, seed^0xd15a_6600_0000_0001))
 	p := disaggPlan{readers: 2, leaders: 2}
+	pick := func(fs ...disaggFault) disaggFault { return fs[rng.IntN(len(fs))] }
+	shuffle := func(fs []disaggFault) []disaggFault {
+		rng.Shuffle(len(fs), func(i, j int) { fs[i], fs[j] = fs[j], fs[i] })
+		return fs
+	}
 	switch mode {
 	case disaggModeShort:
-		seams := []disaggFault{dfCrashCut, dfCrashUpload, dfCrashCommit, dfCommitLost}
-		p.faults = []disaggFault{seams[rng.IntN(len(seams))], dfNotifyLost}
+		p.bootFaults = []disaggFault{pick(dfCrashRepoComplete, dfCrashDirectCut, dfCrashDirectUpload, dfCrashDirectCommit)}
+		p.mergeFaults = []disaggFault{pick(dfCrashCloseBeforeSeal, dfCrashMergeFlush, dfCrashMergeSeal,
+			dfCrashMergeDiscovery, dfCrashMergeCleanup, dfCrashSteadyPhase)}
+		p.faults = []disaggFault{pick(dfCrashCut, dfCrashUpload, dfCrashCommit, dfCommitLost), dfNotifyLost}
 	default:
 		p.readers += rng.IntN(2)
 		p.leaders += rng.IntN(2)
-		p.faults = slices.Clone(disaggAllFaults)
-		rng.Shuffle(len(p.faults), func(i, j int) { p.faults[i], p.faults[j] = p.faults[j], p.faults[i] })
+		// A kill after a repo completes goes first: the rest need
+		// traffic, and backfill's repos all complete early.
+		p.bootFaults = append([]disaggFault{dfCrashRepoComplete}, shuffle([]disaggFault{
+			dfCrashDirectCut, dfCrashDirectUpload, dfCrashDirectCommit, dfCommitLostBlock, dfCrashSeal, dfLeaseLoss,
+		})...)
+		// Every merge crashpoint, in the order merge reaches them. The
+		// last two exclude each other: the steady-phase seam fires only in
+		// the session that ran merge, and a kill after cleanup leaves a
+		// successor that does not.
+		p.mergeFaults = []disaggFault{dfCrashCloseBeforeSeal, dfCrashMergeFlush, dfCrashMergeSeal, dfCrashMergeDiscovery,
+			pick(dfCrashMergeCleanup, dfCrashSteadyPhase)}
+		p.faults = shuffle(slices.Clone(disaggAllFaults))
 	}
+	p.pre = 6 + rng.IntN(5)
+	p.cutover = 8 + rng.IntN(9)
 	for range p.faults {
 		p.waves = append(p.waves, 8+rng.IntN(9))
 	}
@@ -328,6 +374,23 @@ type disaggHarness struct {
 	fired    []string
 	// stream is the delivered stream every reader must agree on.
 	stream []disaggKey
+
+	// The lifecycle prelude (disagg_lifecycle_test.go). stage names the
+	// phase the harness is driving, for failure reports.
+	stage          string
+	gate           *disaggListGate
+	cutoverReached chan string
+	cutoverGo      chan struct{}
+	bootBarrier    chan string
+	bootResume     chan struct{}
+	resumeOnce     sync.Once
+	// survivors are the rows generated after backfill finished, which
+	// merge must keep.
+	survivors []disaggKey
+	// mergeReplay is set when a kill re-drained a merge source, which
+	// leaves main's first mergedRows rows with duplicates.
+	mergeReplay bool
+	mergedRows  int
 }
 
 func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
@@ -348,6 +411,11 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 		sched:      sched,
 		blobFaults: &disaggBlobFaults{fired: map[*memblob.KeyPrefixFault]bool{}},
 		crashed:    make(chan *disaggPod, 16),
+
+		cutoverReached: make(chan string),
+		cutoverGo:      make(chan struct{}),
+		bootBarrier:    make(chan string),
+		bootResume:     make(chan struct{}),
 	}
 	h.w = newRestartWorld(t, Config{
 		Seed:              seed,
@@ -365,21 +433,22 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 	h.blob = memblob.New(memblob.WithFaultInjector(h.blobFaults))
 	archiveID := h.db.Archive().ArchiveID
 	h.objects = objstore.FormatUUID(archiveID) + "/objects/"
-	h.seed0()
+	h.initCatalog()
 
 	simLn := newPipeListener()
-	simSrv := &http.Server{Handler: simhttp.NewHandlerWithOptions(h.w, disaggSimURL, simhttp.HandlerOptions{})}
+	h.gate = newDisaggListGate(simhttp.NewHandler(h.w, disaggSimURL))
+	simSrv := &http.Server{Handler: h.gate}
 	go func() { _ = simSrv.Serve(simLn) }()
 	t.Cleanup(func() { _ = simSrv.Close() })
 	h.simClient = simLn.httpClient()
 	t.Cleanup(h.teardown)
 
-	for range plan.readers {
-		h.startPod(true)
-	}
-	for range plan.leaders {
-		h.startPod(false)
-	}
+	t.Logf("plan: readers=%d leaders=%d bootstrap=%v merge=%v faults=%v prelude=%d+%d waves=%v",
+		plan.readers, plan.leaders, plan.bootFaults, plan.mergeFaults, plan.faults, plan.pre, plan.cutover, plan.waves)
+	h.runLifecycle()
+
+	// Observers start once merge is done; the readers themselves have run
+	// since bootstrap began.
 	obsCtx, obsCancel := context.WithCancel(h.ctx)
 	h.obsCancel = obsCancel
 	for _, p := range h.pods {
@@ -388,7 +457,7 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 		}
 	}
 	h.converge("start")
-	t.Logf("plan: readers=%d leaders=%d faults=%v waves=%v; seeded %d events", plan.readers, plan.leaders, plan.faults, plan.waves, len(h.expected))
+	t.Logf("steady state: %d merged events", len(h.expected))
 
 	for i, f := range plan.faults {
 		h.wave(i, f, plan.waves[i])
@@ -412,9 +481,15 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 	h.mu.Lock()
 	sessions := len(h.sessions)
 	h.mu.Unlock()
-	plans := make([]string, len(plan.faults))
-	for i, f := range plan.faults {
-		plans[i] = string(f)
+	var plans []string
+	for _, f := range plan.bootFaults {
+		plans = append(plans, disaggBootFaultPrefix+string(f))
+	}
+	for _, f := range plan.mergeFaults {
+		plans = append(plans, disaggMergeFaultPrefix+string(f))
+	}
+	for _, f := range plan.faults {
+		plans = append(plans, string(f))
 	}
 	return disaggResult{
 		Seed:     seed,
@@ -422,6 +497,7 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 		Readers:  plan.readers,
 		Leaders:  plan.leaders,
 		Plan:     plans,
+		Prelude:  []int{plan.pre, plan.cutover},
 		Waves:    plan.waves,
 		Fired:    h.fired,
 		Events:   len(h.expected),
@@ -431,26 +507,6 @@ func runDisaggOracle(t *testing.T, seed uint64, mode string) disaggResult {
 		Turns:    len(trace),
 		Trace:    hex.EncodeToString(sum[:8]),
 	}
-}
-
-// seed0 builds the steady-state catalog the pods start from.
-func (h *disaggHarness) seed0() {
-	t := h.t
-	lease := h.db.NewLease()
-	require.NoError(t, lease.Acquire(h.ctx, time.Hour))
-	up, err := protocol.NewUploader(protocol.UploaderConfig{Blob: h.blob, ArchiveID: h.db.Archive().ArchiveID, GCDelay: time.Hour, OrphanAge: time.Hour})
-	require.NoError(t, err)
-	seeded, err := SeedCatalog(h.ctx, SeedCatalogConfig{
-		World:             h.w,
-		LiveEvents:        seedTestLive,
-		Session:           catalog.NewSession(catalog.SessionConfig{DB: h.db, Epoch: lease.Epoch()}),
-		Uploader:          up,
-		MaxEventsPerBlock: seedTestBlock,
-		MaxSegmentBytes:   seedTestMaxSegment,
-	})
-	require.NoError(t, err)
-	require.NoError(t, lease.Release(h.ctx))
-	h.expected = append(h.expected, seeded.Events...)
 }
 
 // wave arms f, generates n events, and waits for every reader to deliver
@@ -499,6 +555,8 @@ func (h *disaggHarness) arm(f disaggFault) (fired func() bool, mid func()) {
 	switch f {
 	case dfCommitLost:
 		return catalogFault(&storagefake.Fault{Kind: storagefake.FaultCommitLost, TxKind: catalog.TxHotBatch, Ordinal: 1}), nil
+	case dfCommitLostBlock:
+		return catalogFault(&storagefake.Fault{Kind: storagefake.FaultCommitLost, TxKind: catalog.TxBlock, Ordinal: 1}), nil
 	case dfNotifyLost:
 		return catalogFault(&storagefake.Fault{Kind: storagefake.FaultNotifyLost, TxKind: catalog.TxHotBatch, Ordinal: 1}), nil
 	case dfSlowRead:
@@ -621,7 +679,11 @@ func (h *disaggHarness) converge(what string) {
 			h.failf("%s: %s v2: %d commit prefixes re-archived across %d leader changes", what, o0.pod.name, rewinds, limit)
 		}
 		done = done && covered && uint64(len(keys)) == next-1
-		wantV1 := len(disaggV1Project(keys))
+		wantV1 := -1
+		if done {
+			// Reading the catalog is slow; only a caught-up stream needs it.
+			wantV1 = len(disaggV1Project(keys, h.resyncSeqs()))
+		}
 		for _, o := range h.observers[1:] {
 			if o.progress() < map[bool]int{true: wantV1, false: len(keys)}[o.proto == "v1"] {
 				done = false
@@ -631,15 +693,36 @@ func (h *disaggHarness) converge(what string) {
 			return
 		}
 		if !heldAt.IsZero() && time.Since(heldAt) > disaggServeTimeout {
-			h.failf("%s: the catalog has held every row at seq/next %d for %s, but %s v2 has %d (covered=%v)",
-				what, next, disaggServeTimeout, o0.pod.name, len(keys), covered)
+			h.failf("%s: the catalog has held every row at seq/next %d for %s, but %s v2 has %d (covered=%v); v1 wants %d; %s",
+				what, next, disaggServeTimeout, o0.pod.name, len(keys), covered, wantV1, h.observerProgress())
 		}
 		if time.Now().After(deadline) {
-			h.failf("%s: not converged after %s: seq/next %d, %d model rows, %s v2 has %d (covered=%v)",
-				what, disaggConvergeTimeout, next, len(want), o0.pod.name, len(keys), covered)
+			h.failf("%s: not converged after %s: seq/next %d, %d model rows, %s v2 has %d (covered=%v); v1 wants %d; %s",
+				what, disaggConvergeTimeout, next, len(want), o0.pod.name, len(keys), covered, wantV1, h.observerProgress())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// resyncSeqs is the set of main's seqs that hold resync replacements,
+// which v1 does not deliver.
+func (h *disaggHarness) resyncSeqs() map[uint64]bool {
+	out := map[uint64]bool{}
+	for _, ev := range h.readCatalog()[catalog.Main] {
+		if ev.Kind.IsResyncReplacement() {
+			out[ev.Seq] = true
+		}
+	}
+	return out
+}
+
+// observerProgress lists how many events each observer has delivered.
+func (h *disaggHarness) observerProgress() string {
+	parts := make([]string, len(h.observers))
+	for i, o := range h.observers {
+		parts[i] = fmt.Sprintf("%s %s %d", o.pod.name, o.proto, o.progress())
+	}
+	return strings.Join(parts, ", ")
 }
 
 // model returns the expected rows' keys and, for each, the upstream event
@@ -712,6 +795,14 @@ func (h *disaggHarness) sessionStarted(pod string, epoch uint64) {
 	h.sessions = append(h.sessions, disaggSession{pod: pod, epoch: epoch})
 }
 
+// newestSession reports whether pod started the newest leader session. A
+// pod runs one session at a time, so that session is the one calling.
+func (h *disaggHarness) newestSession(pod string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.sessions) > 0 && h.sessions[len(h.sessions)-1].pod == pod
+}
+
 func (h *disaggHarness) maxEpoch() uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -753,7 +844,14 @@ func (h *disaggHarness) checkStreams() string {
 		}
 		if ref == nil {
 			disaggRequireModel(t, want, groups, keys, h.sessionChanges(), name)
-			require.NoErrorf(t, CheckInvariants(v2), "%s", name)
+			if h.mergeReplay {
+				// The merged prefix repeats a source's rows; checkMerged
+				// checked it as merge left it.
+				require.NoErrorf(t, CheckStructuralInvariants(v2), "%s", name)
+				require.NoErrorf(t, CheckInvariants(v2[min(h.mergedRows, len(v2)):]), "%s after merge", name)
+			} else {
+				require.NoErrorf(t, CheckInvariants(v2), "%s", name)
+			}
 			model, err := Reconstruct(v2)
 			require.NoErrorf(t, err, "%s", name)
 			require.NoErrorf(t, Compare(ground, model), "%s", name)
@@ -765,7 +863,7 @@ func (h *disaggHarness) checkStreams() string {
 		require.Equalf(t, ref, v2, "%s and %s delivered different events", refName, name)
 	}
 	require.NotNil(t, ref, "no v2 observer")
-	refV1 := disaggV1Project(refKeys)
+	refV1 := disaggV1Project(refKeys, h.resyncSeqs())
 	for _, o := range h.observers {
 		if o.proto != "v1" {
 			continue
@@ -827,6 +925,10 @@ func (h *disaggHarness) checkArchives() {
 // teardown stops observers, then every pod, requiring a clean exit from
 // each pod that was not killed.
 func (h *disaggHarness) teardown() {
+	if h.gate != nil {
+		h.gate.release()
+	}
+	h.resumeBoot()
 	if h.t.Failed() {
 		for _, p := range h.pods {
 			h.t.Logf("--- %s (reader=%t crashed=%t) log tail:\n%s", p.name, p.reader, p.crashed.Load(), p.logs.tail(16<<10))
@@ -848,7 +950,7 @@ func (h *disaggHarness) teardown() {
 func (h *disaggHarness) failf(format string, args ...any) {
 	h.t.Helper()
 	var b strings.Builder
-	fmt.Fprintf(&b, "fired so far: %v\n", h.fired)
+	fmt.Fprintf(&b, "stage: %s\nfired so far: %v\n", h.stage, h.fired)
 	if snap, err := h.db.Snapshot(); err == nil {
 		fmt.Fprintf(&b, "catalog: epoch %d holder %x lease until %s; %d segments, %d active blocks, %d hot batches, %d objects\n",
 			snap.Archive.WriterEpoch, snap.Archive.HolderID, snap.Archive.LeaseExpiresAt.Format(time.RFC3339Nano),
@@ -947,6 +1049,19 @@ func (h *disaggHarness) startPod(reader bool) *disaggPod {
 		opts.Storage.Leader.AcquireInterval = time.Hour
 	} else {
 		opts.CrashInjector = disaggCrashInjector{h: h, pod: p}
+		opts.BackfillRetryBaseDelay = time.Millisecond
+		// atmos holds a per-DID-shard sync.Mutex across the Store's
+		// discovery write, a fenced commit that parks in the scheduler.
+		// A second host's reconcile waiting on that shard is not durably
+		// blocked, so synctest.Wait would never return. One active host
+		// runs one reconcile at a time.
+		opts.BackfillMaxActiveHosts = 1
+		// A block per bootstrap-live event gives the direct-mode seams
+		// traffic while backfill waits on its held repo.
+		opts.BootstrapLiveMaxEventsPerBlock = 1
+		opts.BootstrapLiveMaxSegmentBytes = seedTestMaxSegment
+		opts.BarrierBeforeCutover = disaggBarrier(h.cutoverReached, h.cutoverGo, p.name)
+		opts.BarrierAfterBootstrap = disaggBarrier(h.bootBarrier, h.bootResume, p.name)
 	}
 	ctx, cancel := context.WithCancel(h.ctx)
 	p.cancel = cancel
@@ -1026,7 +1141,9 @@ func (disaggReaderLocker) Release(context.Context) error                { return
 func (disaggReaderLocker) Epoch() uint64                                { return 0 }
 
 // disaggCrashArm is the one crash seam armed at a time; the first leader to
-// reach it dies there.
+// reach it dies there. Only the newest session may take it: after lease
+// loss the old session runs on until it notices, and a kill there would
+// end no session the harness is waiting on.
 type disaggCrashArm struct {
 	point crashpoint.Point
 	fired atomic.Bool
@@ -1042,7 +1159,7 @@ type disaggCrashInjector struct {
 // harness then tears the process down and starts a replacement.
 func (c disaggCrashInjector) SimulateCrash(_ context.Context, p crashpoint.Point) error {
 	arm := c.h.crash.Load()
-	if arm == nil || arm.point != p || !c.h.crash.CompareAndSwap(arm, nil) {
+	if arm == nil || arm.point != p || !c.h.newestSession(c.pod.name) || !c.h.crash.CompareAndSwap(arm, nil) {
 		return nil
 	}
 	c.pod.client.Kill()
@@ -1281,11 +1398,12 @@ func disaggByDID(events []ObservedEvent) map[string][]ObservedEvent {
 }
 
 // disaggV1Project is what a v1 subscriber sees of a stream: no sync rows,
-// and a rev only on commits.
-func disaggV1Project(keys []disaggKey) []disaggKey {
+// no resync replacements, and a rev only on commits. The v2 client
+// delivers a resync replacement as a create, so resync names their seqs.
+func disaggV1Project(keys []disaggKey, resync map[uint64]bool) []disaggKey {
 	var out []disaggKey
 	for _, k := range keys {
-		if k.Kind == segment.KindSync {
+		if k.Kind == segment.KindSync || resync[k.Seq] {
 			continue
 		}
 		switch k.Kind {

@@ -1,0 +1,30 @@
+mutant: m070_direct_block_seq_check_skipped
+target: internal/catalog/scripts.go
+failure-mode: |
+  CommitBlock, the direct-mode block transaction, no longer locks and
+  checks its namespace's seq key against the block's first seq (design
+  §10.6). A leader whose in-memory seq diverged from the catalog would
+  commit a block that overlaps or skips the committed range, and the script
+  overwrites the seq key anyway.
+expected-detection: |
+  Correct leaders never diverge: every direct-mode session reloads its seq
+  from the catalog, including after a block commit that applied but
+  reported failure. So the layer 3 oracle's direct-mode kills have no path
+  that reaches this check. TestScripts_DirectSeqMismatch commits a block at
+  the wrong first seq and requires SourceSeq corruption.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -405,9 +405,6 @@ func (s *Session) CommitBlock(ctx context.Context, b Block) (BlockCommit, error)
+ 	}
+ 	var out BlockCommit
+ 	rev, err := s.run(ctx, TxBlock, func(tx Tx, rev uint64) error {
+-		if err := checkSeq(ctx, tx, b.Namespace, b.Info.MinSeq); err != nil {
+-			return err
+-		}
+ 		if err := insertActiveBlock(ctx, tx, rev, b, &out); err != nil {
+ 			return err
+ 		}
