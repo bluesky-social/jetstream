@@ -789,6 +789,14 @@ the batch commits. The consumer promotes an event's state in the writer's
 found both halves. With them fixed, the committed prefix is the only
 duplicate it sees (`specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md`).
 
+The verifier runs ahead of the appends, so a DID can have several verified
+events whose rows are not yet appended (S3.5). `syncstate.StateStore` keeps
+an ordered queue of pending states per DID, and promotion takes the newest one
+at or below the appended event's rev (for hosting, its account seq). A single
+pending slot let a later event's save hide an earlier event's state, so the
+earlier event's rows committed with the DID's state behind
+(`specs/oracle/2026-09-26-disagg-pipelined-chain-state-hidden.md`).
+
 **Metadata batch size.** At 3,000 events/s, a batch carries up to about 256
 `repo/<did>` upserts. They are applied as one multi-row upsert (§12.3), not one
 statement per key.
@@ -1883,11 +1891,17 @@ object store. The fakes:
   agree exactly. The only duplicate allowed is §10.4's re-archived commit
   prefix, at most one per leader change.
 
-The oracle's crash seams are five crashpoints in `internal/crashpoint`: after
+The oracle starts from the catalog `storage init` creates and runs bootstrap,
+merge and steady state (S3.5). It checks the catalog at cutover and after
+merge against the uncompacted model, as the local lifecycle harness does.
+Steady-state crash seams are five crashpoints in `internal/crashpoint`: after
 a hot batch is cut, after its upload, after its commit, after a fold's
-upload, and after a seal's footer upload. A pod's `CrashInjector` kills its
-`storagefake.Client` and blob handle at the seam, like SIGKILL, and a fresh
-pod replaces it. `storagefake.DB.ExpireLease` models lease loss without
+upload, and after a seal's footer upload. Bootstrap adds a kill after a repo
+completes, the three direct-mode block seams (§10.6), a block commit applied
+but reported failed, a seal's footer upload, and lease loss. Merging adds a
+kill before `bootstrap_live`'s final seal and at every merge crashpoint. A
+pod's `CrashInjector` kills its `storagefake.Client` and blob handle at the
+seam, like SIGKILL, and a fresh pod replaces it. `storagefake.DB.ExpireLease` models lease loss without
 touching the holder's process. `Options.SteadyMaxSegmentBytes` shrinks
 segments so seals happen within a short run. What the tier does not prove,
 and why, is in `specs/oracle.md` ("Disaggregated Storage Tier").

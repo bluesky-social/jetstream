@@ -5,12 +5,13 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 60 active mutants on disk
-(m001–m069; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
-union baseline after disaggregated-storage coverage (Stage 2 S2.19, m062–m069),
+**Current catalog (keep this line current): 63 active mutants on disk
+(m001–m072; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
+union baseline after disaggregated-storage lifecycle coverage (Stage 3 S3.5,
+m070–m072), disaggregated-storage coverage (Stage 2 S2.19, m062–m069),
 issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **60 killed, 0 survived,
+coverage: **63 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
@@ -26,6 +27,8 @@ drain semantics.
 m062–m069 cover disaggregated storage: fencing, fold, the hot-batch relay
 cursor, follower serving, seal order, the commit scripts' seq and reference
 checks, and verifier state durability (the `disagg` tier).
+m070–m072 cover the disaggregated lifecycle: the direct-mode block seq check,
+merge's final transaction, and the per-DID pending sync-state queue.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -76,6 +79,41 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Campaign 2026-09-26 — S3.5 lifecycle; m070–m072, m003/m006 refresh
+
+A full-catalog campaign in the disposable clean worktree at `f39304d`, after
+the layer 3 oracle grew to cover bootstrap, merge and steady state (plan
+S3.5). The `disagg` tier now runs the lifecycle harness. Each `expected-tier`
+was written before the first run. 61 mutants were killed; m003 and m006 were
+STALE. S3.3 renamed the merge runner's source field and moved the source
+commit call, so `9635bde` refreshed both patches to the same bugs, and single
+runs at `9635bde` killed both at their original tiers.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m070_direct_block_seq_check_skipped | KILLED@disagg | unit only: `TestScripts_DirectSeqMismatch` |
+| m071_merge_leaves_bootstrap_live_seq | KILLED@disagg | oracle: catalog invariant 2 (a seq key for `bootstrap_live`, which has no segments) at the revision of merge's final transaction |
+| m072_sync_state_newest_pending_only | KILLED@disagg | unit: `TestStateStore_PipelinedSavesPromoteEach` |
+| m003_merge_cursor_no_advance (refreshed) | KILLED@restart-multisource | unchanged from its last banked result |
+| m006_merge_commit_error_swallowed (refreshed) | KILLED@storefault | unchanged from its last banked result |
+
+Notes:
+
+- **m070 is unit-only by design**, like m067. Every direct-mode session
+  reloads its seq from the catalog, including after a commit that applied but
+  reported failure, so no oracle path reaches a block at the wrong seq.
+- **m071 prediction miss (in the kill path, not the tier).** Its first header
+  predicted the after-merge wait (`mergePending`) would catch the leftover
+  key. The per-revision invariant check fires first; `f39304d`
+  rewrote the header to say so. The auto-extracted note quoted a fault
+  injection log line and was rewritten by hand in `baseline.json`.
+- **m072 models the production bug the lifecycle oracle found**
+  (`specs/oracle/2026-09-26-disagg-pipelined-chain-state-hidden.md`). The
+  oracle hit it in about 4% of runs, too rare for eight seeds, so the unit
+  test is the executioner.
+- The baseline now records 63 mutants: 63 killed, 0 survived, 0 STALE or
+  build-broken.
 
 ## Campaign 2026-09-25 — `disagg` tier; m062–m069 (Stage 2 S2.19)
 

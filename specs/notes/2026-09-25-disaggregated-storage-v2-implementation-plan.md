@@ -1083,7 +1083,7 @@ Design §10.6, §10.10, §15.1, and §26 stage 3.
     `<prefix>/<archive_id>/probe/<uuid>`.
   - Flags share the `serve` storage flags. Test against `just up`, plus a
     storagefake unit test.
-- [ ] **S3.5 Layer 3: full lifecycle with kills in every phase** (L). Deps:
+- [x] **S3.5 Layer 3: full lifecycle with kills in every phase** (L). Deps:
   S3.2, S3.3.
   - Extend the S2.18 harness to start from an empty initialized catalog. Kill
     the leader in bootstrap, merging (at every merge crashpoint), and steady
@@ -1248,6 +1248,49 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S3.5 (2026-09-26): Layer 3 covers the whole lifecycle.**
+  - The full-mode disaggregated oracle (`internal/oracle/disagg_lifecycle_test.go`)
+    starts every seed from a catalog `storage init` just created, and runs
+    bootstrap, merge and steady state with leader kills in each phase:
+    - bootstrap: after a repo completes, then in seeded order the three
+      direct-mode block seams, a block commit applied but reported failed, a
+      seal footer upload, and lease expiry;
+    - merging: between closing `bootstrap_live` and sealing it, then at every
+      merge crashpoint in order;
+    - steady state: the S2.18 hot-writer fault mix.
+  - Checks: at cutover `main` plus `bootstrap_live` reconstruct the world,
+    less repos a kill deferred to merge's pending pass. After merge `main`
+    alone does, with dense seqs, a matching `seq/next`, `bootstrap_live` and
+    its keys gone, and every post-backfill row kept. Steady state checks as in
+    S2.18, with merge's `main` as the model's prefix. All against the
+    uncompacted model (D5).
+  - Harness mechanics, each in `specs/gotchas.md`:
+    - A host gate (`disaggListGate`) lets backfill list only its first PDS
+      until the bootstrap faults fire, so bootstrap cannot finish under them.
+    - The backfill `Store`'s `countsMu` and `rosterMu` span catalog commits,
+      so they are channel mutexes (`chanMutex`), which synctest counts as
+      durably blocked. atmos holds a per-DID-shard `sync.Mutex` across the
+      discovery write, so the oracle runs with `BackfillMaxActiveHosts = 1`.
+    - Only the pod that started the newest session takes crash seams
+      (`newestSession`). A deposed leader can still reach one.
+    - v1 observers are compared against the v1 projection of the stream.
+  - Merge re-drain is at-least-once. A kill between a source's flush and its
+    cursor commit re-drains that source at new seqs, so the rev-order check
+    is skipped over the merged prefix in that case. This is the local-mode
+    contract; the design already allows it.
+  - Production bug found and fixed (`2451872`): syncstate kept one pending
+    state per DID, so the verifier's save for a later event hid an earlier
+    event's state, and that event's rows committed with the DID's state
+    behind. Each DID now has an ordered pending queue
+    (`specs/oracle/2026-09-26-disagg-pipelined-chain-state-hidden.md`,
+    design §10.4). Local mode had the bug too.
+  - Mutants: m070 (direct block commit skips the seq check; unit-only, as
+    m067), m071 (merge leaves `live_segments/seq/next`; killed by catalog
+    invariant 2), m072 (promotion considers only the newest pending state;
+    killed by `TestStateStore_PipelinedSavesPromoteEach`). S3.3 moved m003's
+    and m006's targets; both were refreshed to the same bugs and are killed
+    at their old tiers. `testing/mutation/RESULTS.md` has the campaign and
+    `baseline.json` records 63 killed.
 - **S3.4 (2026-09-26): `jetstream storage init`.**
   - `jetstreamd.InitStorage` opens PostgreSQL and S3 with the `serve`
     connection code, then runs `StorageBackend.Init`. The CLI command

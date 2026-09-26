@@ -1,5 +1,5 @@
 {
-  "commit": "87b0384cde7b9cff80f636a661a3bec3754e449f",
+  "commit": "f39304d16be5e0ef299973ee7844ac93b726e669",
   "mutants": [
     {"id":"m001_delete_mapped_to_update","disposition":"KILLED","result":"KILLED@default","note":"see log"},
     {"id":"m002_watermark_floor_off_by_one","disposition":"KILLED","result":"KILLED@compaction","note":"oracle: superseded record row survived at/below the first-init watermark: seq=1 watermark=2 (m002 boundary miss is permanent: later fold win"},
@@ -60,6 +60,9 @@
     {"id":"m066_seal_reverses_block_order","disposition":"KILLED","result":"KILLED@disagg","note":"follower corruption at first catalog load: generation_blocks out of seq order"},
     {"id":"m067_hot_batch_seq_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"TestScripts_SeqMismatch/SeqKeyCorrupt (unit tier by design)"},
     {"id":"m068_reference_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"TestScripts_MissingReference (unit tier by design)"},
-    {"id":"m069_sync_state_promoted_after_append","disposition":"KILLED","result":"KILLED@disagg","note":"whole event archived twice after a leader crash; TestConsumer_Hot_ChainStateCommitsWithLastRow"}
+    {"id":"m069_sync_state_promoted_after_append","disposition":"KILLED","result":"KILLED@disagg","note":"whole event archived twice after a leader crash; TestConsumer_Hot_ChainStateCommitsWithLastRow"},
+    {"id":"m070_direct_block_seq_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"unit only: TestScripts_DirectSeqMismatch (correct leaders never reach the direct-mode seq check)"},
+    {"id":"m071_merge_leaves_bootstrap_live_seq","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: catalog invariant 2, a seq key for bootstrap_live with no segments, after the final merge transaction"},
+    {"id":"m072_sync_state_newest_pending_only","disposition":"KILLED","result":"KILLED@disagg","note":"unit: TestStateStore_PipelinedSavesPromoteEach (the lifecycle oracle hits it in about 4% of runs)"}
   ]
 }
