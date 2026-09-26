@@ -855,9 +855,12 @@ loop is bulk; it also carries sync 1.1 resync replacements. Backfill runs in
 direct mode, so it has no class.
 
 Commits stay strictly in seq order, so a live inline batch that follows a pointer
-batch waits for the pointer's upload and read-back. During bulk recovery, live
-latency may rise by about one S3 PUT plus one GET. This is accepted. It must be
-measured (§22).
+batch waits for the pointer's upload and read-back. It also waits for every
+bulk batch frozen ahead of it to commit. On a PostgreSQL whose commits cost a
+real WAL flush, that wait was about a second while the 64MiB bulk permit pool
+alone set queue depth (§22.2). S2.23 therefore bounds the bulk batches frozen
+but not yet committed, and commits consecutive ready batches in one
+transaction. Measured results are in §22.2.
 
 ### 10.6 Direct mode
 
@@ -1632,8 +1635,14 @@ Rules:
   and after the first load, with `Manifest.ResidentBytes()`. That value is an
   estimate from entry counts and slice lengths, not a heap measurement.
 - The compressed object cache is an LRU keyed by object SHA-256. It holds raw
-  object bytes (block frames and pointer-batch frames), not footers. Footers live
-  in the manifest.
+  object bytes: block frames, pointer-batch frames, and footers. The manifest
+  keeps the decoded footer, but the raw footer object also enters the cache,
+  because followers load it through the cache and `SealedMetadata` rereads it
+  there. The LRU bounds both. At pop1 start footers fill most of the default
+  budget until block reads evict them (§22.2).
+- `Manifest.ResidentBytes()` misses the follower's object index and block lists.
+  For backfill-shaped footers that is about 2.8GiB at pop1 (§22.2). S5.2 closes
+  the gap.
 - Export each budget's current use as a gauge (§19).
 
 ## 18. Configuration
@@ -1938,6 +1947,141 @@ What this means for the design:
   block age cut (§10.3). Stage 1 leaves local mode as it is.
 - A single instant sample of this gauge means nothing. Read it with
   `max_over_time` or `avg_over_time`.
+
+### 22.2 Stage 2 results
+
+Measured 2026-09-25 with `cmd/storagebench` (`just storagebench write`,
+`footers`, `calibrate`) on one workstation (32 threads, NVMe under LUKS)
+against the `just up` SeaweedFS and MinIO. Two PostgreSQL 18.6 servers:
+
+- **tmpfs**: the `just up` server. Its data directory is tmpfs, so a commit
+  never waits for a disk flush (about 0.05ms).
+- **disk**: a throwaway container with its data on the NVMe and default
+  durability settings. A commit is about 4ms, almost all of it the WAL flush.
+  This is the self-hosted estimate.
+
+RDS was not measured: no instance was available. Expect Multi-AZ RDS commits to
+cost as much as the disk server's or more, so read the disk rows as the
+production case.
+
+Method. `write` drives the hot writer with production defaults. Live events
+arrive one at a time at a fixed rate. Each one stages the live consumer's
+bookkeeping: a chain-state upsert and the relay cursor. Bulk workers append
+whole repos beside them. Two followers read the result: the leader pod's
+(doorbell and NOTIFY) and another pod's (its own pool, NOTIFY only). End-to-end
+latency runs from an event's witness time to its delivery from a follower's
+readable log. Both pods measured within 0.1ms of each other in every phase, so
+the tables give one figure. Synthetic events match production's size
+(`calibrate`: 82.5 raw bytes per live event against about 94 in production).
+WAL is the server's LSN delta over the phase.
+
+**Bug found and fixed first (`425fac0`).** Every durable batch's syncstate
+snapshot cloned all verifier state promoted but not yet committed. Hot batches
+are pipelined, so each batch restaged every entry of the batches still in
+flight. A commit backlog made the next batch bigger, which made commits slower.
+With 1M bulk events beside 3,000 live events/s, commits fell from 215k to about
+200 events/s, live latency passed 3s, and a batch carried 743 metadata ops on
+average. A snapshot now takes only what was promoted since the previous one. A
+batch that fails to commit hands its still-current entries to the next batch.
+Afterwards the same run staged 3.8 ops per batch. It made 1M bulk events
+durable in 2.65s on tmpfs.
+
+Steady state (live only):
+
+| Rate | PG | Hot batch txn p50/p99 | Commit p50/p99 | End-to-end p50/p99 | WAL per day |
+|---|---|---|---|---|---|
+| 10/s | tmpfs | 0.7/1.6ms | <0.1ms | 17/23ms | — |
+| 10/s | disk | 5.0/6.6ms | 4.4/5.8ms | 21.1/24.5ms | 1.0GiB |
+| 330/s (pop1) | disk | 4.4/6.1ms | 4.0/5.5ms | 14.3/21.7ms | 15.3GiB |
+| 3,000/s | tmpfs | 1.0–1.3/1.6–2.3ms | about 0.05ms | 9.9/17.8ms | 107GiB |
+| 3,000/s | disk | 4.8/8.2ms | 4.0/6.6ms | 13.8/21.9ms | 123GiB |
+
+- Steady state meets the 20–40ms target on both servers. The live batch age
+  (15ms) dominates latency.
+- At 3,000/s the writer commits about 64 hot batches/s (age cuts) and stages
+  1.02 metadata ops per live event. Every live batch was inline: the 4MiB/s
+  token bucket never ran short, so no forced cut produced a pointer batch.
+- WAL is about 510 bytes per live event: the inline frame, the hot batch
+  row, the chain-state upsert, and their index entries. Budget about 125GiB
+  per day at 3,000 events/s and 15GiB per day at pop1's rate. Bulk batches are
+  pointers, so bulk recovery adds little WAL: 117–148GiB per day at 3,000 live
+  plus 10k–100k bulk events/s.
+
+Bulk recovery, with 3,000 live events/s:
+
+| Bulk | PG | Bulk achieved | End-to-end p50/p99 | Notes |
+|---|---|---|---|---|
+| 10k/s paced | tmpfs | 10k/s | 9.2/17.8ms | |
+| 30k/s paced | tmpfs | 30k/s | 8.4/17.8ms | |
+| 100k/s paced | tmpfs | 100k/s | 6.2/358ms | a seal hit the unfolded cap |
+| 1M, unpaced | tmpfs | 377k/s | 415/609ms | |
+| 30k/s paced | disk | 29k/s | 958/1,909ms | |
+| 4M, unpaced | disk | 36k/s | 6,742/7,102ms | |
+| 30k/s paced, 256KiB bulk permits | disk | 30k/s | 26.5/66.7ms | experiment |
+
+- **Live latency misses the target during bulk recovery on the disk server.**
+  §10.5 assumed a live batch waits behind about one S3 PUT. It actually waits
+  behind every bulk batch frozen ahead of it, and the 64MiB bulk permit pool
+  admits hundreds of them (bulk batches averaged about 520 events, 36KiB raw).
+  Each bulk batch costs two transactions: its object's registration (§7.3 step
+  3) and its hot batch commit. The fence row lock serializes both kinds with
+  every other leader transaction, and on the disk server each holds that lock
+  for about 4ms of WAL flush. The leader therefore commits at most about 200
+  transactions per second. At 30k bulk events/s, 13,500 transactions in 61s
+  spent about 54s in commit alone. tmpfs hid this because its commits are
+  almost free.
+- Shrinking the bulk pool to 256KiB, about 7 batches in flight, kept 30k bulk
+  events/s and cut live latency to 26.5/66.7ms. So queue depth is most of the
+  problem. The remaining p99 is the serialized commit path, still about 85%
+  busy. S2.23 bounds the bulk batches in flight and commits consecutive ready
+  hot batches in one transaction.
+- Unpaced bulk on tmpfs misses too (415/609ms), for the same queue-depth
+  reason.
+
+Seal. A 256MiB segment seals in 1.40s (tmpfs) to 1.61s (disk). The seal
+transaction itself is 18–28ms. The rest is reading back the active blocks,
+building the footer, and uploading it. Folds wait while the maintainer seals,
+so unfolded events grow at the append rate for that long. At 100k bulk events/s
+that is about 140k events, past the 65,536 unfolded cap (rule 9), so live
+appends blocked. That seal caused the 358ms p99 above. At 30k events/s a seal
+adds about 45k events, under the cap. The cap and the seal duration together
+bound the bulk rate that keeps live latency flat.
+
+Pod start at pop1 size (`footers`). Synthetic sealed segments of 680 blocks,
+which is what a 256MiB segment of production-sized blocks holds. Only the
+footers are uploaded. Two footer profiles: backfill blocks, with 64 distinct
+DIDs per block (repos arrive whole), and live blocks, with 3,500 distinct DIDs
+per 4,096 events.
+
+| Profile | Segments | Footers | Load to ready | `ResidentBytes()` | Heap growth, excluding cache | Object cache | Leader invariant check |
+|---|---|---|---|---|---|---|---|
+| backfill | 7,000 | 1,528MiB (0.22MiB each) | 8.1s | 1,649MiB | 4,475MiB | 1,528MiB | 4.5s |
+| live | 50 | 458MiB (9.2MiB each) | 0.42s | 460MiB | 488MiB | 458MiB | 31ms |
+
+- Load time is fine: 188MiB/s for backfill footers and 1.1GiB/s for live
+  footers, which have fewer and bigger objects. The backfill catalog has 4.76M
+  block object rows and makes a 2.4GiB database.
+- The leader's session-start `CheckInvariants` (the cheap subset, §10.9) takes
+  4.5s on the pop1-sized catalog. That adds to failover time.
+- Where the 7,000-segment heap goes (heap profile):
+  - manifest: 2.75GiB, of which blooms are 2.2GiB;
+  - the follower's object index: 1.08GiB, about 227 bytes per referenced
+    object, and every sealed block is an object;
+  - a second copy of each segment's block list, held by the follower
+    (0.24GiB);
+  - the object cache: 1.5GiB.
+- `Manifest.ResidentBytes()` is accurate for live footers (1.01 of footer
+  bytes, against 1.07 measured). For backfill footers it undercounts by about
+  2.7×, because it counts neither per-bloom overhead nor the follower's
+  object index and block lists. The §17 startup check uses it. At pop1 the
+  check under-reserves by about 2.8GiB. S5.2 must count the follower's
+  structures, or use heap growth across the first load.
+- Footers do enter the object cache: `SealedMetadata` rereads them through it
+  (§17 corrected). The LRU still bounds them. At pop1 start they fill 1.5GiB
+  of the 2GiB default until block reads evict them.
+- pop1's real mix of the two profiles is not known here. 7,000 backfill-shaped
+  segments are the floor. Each live-shaped segment adds about 9.75MiB of heap
+  plus 9.2MiB of cache churn.
 
 ## 23. Metrics
 

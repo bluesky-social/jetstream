@@ -149,6 +149,30 @@ test-storage *ARGS:
     JETSTREAM_TEST_S3_ENDPOINT=http://127.0.0.1:19000 \
         gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 {{ARGS}} "${s3[@]}"
 
+# Measure disaggregated storage against the `just up` services (design
+# §22), e.g. `just storagebench write` or `just storagebench footers`. S3 is
+# SeaweedFS; STORAGEBENCH_S3_ENDPOINT=http://127.0.0.1:19000 selects MinIO,
+# which has more room. Objects are left behind (the dev credentials cannot
+# list), so `just down && just up` between large runs.
+storagebench *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    running="$(docker compose ps --status running --services)"
+    for svc in postgres seaweedfs minio; do
+        if ! grep -qx "${svc}" <<<"${running}"; then
+            echo "storagebench: ${svc} is not running; run \`just up\` first" >&2
+            exit 1
+        fi
+    done
+    # Dev credentials from compose.yaml, never real secrets.
+    export JETSTREAM_BENCH_PG_URL="${STORAGEBENCH_PG_URL:-postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable}"
+    export JETSTREAM_S3_ENDPOINT="${STORAGEBENCH_S3_ENDPOINT:-http://127.0.0.1:18333}"
+    export JETSTREAM_S3_REGION=us-east-1
+    export JETSTREAM_S3_BUCKET=jetstream
+    export AWS_ACCESS_KEY_ID=jetstream
+    export AWS_SECRET_ACCESS_KEY=jetstream-dev-secret
+    go run ./cmd/storagebench {{ARGS}}
+
 # Run jetstream against the local simulator (default).
 # Picks up JETSTREAM_RELAY_URL and JETSTREAM_PLC_URL from .env.
 run *ARGS:

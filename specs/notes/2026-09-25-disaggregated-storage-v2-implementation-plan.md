@@ -995,7 +995,7 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
   - A hot-batch row decoder (descriptor plus frame) and a footer object parser
     fed with arbitrary bytes as they come from storage (design §20). Add both
     to the `ci-scheduled.yml` fuzz matrix and to `testing/ci/workflows_test.go`.
-- [ ] **S2.22 Stage 2 measurements** (M). Deps: S2.16, S2.20.
+- [x] **S2.22 Stage 2 measurements** (M). Deps: S2.16, S2.20.
   - Record in the design (§22):
     - PG p50/p99 commit latency at 3,000 events/s with repo upserts (RDS and
       self-hosted);
@@ -1006,6 +1006,26 @@ a seeded catalog (S2.17). Compaction is off in disaggregated mode (D5).
     - PG WAL volume per day.
   - Add a load driver (a simulator traffic mode or a `cmd/` tool) that runs
     against `just up`, so these can be repeated.
+- [ ] **S2.23 Live latency under bulk recovery** (M). Deps: S2.22.
+  - S2.22 found that live latency on a disk-backed PG was about 1s p50 and
+    1.9s p99 during paced bulk recovery (3,000 live plus 30k bulk events/s),
+    against the 20-40ms target (design §22.2). Two causes:
+    - the 64MiB bulk permit pool lets hundreds of bulk batches freeze ahead
+      of live in the serial committer;
+    - each bulk batch costs two fsync'd transactions that the fence row lock
+      serializes.
+  - Bound bulk batches frozen but not yet committed to the upload
+    concurrency, independent of the byte pool (design §10.5).
+  - Group commit: the commit loop takes every consecutive ready batch at the
+    head of the queue and commits them in one fenced `CommitHotBatch`
+    transaction. It calls the hook once per batch into the shared op batch
+    and runs the batches' post-commit steps in seq order. A failed group fails
+    every batch in it, the same as one failed batch today.
+  - Re-measure with `just storagebench` on a disk-backed PG. Target: live
+    end-to-end p99 of 40ms or less at 3,000 live plus 30k bulk events/s, with
+    bulk throughput kept. Record the result in design §22.2.
+  - Oracle: `just oracle-disagg` plus the sweep, and the mutation gate (m067
+    and m069 sit on the commit path).
 
 **Checks:** `just`, `just test-storage`, `just oracle-disagg` (plus a sweep),
 `just test-long ./internal/oracle` (local still green),
@@ -1175,6 +1195,10 @@ Design §15.4, §17, §20 layer 5, and §26 stage 5.
   - `GOMEMLIMIT` required in disaggregated mode. Sum the configurable budgets
     plus the measured manifest size, and refuse above 75% with a per-budget
     message (§17). Check before and after the footer load.
+  - Count the follower's object index (about 227 bytes per referenced object)
+    and its block lists, not only `Manifest.ResidentBytes()`. At pop1 with
+    backfill-shaped footers, `ResidentBytes` alone undercounts by about 2.8GiB
+    (design §22.2).
   - Gauges: `jetstream_memory_budget_bytes{budget}` and
     `jetstream_memory_used_bytes{budget}`.
 - [ ] **S5.3 Dashboards and alerts** (S).
@@ -1216,13 +1240,59 @@ mode.
 | Mutant refresh churn in stage 1 hides regressions | S1.x | Refresh STALE mutants in the same PR that moved their target; the reviewer checks the refreshed diff is the same bug |
 | The storagefake drifts from PostgreSQL | D1, D3 | One primitive contract suite runs against both in CI (`test-storage`) |
 | CI Docker egress breaks `test-storage` | S2.20 | Pin images by digest (already done); allowlist from the `release.yml` precedent; retry workflow if runner-loss becomes common |
-| Stage 2 performance misses the 20-40ms live latency target | S2.8, S2.9 | S2.22 measures early with the load driver; batch age and token bucket are config |
+| Stage 2 performance misses the 20-40ms live latency target | S2.8, S2.9 | S2.22 measured it: steady state meets the target; bulk recovery on a disk-backed PG misses it, and S2.23 fixes that. Batch age and token bucket are config |
 | The metadata write path is slower on PG than Pebble at bootstrap rates | S3 | S3.6 measures fenced transactions per second before stage 3 exits |
 
 ## Decisions log
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S2.22 (2026-09-25): stage 2 measurements.**
+  - Load driver: `cmd/storagebench`, run with `just storagebench` against
+    `just up`. The tool is not a simulator mode, because it measures the
+    production hot writer, maintainer, and followers directly, with
+    production defaults.
+    - `write` runs `name:rate:duration[:bulk[:bulk_rate]]` phases of live
+      and bulk traffic through a leader pod and a second pod, and reports:
+      - transaction latency per script;
+      - end-to-end latency on both pods;
+      - staged ops;
+      - hot batch counts by class and storage;
+      - fold and seal durations;
+      - WAL per day.
+    - `footers` builds a synthetic pop1-sized catalog of sealed footers and
+      times pod start, heap, and the leader's invariant check.
+    - `calibrate` checks that synthetic events match production's size.
+  - `internal/pgstore/pgfixture` gives the bench a throwaway database per run
+    (forced drop), plus the WAL position and database size. It is the only
+    new pgx importer. It lives under `internal/pgstore/`, which the depguard
+    rule allows.
+  - First run found a verifier-state bug and fixed it (`425fac0`). Every
+    batch's syncstate snapshot restaged everything promoted but not yet
+    committed, so a commit backlog grew on itself (743 ops per batch, commits
+    at 200 events/s). Snapshots are now deltas.
+  - Results (design §22.2):
+    - Steady state meets the target on tmpfs and disk PG: 13.8/21.9ms
+      end-to-end at 3,000 events/s on disk.
+    - WAL is about 125GiB/day at 3,000 events/s.
+    - A seal takes 1.4–1.6s.
+    - Pod start at 7,000 segments takes 8.1s.
+    - Every live batch was inline. Forced cuts made no live pointer batch, so
+      the Decisions entry under S2.9 needs no follow-up.
+    - The leader's cheap `CheckInvariants` takes 4.5s at pop1. That is
+      acceptable for now. It is part of failover time, so revisit it if
+      failover targets tighten.
+  - Misses:
+    - Live latency during bulk recovery on a disk-backed PG (1s p50) is
+      tracked as S2.23. Stage 2 is not done until S2.23 lands.
+    - `Manifest.ResidentBytes()` undercounts the heap by about 2.8GiB at pop1
+      with backfill footers. S5.2 gains a sub-bullet.
+  - RDS was not measured, for lack of an instance. The disk-backed PG
+    (about 4ms commits) stands in for it.
+  - Design corrections:
+    - §10.5: live waits for every frozen bulk batch, not one PUT.
+    - §17: footers do enter the object cache.
 
 - **S2.19 (2026-09-25): stage 2 mutants and the `disagg` tier.**
   - Eight mutants, m062–m069: the five the plan names, the two recommended
