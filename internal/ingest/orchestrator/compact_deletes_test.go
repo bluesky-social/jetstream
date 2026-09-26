@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -736,6 +737,57 @@ func TestRebuildLiveTombstones_BoundedByWatermark(t *testing.T) {
 	require.NotContains(t, set.Snapshot().Records,
 		tombstone.RecordKey{DID: "did:plc:a", Collection: "c", Rkey: "r"},
 		"tombstones at or below the watermark are already applied and must not rebuild")
+}
+
+// TestRebuildLiveTombstones_ConcurrentKeepsNewest: the rebuild folds blocks
+// concurrently, so a key tombstoned in many blocks must still rebuild to its
+// highest seq, whatever order the blocks finish in.
+func TestRebuildLiveTombstones_ConcurrentKeepsNewest(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	segmentsDir := filepath.Join(dataDir, "segments")
+	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
+	st, err := pebblestore.Open(dataDir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Two-event blocks: 8 segments of 12 events are 48 blocks, more than
+	// tombstoneRebuildConcurrency.
+	want := tombstone.New()
+	seq := uint64(1)
+	for idx := range uint64(8) {
+		var evs []segment.Event
+		for i := range 12 {
+			ev := segment.Event{Seq: seq, WitnessedAt: int64(seq), Rev: strconv.FormatUint(seq, 10)}
+			switch i % 3 {
+			case 0:
+				ev.Kind, ev.DID, ev.Collection, ev.Rkey, ev.Payload = segment.KindUpdate, "did:plc:hot", "c", "r", []byte("x")
+			case 1:
+				ev.Kind, ev.DID, ev.Collection, ev.Rkey = segment.KindDelete, "did:plc:hot", "c", "r"+strconv.FormatUint(seq, 10)
+			case 2:
+				ev.Kind, ev.DID, ev.Payload = segment.KindSync, "did:plc:sync", []byte{0xa0}
+			}
+			require.NoError(t, want.Observe(&ev))
+			evs = append(evs, ev)
+			seq++
+		}
+		writeCompactionSegment(t, segmentsDir, idx, evs)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	set := tombstone.New()
+	o := &Orchestrator{cfg: Config{
+		DataDir:            dataDir,
+		Store:              st,
+		Logger:             logger,
+		Tombstones:         set,
+		CompactionInterval: time.Hour,
+	}, logger: logger}
+	require.NoError(t, o.rebuildLiveTombstones(t.Context()))
+	require.Equal(t, want.Snapshot().Records, set.Snapshot().Records)
+	require.Equal(t, want.Snapshot().DIDs, set.Snapshot().DIDs)
+	require.Equal(t, seq-3, set.Snapshot().Records[tombstone.RecordKey{DID: "did:plc:hot", Collection: "c", Rkey: "r"}])
 }
 
 // TestRebuildLiveTombstones_DisabledWhenCompactionOff: with

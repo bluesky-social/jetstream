@@ -40,6 +40,12 @@ const defaultCompactionBloomNarrowMaxDIDs = 100_000
 // event and this floor keeps the compactor from spinning full passes.
 const minCompactionTriggerSpacing = 30 * time.Second
 
+// tombstoneRebuildConcurrency bounds the block reads the session-start
+// tombstone rebuild keeps in flight. Live ingest waits for the rebuild, and
+// in disaggregated mode each read is an object GET: one at a time, a 4h
+// backlog takes minutes (design §22.4).
+const tombstoneRebuildConcurrency = 16
+
 type sealedCompactionSegment struct {
 	ingest.SegmentFile
 	header segment.Header
@@ -624,20 +630,35 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 	// scale with the watermark backlog, not the archive — spec §3.4), so
 	// start past them. The refs run through the active tail's durable
 	// blocks too.
+	// Merge keeps each key's highest seq, so blocks can fold in any order.
 	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]tombstone.DIDTombstone)}
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(tombstoneRebuildConcurrency)
 	for ref := range view.RefsFrom(catalog.Main, watermark+1) {
-		if err := ctx.Err(); err != nil {
-			return err
+		if gctx.Err() != nil {
+			break
 		}
-		events, err := catalog.DecodeRef(ctx, fetcher, ref)
-		if err != nil {
-			return fmt.Errorf("orchestrator: compaction: rebuild decode segment %d block %d: %w", ref.Segment, ref.Block, err)
-		}
-		part, err := tombstone.Fold(events, watermark)
-		if err != nil {
-			return fmt.Errorf("orchestrator: compaction: rebuild fold segment %d block %d: %w", ref.Segment, ref.Block, err)
-		}
-		snap.Merge(part)
+		g.Go(func() error {
+			events, err := catalog.DecodeRef(gctx, fetcher, ref)
+			if err != nil {
+				return fmt.Errorf("orchestrator: compaction: rebuild decode segment %d block %d: %w", ref.Segment, ref.Block, err)
+			}
+			part, err := tombstone.Fold(events, watermark)
+			if err != nil {
+				return fmt.Errorf("orchestrator: compaction: rebuild fold segment %d block %d: %w", ref.Segment, ref.Block, err)
+			}
+			mu.Lock()
+			snap.Merge(part)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	o.cfg.Tombstones.Replace(snap)
