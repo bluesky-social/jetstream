@@ -20,6 +20,10 @@ type ReadLogEntry = catalog.LogEntry
 // ReadableLog is the writer-owned ordered log of appended events. Entries are
 // present from seq allocation until eviction, and eviction never advances the
 // floor beyond the durable watermark.
+//
+// A writer's log is dense. A FollowerLog may also hold vacant seqs (nil
+// entries): seqs compaction removed from a sealed block before the follower
+// read it (design §11.1). Readers skip them.
 type ReadableLog struct {
 	mu       sync.RWMutex
 	entries  []*ReadLogEntry
@@ -84,6 +88,25 @@ func (l *ReadableLog) appendEntry(entry *ReadLogEntry) {
 	close(old)
 }
 
+// skip advances the tip to nextSeq, leaving the seqs in between vacant.
+func (l *ReadableLog) skip(nextSeq uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if nextSeq < l.tipSeq {
+		panic(fmt.Sprintf("ingest: readable log skip to %d, below tip %d", nextSeq, l.tipSeq))
+	}
+	if nextSeq == l.tipSeq {
+		return
+	}
+	for ; l.tipSeq < nextSeq; l.tipSeq++ {
+		l.entries = append(l.entries, nil)
+	}
+	l.evictLocked()
+	l.publishMetricsLocked()
+	// A reader parked at the old tip must not wait on a vacancy; the next
+	// append wakes it either way, so the notify channel is left alone.
+}
+
 func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 	if l == nil {
 		return
@@ -114,7 +137,9 @@ func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 }
 
 func (l *ReadableLog) evictLocked() {
-	for len(l.entries) > 0 && l.baseSeq < l.durable && l.curBytes > l.maxBytes {
+	// Vacant entries cost nothing against the budget, but a leading run of
+	// them below durable is dropped regardless so it cannot pin the slice.
+	for len(l.entries) > 0 && l.baseSeq < l.durable && (l.curBytes > l.maxBytes || l.entries[0] == nil) {
 		evicted := l.entries[0]
 		l.curBytes -= evicted.ApproxBytes()
 		l.entries[0] = nil
@@ -147,13 +172,23 @@ func (l *ReadableLog) ReadFrom(cursor uint64, max int) (entries []*ReadLogEntry,
 		if idx >= uint64(len(l.entries)) {
 			panic(fmt.Sprintf("ingest: readable log corrupt index %d len %d base %d tip %d", idx, len(l.entries), l.baseSeq, l.tipSeq))
 		}
-		out := l.entries[idx:]
-		if len(out) > max {
-			out = out[:max]
+		for _, e := range l.entries[idx:] {
+			if e == nil {
+				continue
+			}
+			if entries == nil {
+				entries = make([]*ReadLogEntry, 0, min(max, len(l.entries)-int(idx)))
+			}
+			entries = append(entries, e)
+			if len(entries) == max {
+				break
+			}
 		}
-		entries = make([]*ReadLogEntry, len(out))
-		copy(entries, out)
-		return entries, nil, true, false
+		if len(entries) > 0 {
+			return entries, nil, true, false
+		}
+		// Only vacancies remain up to the tip: wait there.
+		return nil, l.notify, false, true
 	}
 	if cursor >= l.tipSeq {
 		return nil, l.notify, false, true
@@ -197,7 +232,7 @@ func (l *ReadableLog) PendingForDID(did string) []segment.Event {
 	out := make([]segment.Event, 0)
 	for _, entry := range l.entries {
 		ev := entry.Event()
-		if ev.Seq < l.durable || ev.DID != did {
+		if ev == nil || ev.Seq < l.durable || ev.DID != did {
 			continue
 		}
 		cp := *ev

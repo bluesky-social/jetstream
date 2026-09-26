@@ -39,6 +39,17 @@ func (f *FollowerLog) Append(ev *segment.Event) error {
 	return nil
 }
 
+// Skip advances the log's tip to next without appending, leaving the seqs
+// in between vacant: compaction removed them from a sealed block before the
+// follower read it. Readers skip vacant seqs.
+func (f *FollowerLog) Skip(next uint64) error {
+	if tip := f.log.TipSeq(); next < tip {
+		return fmt.Errorf("ingest: follower log skip to %d, below tip %d", next, tip)
+	}
+	f.log.skip(next)
+	return nil
+}
+
 // AdvanceDurable marks every appended seq below next durable, which lets the
 // log evict them under its byte budget.
 func (f *FollowerLog) AdvanceDurable(next uint64) error {

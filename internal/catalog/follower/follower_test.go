@@ -59,6 +59,41 @@ func TestFollower_FoldBetweenTicks(t *testing.T) {
 	require.Equal(t, uint64(22), f.Snapshot().TipSeq(catalog.Main))
 }
 
+// A follower that falls behind across a seal and a compaction pass finds
+// sealed blocks that lack seqs inside their envelopes. Those seqs stay
+// vacant in its log, which readers skip; they are not corruption.
+func TestFollower_CompactedBetweenTicks(t *testing.T) {
+	t.Parallel()
+	r := newRig(t)
+	r.setPhase(lifecycle.PhaseSteadyState)
+	f, _, _ := r.follower(followerOpts{manifest: true})
+	ctx := t.Context()
+	require.NoError(t, f.Refresh(ctx))
+
+	r.commitHot(3, false) // 1-3
+	r.commitHot(3, true)  // 4-6
+	r.fold(2)             // block 1-6
+	r.commitHot(3, false) // 7-9
+	r.fold(1)             // block 7-9
+	r.seal()              // segment 0
+	// A block edge, an interior row, and a whole block.
+	r.compact(0, 2, 6, 7, 8, 9)
+	r.commitHot(3, false) // 10-12
+	require.NoError(t, f.Refresh(ctx))
+	require.NoError(t, f.Ready(ctx))
+
+	require.Equal(t, uint64(13), f.Log().TipSeq())
+	r.requireStream(logEvents(t, f, 1), 1)
+	r.requireStream(coldEvents(t, f, 1), 1)
+	entries, _, ok, _ := f.Log().ReadFrom(6, 10)
+	require.True(t, ok)
+	require.Equal(t, uint64(10), entries[0].Event().Seq, "a cursor on a vacancy resumes at the next resident seq")
+
+	r.commitHot(2, false) // 13-14
+	require.NoError(t, f.Refresh(ctx))
+	r.requireStream(logEvents(t, f, 1), 1)
+}
+
 // Property: over a random mix of inline and pointer batches, folds, seals,
 // and skipped ticks, with the follower starting against a non-empty archive,
 // the readable log is exactly the committed stream from the start tip on,

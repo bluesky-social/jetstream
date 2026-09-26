@@ -319,11 +319,12 @@ func (f *Follower) runTick(ctx context.Context) error {
 	steady := next.phase == lifecycle.PhaseSteadyState
 	flog := f.flog.Load()
 	var events []segment.Event
+	var logTip uint64
 	if flog != nil && steady {
 		// Reading (and verifying) every block the log still lacks,
 		// pointer batches included, happens before anything is published,
 		// so a failed fetch leaves the whole tick to retry.
-		if events, err = f.feed(ctx, next, flog.Log().TipSeq(), rd); err != nil {
+		if events, logTip, err = f.feed(ctx, next, flog.Log().TipSeq(), rd); err != nil {
 			return err
 		}
 	}
@@ -339,7 +340,16 @@ func (f *Follower) runTick(ctx context.Context) error {
 	// because advancing lets the log evict, and a reader that saw the new
 	// floor must find the evicted seqs in the mirror it loads next.
 	for i := range events {
+		// A seq feed passed over was compacted away; it stays vacant.
+		if err := flog.Skip(events[i].Seq); err != nil {
+			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
+		}
 		if err := flog.Append(&events[i]); err != nil {
+			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
+		}
+	}
+	if flog != nil && steady {
+		if err := flog.Skip(logTip); err != nil {
 			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
 		}
 	}

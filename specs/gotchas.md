@@ -87,6 +87,10 @@ The same rule applies to locks held across a write. The backfill `Store`'s `coun
 
 A killed or deposed leader keeps running until its context and client die, and it can reach an armed crashpoint after its successor has started. If the old session takes the seam, the kill lands on a process that is already dead, the fault never exercises the new leader, and the harness waits for a crash that doesn't come. The layer 3 injector only fires for the pod that started the newest session (`newestSession`). Any new harness that arms seams across leader changes needs the same check. Area: `internal/oracle/disagg_oracle_test.go` (`disaggCrashInjector`).
 
+### Sealed blocks have holes; hot batches and active blocks don't
+
+Compaction keeps each block's [MinSeq, MaxSeq] envelope and drops rows inside it, so a sealed block can skip seqs. A follower whose last tick predates a seal and a compaction pass reads the missing seqs from the compacted block, not from hot batches. Anything that walks refs seq by seq must allow holes inside a sealed ref's envelope (`BlockRef.Generation != 0`) and still demand density from hot batches and active blocks, where a hole really is corruption. The follower's readable log leaves those seqs vacant (nil entries) and every reader skips them. The first version treated the hole as corruption and stopped the follower. Only the layer 3 oracle's held reader, which refreshes rarely, caught it. Area: `internal/catalog/follower/tick.go` (`feed`), `internal/ingest/readlog.go`, `specs/oracle/2026-09-26-disagg-follower-compaction-hole.md`.
+
 ### A v1 subscriber sees a projection of the stream, not the stream
 
 A v1 subscriber gets no sync rows, receives resync replacements as ordinary creates, and sees a rev only on commits. Comparing a v1 observer to the model row for row fails as soon as a resync happens. The layer 3 oracle compares v1 observers against `disaggV1Project`, not against the raw model. Area: `internal/oracle/disagg_oracle_test.go`.

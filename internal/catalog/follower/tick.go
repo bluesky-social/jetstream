@@ -543,16 +543,20 @@ func (m *mirror) tails(objects objIndex) (map[catalog.Namespace]catalog.SegmentV
 	return tails, nil
 }
 
-// feed returns the events [log tip, next's Main tip) in seq order: blocks
-// folded (or sealed) since the last tick first, read through RefsFrom, then
-// the hot batches (design §11.1). Every seq appears exactly once.
-func (f *Follower) feed(ctx context.Context, next *mirror, from uint64, rd *protocol.Reader) ([]segment.Event, error) {
+// feed returns the events [log tip, next's Main tip) in seq order, and the
+// seq the log's tip moves to: blocks folded (or sealed) since the last tick
+// first, read through RefsFrom, then the hot batches (design §11.1). Every
+// seq appears at most once and in order. Hot batches and active blocks are
+// dense; a sealed block may lack seqs inside its envelope, because a
+// compaction pass that ran since the last tick dropped them (design §12).
+// The caller leaves those seqs vacant in the log.
+func (f *Follower) feed(ctx context.Context, next *mirror, from uint64, rd *protocol.Reader) ([]segment.Event, uint64, error) {
 	tip := next.view.TipSeq(catalog.Main)
 	if tip <= from {
 		if tip != 0 && tip < from {
-			return nil, catalog.Corruptf(catalog.SourceInvariant, "main tip %d is below the readable log tip %d", tip, from)
+			return nil, 0, catalog.Corruptf(catalog.SourceInvariant, "main tip %d is below the readable log tip %d", tip, from)
 		}
-		return nil, nil
+		return nil, from, nil
 	}
 	fetch := tickFetcher{rd: rd}
 	var out []segment.Event
@@ -561,32 +565,40 @@ func (f *Follower) feed(ctx context.Context, next *mirror, from uint64, rd *prot
 		events, err := catalog.DecodeRef(ctx, fetch, ref)
 		if err != nil {
 			if _, ok := catalog.IsCorruption(err); ok {
-				return nil, err
+				return nil, 0, err
 			}
 			if _, inline := ref.Loc.(catalog.InlineBlock); inline || errors.Is(err, segment.ErrCorruptSegment) {
-				return nil, catalog.Corruptf(catalog.SourceHotBatch, "decode main block [%d,%d]: %v", ref.MinSeq, ref.MaxSeq, err)
+				return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "decode main block [%d,%d]: %v", ref.MinSeq, ref.MaxSeq, err)
 			}
-			return nil, fmt.Errorf("follower: read main block [%d,%d]: %w", ref.MinSeq, ref.MaxSeq, err)
+			return nil, 0, fmt.Errorf("follower: read main block [%d,%d]: %w", ref.MinSeq, ref.MaxSeq, err)
 		}
+		if want < ref.MinSeq {
+			return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] starts after seq %d", ref.MinSeq, ref.MaxSeq, want)
+		}
+		// Only a sealed generation can have been compacted.
+		sealed := ref.Generation != 0
 		for i := range events {
 			ev := &events[i]
 			if ev.Seq < want {
 				continue
 			}
-			if ev.Seq != want || ev.Seq > ref.MaxSeq {
-				return nil, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] holds seq %d where %d was due", ref.MinSeq, ref.MaxSeq, ev.Seq, want)
+			if ev.Seq > ref.MaxSeq || (ev.Seq != want && !sealed) {
+				return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] holds seq %d where %d was due", ref.MinSeq, ref.MaxSeq, ev.Seq, want)
 			}
 			out = append(out, *ev)
-			want++
+			want = ev.Seq + 1
+		}
+		if sealed {
+			want = ref.MaxSeq + 1
 		}
 		if want != ref.MaxSeq+1 {
-			return nil, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] ends at seq %d", ref.MinSeq, ref.MaxSeq, want)
+			return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] ends at seq %d", ref.MinSeq, ref.MaxSeq, want)
 		}
 	}
 	if want != tip {
-		return nil, catalog.Corruptf(catalog.SourceInvariant, "main refs from %d end at %d, before tip %d", from, want, tip)
+		return nil, 0, catalog.Corruptf(catalog.SourceInvariant, "main refs from %d end at %d, before tip %d", from, want, tip)
 	}
-	return out, nil
+	return out, tip, nil
 }
 
 // tickFetcher reads a not-yet-published mirror's blocks.

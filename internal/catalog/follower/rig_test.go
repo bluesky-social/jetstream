@@ -61,6 +61,18 @@ type rig struct {
 	// active is Main's active blocks since the last seal.
 	active []activeBlock
 	seg    uint64
+	// sealed is each sealed segment's current generation, by index.
+	sealed []sealedGen
+	// dropped is the seqs compaction removed.
+	dropped map[uint64]bool
+}
+
+type sealedGen struct {
+	gen    uint64
+	header []byte
+	footer []byte
+	frames [][]byte
+	blocks []catalog.SealBlock
 }
 
 type activeBlock struct {
@@ -164,10 +176,54 @@ func (r *rig) seal() {
 	sl.Header = hdr
 	sl.Footer, err = r.up.Put(r.t.Context(), r.s, footer)
 	require.NoError(r.t, err)
-	_, err = r.s.Seal(r.t.Context(), sl)
+	c, err := r.s.Seal(r.t.Context(), sl)
 	require.NoError(r.t, err)
+	r.sealed = append(r.sealed, sealedGen{gen: c.GenerationID, header: hdr, footer: footer, frames: frames, blocks: sl.Blocks})
 	r.active = nil
 	r.seg++
+}
+
+// compact publishes a compacted generation of sealed segment seg without
+// the rows at seqs, the way the leader's compaction pass does (design §12.2).
+func (r *rig) compact(seg uint64, seqs ...uint64) {
+	r.t.Helper()
+	ctx := r.t.Context()
+	src := r.sealed[seg]
+	recs := map[segment.RecordKey]uint64{}
+	for _, seq := range seqs {
+		ev := r.events[seq-1]
+		recs[segment.RecordKey{DID: ev.DID, Collection: ev.Collection, Rkey: ev.Rkey}] = seq + 1
+	}
+	res, err := segment.SparseRewrite(src.header, src.footer, func(i int) ([]byte, error) { return src.frames[i], nil },
+		segment.NewTombstones(nil, recs, 0), segment.SparseOptions{})
+	require.NoError(r.t, err)
+	require.True(r.t, res.Rewritten)
+	footer, err := r.up.Put(ctx, r.s, res.Footer)
+	require.NoError(r.t, err)
+	p := catalog.Publish{Segment: seg, Source: src.gen, Header: res.HeaderBytes, Footer: footer, Blocks: make([]catalog.PublishBlock, len(src.frames))}
+	next := sealedGen{header: res.HeaderBytes, footer: res.Footer, frames: append([][]byte(nil), src.frames...), blocks: make([]catalog.SealBlock, len(src.frames))}
+	for _, i := range res.Reused {
+		p.Blocks[i] = catalog.PublishBlock{Object: catalog.ObjectRef{ID: src.blocks[i].ObjectID}, Reused: true, CompressedLength: src.blocks[i].CompressedLength}
+	}
+	for _, f := range res.Frames {
+		ref, err := r.up.Put(ctx, r.s, f.Frame)
+		require.NoError(r.t, err)
+		next.frames[f.Block] = f.Frame
+		p.Blocks[f.Block] = catalog.PublishBlock{Object: ref, CompressedLength: int64(len(f.Frame))}
+	}
+	c, err := r.s.PublishGeneration(ctx, p)
+	require.NoError(r.t, err)
+	next.gen = c.GenerationID
+	for i, id := range c.ObjectIDs {
+		next.blocks[i] = catalog.SealBlock{ObjectID: id, CompressedLength: p.Blocks[i].CompressedLength}
+	}
+	r.sealed[seg] = next
+	if r.dropped == nil {
+		r.dropped = map[uint64]bool{}
+	}
+	for _, seq := range seqs {
+		r.dropped[seq] = true
+	}
 }
 
 type followerOpts struct {
@@ -205,12 +261,15 @@ func logEvents(t *testing.T, f *follower.Follower, from uint64) []segment.Event 
 	require.NotNil(t, l, "readable log")
 	var out []segment.Event
 	for cur := from; cur < l.TipSeq(); {
-		entries, _, ok, _ := l.ReadFrom(cur, 1024)
+		entries, _, ok, atTip := l.ReadFrom(cur, 1024)
+		if atTip {
+			break // only compacted-away seqs remain
+		}
 		require.True(t, ok, "log read at %d (floor %d, tip %d)", cur, l.FloorSeq(), l.TipSeq())
 		for _, e := range entries {
 			out = append(out, *e.Event())
 		}
-		cur += uint64(len(entries))
+		cur = entries[len(entries)-1].Event().Seq + 1
 	}
 	return out
 }
@@ -231,10 +290,16 @@ func coldEvents(t *testing.T, f *follower.Follower, from uint64) []segment.Event
 	return out
 }
 
-// requireStream checks got is exactly the committed events [from, from+len).
+// requireStream checks got is exactly the committed events from seq from on,
+// less the ones compaction dropped.
 func (r *rig) requireStream(got []segment.Event, from uint64) {
 	r.t.Helper()
-	want := r.events[from-1:]
+	var want []segment.Event
+	for _, ev := range r.events[from-1:] {
+		if !r.dropped[ev.Seq] {
+			want = append(want, ev)
+		}
+	}
 	require.Len(r.t, got, len(want))
 	for i := range want {
 		require.Equal(r.t, want[i].Seq, got[i].Seq, "seq at %d", i)

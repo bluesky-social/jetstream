@@ -7,8 +7,10 @@ import (
 )
 
 // HotLog is the in-memory ordered log of recent events that serves live
-// subscribers (design §11.4). Seqs in [FloorSeq, TipSeq) are resident; below
-// FloorSeq a reader must go through the CatalogView. Local mode's HotLog is
+// subscribers (design §11.4). Seqs in [FloorSeq, TipSeq) are resident or,
+// in a follower's log, vacant: compaction removed them before the follower
+// read them, and ReadFrom skips them. Below FloorSeq a reader must go
+// through the CatalogView. Local mode's HotLog is
 // the ingest writer's readable log; the disaggregated follower feeds one from
 // committed hot batches.
 //
