@@ -18,12 +18,12 @@ tiers: storefault
 diff --git a/internal/ingest/orchestrator/merge_runner.go b/internal/ingest/orchestrator/merge_runner.go
 --- a/internal/ingest/orchestrator/merge_runner.go
 +++ b/internal/ingest/orchestrator/merge_runner.go
-@@ -92,7 +92,7 @@
+@@ -99,7 +99,7 @@ func (r *mergeRunner) run(ctx context.Context) error {
  			if err := r.simulateCrash(ctx, crashpoint.AfterMergeDstFlushBeforeSourceCommit); err != nil {
  				return err
  			}
--			if err := commitSourceComplete(r.store, r.cache, sf.Index+1, perDID, r.now()); err != nil {
-+			if err := commitSourceComplete(r.store, r.cache, sf.Index+1, perDID, r.now()); err == nil {
+-			if err := commitSourceComplete(r.store, r.cache, sf.index+1, perDID, r.now()); err != nil {
++			if err := commitSourceComplete(r.store, r.cache, sf.index+1, perDID, r.now()); err == nil {
  				return err
  			}
  			r.metrics.incMergeSegmentsConsumed()
