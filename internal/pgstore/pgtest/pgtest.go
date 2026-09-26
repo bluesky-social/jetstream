@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/url"
 	"os"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/pgstore"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,8 +73,20 @@ func NewDatabase(t testing.TB) string {
 			return
 		}
 		defer func() { _ = c.Close(context.Background()) }()
-		if _, err := c.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
-			t.Errorf("pgtest: drop %s: %v", name, err)
+		for {
+			_, err := c.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+			// FORCE terminates the database's other backends, and this role
+			// may terminate only its own. A reader-role backend whose client
+			// has closed can still be exiting under load; wait it out.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "42501" && ctx.Err() == nil {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				t.Errorf("pgtest: drop %s: %v", name, err)
+			}
+			return
 		}
 	})
 
