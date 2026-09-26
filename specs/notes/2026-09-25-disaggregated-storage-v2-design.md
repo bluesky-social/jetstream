@@ -1589,6 +1589,37 @@ run also picks up `state = 'deleting'` rows and repeats steps 3 and 4 for them.
 `JETSTREAM_S3_RETRY_TIMEOUT` plus the longest upload. `uploading` rows are never
 referenced, so no mark step is needed for them.
 
+As built (S4.3), GC is `protocol.Collector` (`internal/objstore/protocol/gc.go`)
+over the catalog's `GCMark`, `GCClaim`, and `GCForget` scripts, each one fenced
+`TxGC` transaction:
+
+- The leader session runs it on a ticker at `JETSTREAM_GC_INTERVAL`, first one
+  interval after the session starts, beside the writer. It runs in every
+  phase: mark sees references in every table, and an `uploading` row is safe
+  until `orphan_age`.
+- One run marks in pages until a page comes back short, then claims, deletes,
+  and forgets batches until a claim returns nothing. A claim returns leftover
+  `deleting` rows alone, before any fresh ones, so a stopped run resumes with
+  exactly the batch it left.
+- Deletes run concurrently, bounded by `JETSTREAM_S3_UPLOAD_CONCURRENCY`.
+  `Blob.DeleteKey` already treats a missing key as success. A 403 is not
+  treated as "not found": the plan's "404 or 403" rule would forget a row
+  whose key a misconfigured credential could not delete, leaking the object
+  silently. A failed delete fails the run but not the session; its batch stays
+  `deleting`, `jetstream_gc_delete_failures_total` counts it, and the next run
+  retries it.
+- A failed GC transaction ends the session, as every fenced script does.
+  Corruption ends the process: a claimed row still referenced (the re-check),
+  and a forget that removes fewer rows than the batch claimed, since only this
+  session changes `objects` rows between its claim and its forget. The second
+  is found outside a transaction, so the leader session reports GC's error
+  itself rather than through the session's.
+- Crashpoints `after-gc-mark-before-claim`, `after-gc-claim-before-delete`,
+  and `after-gc-delete-before-forget` cover the step boundaries.
+- Besides the §23 series it exports `jetstream_gc_runs_total{outcome}`. The
+  `jetstream_objects{state}` gauge is read after every run, so only the leader
+  reports it.
+
 ## 14. Metadata store
 
 ### 14.1 Interface
@@ -2411,7 +2442,8 @@ All metrics use the existing `obs` package. Names:
   `jetstream_s3_bytes_total{op}`, `jetstream_s3_verify_failures_total{path=upload|read}`
   (request metrics count every attempt, retries included)
 - `jetstream_objects{state}` (gauge, refreshed by GC),
-  `jetstream_gc_deleted_total`, `jetstream_gc_run_duration_seconds`
+  `jetstream_gc_deleted_total`, `jetstream_gc_run_duration_seconds`,
+  `jetstream_gc_runs_total{outcome}`, `jetstream_gc_delete_failures_total`
 - `jetstream_catalog_revision` (gauge), `jetstream_catalog_lag_seconds`
   (gauge: now minus the last successful refresh),
   `jetstream_catalog_refresh_duration_seconds`,

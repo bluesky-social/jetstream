@@ -110,6 +110,8 @@ func TestDisagg_RuntimeCompaction(t *testing.T) {
 		o.CompactionInterval = 20 * time.Millisecond
 		o.CompactionRewriteWorkers = 2
 		o.Storage.CompactionMemoryBytes = 16 << 10
+		// GC marks alongside the passes; nothing ages past its delays.
+		o.Storage.GC.Interval = 20 * time.Millisecond
 		o.OnCompactionPass = func(r jetstreamd.CompactionPassResult) {
 			mu.Lock()
 			defer mu.Unlock()

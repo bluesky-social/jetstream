@@ -37,6 +37,7 @@ var objectPrefix = objstore.FormatUUID(archiveID) + "/objects/"
 
 type harness struct {
 	db       *storagefake.DB
+	lease    *storagefake.Lease
 	blob     objstore.Blob
 	session  *catalog.Session
 	up       *protocol.Uploader
@@ -62,6 +63,7 @@ func newHarness(t *testing.T, o options) *harness {
 	reg := prometheus.NewRegistry()
 	h := &harness{
 		db:       db,
+		lease:    lease,
 		blob:     o.blob,
 		metrics:  protocol.NewMetrics(reg),
 		catalogM: catalog.NewMetrics(reg),

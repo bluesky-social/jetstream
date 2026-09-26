@@ -1147,7 +1147,7 @@ Design §12, §13, and §26 stage 4.
   - `compaction/deadline` plus "pass running since" written in fenced
     transactions (§12.7). Followers compute Cache-Control from it.
   - Remove the D5 startup refusal.
-- [ ] **S4.3 GC** (M). Deps: S2.5, S2.6.
+- [x] **S4.3 GC** (M). Deps: S2.5, S2.6.
   - Leader task every `JETSTREAM_GC_INTERVAL`:
     - mark, in pages of 10,000;
     - claim up to 1,000 plus the in-transaction re-check, where a hit is
@@ -1266,6 +1266,33 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S4.3 (2026-09-26): GC.**
+  - `protocol.Collector` (`internal/objstore/protocol/gc.go`) runs one design
+    §13 run over the S4.2 catalog scripts: mark in pages of 10,000, then
+    claim 1,000, delete, and forget until a claim is empty. It depends only on
+    `catalog.Session`, `catalog.DB`, and `objstore.Blob`, so it is
+    backend-neutral (D1).
+  - The leader session runs it on a `JETSTREAM_GC_INTERVAL` ticker. A failed
+    GC transaction ends the session. Corruption ends the process; that
+    includes a forget that removes fewer rows than were claimed, which is
+    found outside a transaction, so `leaderSession` returns GC's error itself.
+    A failed delete fails only the run.
+  - Deviation: a 403 on DELETE is an error, not "not found" as the task said.
+    Forgetting a row whose delete was denied would leak the object silently.
+    The batch stays `deleting` and `jetstream_gc_delete_failures_total`
+    counts it. Recorded in design §13.
+  - Added: three crashpoints (`after-gc-mark-before-claim`,
+    `after-gc-claim-before-delete`, `after-gc-delete-before-forget`) for
+    S4.4, and `jetstream_gc_runs_total{outcome}` and
+    `jetstream_gc_delete_failures_total` beside the three planned series.
+  - Tests:
+    - Protocol tests use synctest for the delays. They cover the full run, the
+      resume after each crashpoint in a new session, delete failures of both
+      kinds (error, and unknown result), paging, and a fenced run.
+    - `TestRunDisaggregated_GCCorruptionIsFatal` covers both corruption paths
+      through the runtime.
+    - `TestDisagg_RuntimeCompaction` marks every 20ms beside the passes.
 
 - **S4.2 (2026-09-26): Compaction on the catalog.**
   - The catalog side landed first (`064d45c`): `Session.PublishGeneration`

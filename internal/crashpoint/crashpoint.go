@@ -136,6 +136,21 @@ const (
 	// transaction. The uploads stay unreferenced; the next pass rewrites the
 	// segment again and GC collects the orphans.
 	AfterCompactionUploadBeforePublish Point = "after-compaction-upload-before-publish"
+
+	// AfterGCMarkBeforeClaim fires after a GC run's mark pages commit but
+	// before its first claim. The marks stay; the next run's claim honors
+	// them once GC_DELAY has passed.
+	AfterGCMarkBeforeClaim Point = "after-gc-mark-before-claim"
+
+	// AfterGCClaimBeforeDelete fires after a GC claim commits its objects as
+	// deleting but before any key is deleted. The next run resumes the
+	// deleting rows first.
+	AfterGCClaimBeforeDelete Point = "after-gc-claim-before-delete"
+
+	// AfterGCDeleteBeforeForget fires after a GC claim's keys are deleted
+	// but before the forget transaction. The next run deletes the missing
+	// keys again, which succeeds, and forgets the rows.
+	AfterGCDeleteBeforeForget Point = "after-gc-delete-before-forget"
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -165,6 +180,9 @@ var AllPoints = []Point{
 	AfterDirectBlockUploadBeforeCommit,
 	AfterDirectBlockCommitBeforeAck,
 	AfterCompactionUploadBeforePublish,
+	AfterGCMarkBeforeClaim,
+	AfterGCClaimBeforeDelete,
+	AfterGCDeleteBeforeForget,
 }
 
 var knownPoints = func() map[Point]struct{} {

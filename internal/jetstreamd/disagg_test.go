@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -123,4 +124,65 @@ func TestRunDisaggregated_MergingWithoutBootstrapLive(t *testing.T) {
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer closeCancel()
 	require.NoError(t, rt.Close(closeCtx))
+}
+
+// gcFaultDB makes every GC claim return one object. With referenced set,
+// the §13 re-check finds it still referenced; otherwise its forget removes
+// nothing, which only another writer could have caused.
+type gcFaultDB struct {
+	catalog.DB
+	referenced bool
+}
+
+func (d gcFaultDB) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, error) {
+	tx, err := d.DB.Begin(ctx, kind)
+	if err != nil || kind != catalog.TxGC {
+		return tx, err
+	}
+	return gcFaultTx{tx, d.referenced}, nil
+}
+
+type gcFaultTx struct {
+	catalog.Tx
+	referenced bool
+}
+
+func (gcFaultTx) ClaimObjects(context.Context, time.Duration, time.Duration, int) ([]catalog.ObjectRow, error) {
+	return []catalog.ObjectRow{{ID: 1, State: catalog.ObjectAvailable}}, nil
+}
+
+func (t gcFaultTx) ReferencedObjects(_ context.Context, ids []uint64) ([]uint64, error) {
+	if t.referenced {
+		return ids, nil
+	}
+	return nil, nil
+}
+
+func (gcFaultTx) ForgetObjects(context.Context, []uint64) (int, error) { return 0, nil }
+
+// Corruption a GC run finds, inside a catalog transaction or after one, is
+// fatal to the process, not retried next interval.
+func TestRunDisaggregated_GCCorruptionIsFatal(t *testing.T) {
+	t.Parallel()
+	for _, referenced := range []bool{true, false} {
+		t.Run(fmt.Sprintf("referenced=%v", referenced), func(t *testing.T) {
+			t.Parallel()
+			fake := jetstreamdtest.New(storagefake.Config{})
+			require.NoError(t, fake.InitNamespaces(t.Context()))
+			fake.Backend.DB = gcFaultDB{DB: fake.DB, referenced: referenced}
+			opts := disaggOptions(t, fake.Backend)
+			opts.Storage.GC.Interval = 10 * time.Millisecond
+			rt, err := jetstreamd.Build(t.Context(), opts)
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			err = rt.Run(ctx)
+			src, corrupt := catalog.IsCorruption(err)
+			require.True(t, corrupt, "got %v", err)
+			require.Equal(t, catalog.SourceGC, src)
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer closeCancel()
+			require.NoError(t, rt.Close(closeCtx))
+		})
+	}
 }

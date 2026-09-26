@@ -92,6 +92,7 @@ type disaggregated struct {
 	// catalog, not through the follower's mirror, which may lag the
 	// leader's own commits.
 	objects        *protocol.Reader
+	gc             *protocol.Collector
 	cache          *objcache.Cache
 	catalogMetrics *catalog.Metrics
 	maintMetrics   *maintainer.Metrics
@@ -275,6 +276,19 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		return fail(fmt.Errorf("serve: build uploader: %w", err))
 	}
 	rt.disagg.uploader = uploader
+	gc, err := protocol.NewCollector(protocol.GCConfig{
+		Blob:        backend.Blob,
+		ArchiveID:   archive.ArchiveID,
+		Delay:       st.GC.Delay,
+		OrphanAge:   st.GC.OrphanAge,
+		Concurrency: st.S3.UploadConcurrency,
+		Metrics:     protocol.NewGCMetrics(reg),
+		Crash:       opts.CrashInjector,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build gc: %w", err))
+	}
+	rt.disagg.gc = gc
 	objects, err := protocol.NewReader(protocol.ReaderConfig{
 		Rows:           protocol.DBRows{DB: backend.DB},
 		Blob:           backend.Blob,
@@ -667,6 +681,23 @@ func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog
 		}, nil
 	}
 
+	// GC's corruption can come from outside a catalog transaction, where
+	// sess.Err does not see it, so it is reported here.
+	gcDone := make(chan struct{})
+	var gcErr error
+	go func() {
+		defer close(gcDone)
+		gcErr = r.goroutineRoot("gc", func() error {
+			return r.runGC(sctx, epoch, sess, onFailure)
+		})()
+	}()
+	waitGC := func() error {
+		cancel()
+		<-gcDone
+		return gcErr
+	}
+	defer func() { _ = waitGC() }()
+
 	s, err := r.sessions.buildWith(meta, &orchestrator.Disaggregated{
 		Session:               sess,
 		Direct:                direct,
@@ -679,7 +710,46 @@ func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog
 	if err != nil {
 		return err
 	}
-	return r.runWriterSession(sctx, epoch, s)
+	err = r.runWriterSession(sctx, epoch, s)
+	if gerr := waitGC(); gerr != nil {
+		if _, corrupt := catalog.IsCorruption(gerr); corrupt || err == nil {
+			return gerr
+		}
+	}
+	return err
+}
+
+// runGC runs design §13 GC every JETSTREAM_GC_INTERVAL until ctx ends. A
+// failed catalog transaction has ended the session, and corruption must stop
+// it, so either stops the rest of the session through onFailure and is
+// returned. Any other failure, such as a delete the object store refused, is
+// retried next interval.
+func (r *Runtime) runGC(ctx context.Context, epoch uint64, sess *catalog.Session, onFailure func(error)) error {
+	d := r.disagg
+	t := time.NewTicker(r.opts.Storage.GC.Interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		res, err := d.gc.Run(ctx, sess, d.backend.DB)
+		switch {
+		case err == nil:
+			if res.Claimed > 0 {
+				r.logger.Debug("gc run", "epoch", epoch, "marked", res.Marked, "deleted", res.Deleted)
+			}
+			continue
+		case ctx.Err() != nil:
+			return nil
+		}
+		if _, corrupt := catalog.IsCorruption(err); corrupt || sess.Err() != nil {
+			onFailure(err)
+			return fmt.Errorf("serve: gc: %w", err)
+		}
+		r.logger.Warn("gc run failed; retrying next interval", "epoch", epoch, "err", err)
+	}
 }
 
 // sessionError is what a leader session reports to the leader loop. When the
