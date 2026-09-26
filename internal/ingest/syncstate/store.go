@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"sync"
 
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -62,6 +61,17 @@ type StateStore struct {
 	// dedupe only needs to know that this account row was appended.
 	promotedAccount map[atmos.DID]int64
 
+	// unsnapped* are the promotions since the last Snapshot, a subset of
+	// promoted*. A snapshot takes them rather than cloning promoted*: its
+	// batch commits after every earlier snapshot's batch, which carried the
+	// rest. Cloning all of promoted* made every pipelined hot batch restage
+	// every uncommitted entry, so a commit backlog (bulk recovery) grew each
+	// batch and slowed commits further (design §22.2).
+	unsnappedChain   map[atmos.DID][]byte
+	unsnappedHosting map[atmos.DID][]byte
+	unsnappedIdent   map[atmos.DID]int64
+	unsnappedAccount map[atmos.DID]int64
+
 	// captured* record exactly which promoted values the most recent
 	// StageFlush wrote into its batch. CommitStaged clears only those,
 	// so a promotion that lands between StageFlush and CommitStaged is
@@ -85,7 +95,7 @@ type pendingHostingState struct {
 // New returns a StateStore that stores chain and hosting state in s under the
 // keyspaces "sync/chain/<did>" and "sync/host/<did>".
 func New(s metastore.Store) *StateStore {
-	return &StateStore{
+	p := &StateStore{
 		s:               s,
 		pendingChain:    make(map[atmos.DID]pendingChainState),
 		pendingHosting:  make(map[atmos.DID]pendingHostingState),
@@ -94,6 +104,15 @@ func New(s metastore.Store) *StateStore {
 		promotedIdent:   make(map[atmos.DID]int64),
 		promotedAccount: make(map[atmos.DID]int64),
 	}
+	p.resetUnsnappedLocked()
+	return p
+}
+
+func (p *StateStore) resetUnsnappedLocked() {
+	p.unsnappedChain = make(map[atmos.DID][]byte)
+	p.unsnappedHosting = make(map[atmos.DID][]byte)
+	p.unsnappedIdent = make(map[atmos.DID]int64)
+	p.unsnappedAccount = make(map[atmos.DID]int64)
 }
 
 func chainKey(did atmos.DID) []byte {
@@ -303,6 +322,7 @@ func (p *StateStore) RecordIdentitySeq(did atmos.DID, seq int64) {
 		return
 	}
 	p.promotedIdent[did] = seq
+	p.unsnappedIdent[did] = seq
 }
 
 // RecordAccountSeq stages the applied #account seq for did, to be flushed
@@ -315,6 +335,7 @@ func (p *StateStore) RecordAccountSeq(did atmos.DID, seq int64) {
 		return
 	}
 	p.promotedAccount[did] = seq
+	p.unsnappedAccount[did] = seq
 }
 
 // PromoteChain marks the pending chain entry for did as flushable iff
@@ -330,6 +351,7 @@ func (p *StateStore) PromoteChain(did atmos.DID, maxRev string) {
 		return
 	}
 	p.promotedChain[did] = pending.buf
+	p.unsnappedChain[did] = pending.buf
 	delete(p.pendingChain, did)
 }
 
@@ -347,32 +369,43 @@ func (p *StateStore) PromoteHosting(did atmos.DID, maxSeq int64) {
 		return
 	}
 	p.promotedHosting[did] = pending.buf
+	p.unsnappedHosting[did] = pending.buf
 	delete(p.pendingHosting, did)
 }
 
-// Snapshot is the promoted state at one instant, for a later StageSnapshot.
+// Snapshot is the state promoted between two instants, for a later
+// StageSnapshot.
 type Snapshot struct {
 	chain, hosting map[atmos.DID][]byte
 	ident, account map[atmos.DID]int64
 }
 
-// Snapshot captures the promoted state now. A durable batch whose writes
-// are prepared before they commit (async flush, pipelined hot batches) must
-// snapshot when it samples its relay cursor, under the writer mutex: an
-// entry promoted later can belong to an event whose rows are in a later
-// batch, and persisting it with this one lets a crash between the two
-// commits leave state newer than the archive, so the verifier drops the
-// redelivered event as a rev replay.
+// Snapshot captures the state promoted since the previous Snapshot. A
+// durable batch whose writes are prepared before they commit (async flush,
+// pipelined hot batches) must snapshot when it samples its relay cursor,
+// under the writer mutex: an entry promoted later can belong to an event
+// whose rows are in a later batch, and persisting it with this one lets a
+// crash between the two commits leave state newer than the archive, so the
+// verifier drops the redelivered event as a rev replay.
+//
+// Staging only the delta relies on snapshots' batches committing in the
+// order they were taken, which the writer guarantees: it commits in seq
+// order, and a failed commit ends the writer and its session's StateStore.
+// Were a later batch to commit after an earlier one failed, the failed
+// batch's entries would be missing, which leaves durable state older than
+// the archive: the verifier then sees a chain break and resyncs, rather than
+// dropping an event.
 func (p *StateStore) Snapshot() *Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Values are never mutated after promotion, so the copies share them.
-	return &Snapshot{
-		chain:   maps.Clone(p.promotedChain),
-		hosting: maps.Clone(p.promotedHosting),
-		ident:   maps.Clone(p.promotedIdent),
-		account: maps.Clone(p.promotedAccount),
+	snap := &Snapshot{
+		chain:   p.unsnappedChain,
+		hosting: p.unsnappedHosting,
+		ident:   p.unsnappedIdent,
+		account: p.unsnappedAccount,
 	}
+	p.resetUnsnappedLocked()
+	return snap
 }
 
 // StageFlush stages the state promoted now; see StageSnapshot.
@@ -386,6 +419,13 @@ func (p *StateStore) StageFlush(b metastore.Batch) {
 func (p *StateStore) StageSnapshot(b metastore.Batch, snap *Snapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Batches stage and commit one at a time, so a capture still here was
+	// staged into a batch that failed to commit. Its entries that are still
+	// current ride with this batch, as they would have in a full snapshot.
+	carry(snap.chain, p.capturedChain, p.promotedChain, bytes.Equal)
+	carry(snap.hosting, p.capturedHosting, p.promotedHosting, bytes.Equal)
+	carry(snap.ident, p.capturedIdent, p.promotedIdent, func(a, b int64) bool { return a == b })
+	carry(snap.account, p.capturedAccount, p.promotedAccount, func(a, b int64) bool { return a == b })
 	p.capturedChain = snap.chain
 	p.capturedHosting = snap.hosting
 	p.capturedIdent = snap.ident
@@ -401,6 +441,19 @@ func (p *StateStore) StageSnapshot(b metastore.Batch, snap *Snapshot) {
 	}
 	for did, seq := range snap.account {
 		b.Set(acctKey(did), encodeIdentitySeq(seq))
+	}
+}
+
+// carry adds to dst each failed capture that is still the promoted value
+// and that dst does not supersede.
+func carry[V any](dst, failed, promoted map[atmos.DID]V, equal func(a, b V) bool) {
+	for did, v := range failed {
+		if _, ok := dst[did]; ok {
+			continue
+		}
+		if cur, ok := promoted[did]; ok && equal(cur, v) {
+			dst[did] = v
+		}
 	}
 }
 
@@ -455,6 +508,10 @@ func (p *StateStore) Delete(ctx context.Context, did atmos.DID) error {
 	delete(p.promotedHosting, did)
 	delete(p.promotedIdent, did)
 	delete(p.promotedAccount, did)
+	delete(p.unsnappedChain, did)
+	delete(p.unsnappedHosting, did)
+	delete(p.unsnappedIdent, did)
+	delete(p.unsnappedAccount, did)
 	delete(p.capturedChain, did)
 	delete(p.capturedHosting, did)
 	delete(p.capturedIdent, did)

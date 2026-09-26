@@ -1,6 +1,7 @@
 package syncstate
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -361,4 +362,85 @@ func TestStateStore_AccountSeqRatchet(t *testing.T) {
 	got, err = fresh.LoadAppliedAccountSeq(t.Context(), did)
 	require.NoError(t, err)
 	require.Zero(t, got, "Delete must remove the ratchet")
+}
+
+// Pipelined hot batches each take a snapshot when they freeze and commit
+// later, in order. A snapshot holds only what was promoted since the one
+// before it: were it to restage everything still uncommitted, a commit
+// backlog would grow every batch and slow commits further (design §22.2).
+// Committing the batches in order still leaves the latest state durable.
+func TestStateStore_PipelinedSnapshotsStageDeltas(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	dids := make([]atmos.DID, 4)
+	for i := range dids {
+		dids[i] = parseDID(t, "did:plc:"+strings.Repeat(string(rune('p'+i)), 24))
+	}
+	promote := func(did atmos.DID, rev string) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+		s.PromoteChain(did, rev)
+	}
+
+	promote(dids[0], "3lrev1")
+	promote(dids[1], "3lrev1")
+	first := s.Snapshot()
+	promote(dids[2], "3lrev1")
+	promote(dids[0], "3lrev2")
+	second := s.Snapshot()
+	third := s.Snapshot()
+	promote(dids[3], "3lrev1")
+
+	var staged []int
+	for _, snap := range []*Snapshot{first, second, third} {
+		b := raw.NewBatch()
+		s.StageSnapshot(b, snap)
+		staged = append(staged, b.Len())
+		require.NoError(t, b.Commit(t.Context()))
+		s.CommitStaged()
+	}
+	require.Equal(t, []int{2, 2, 0}, staged, "each batch stages only its own promotions")
+
+	for i, want := range []string{"3lrev2", "3lrev1", "3lrev1", ""} {
+		durable, err := New(raw).LoadChain(t.Context(), dids[i])
+		require.NoError(t, err)
+		if want == "" {
+			require.Nil(t, durable, "promoted after the last snapshot, so not durable yet")
+			continue
+		}
+		require.NotNil(t, durable)
+		require.Equal(t, want, durable.Rev)
+	}
+	// The uncommitted promotion is still visible to the verifier.
+	got, err := s.LoadChain(t.Context(), dids[3])
+	require.NoError(t, err)
+	require.Equal(t, "3lrev1", got.Rev)
+}
+
+// A batch that fails to commit hands its entries to the next batch staged,
+// even though that batch's snapshot was taken before the failure.
+func TestStateStore_FailedPipelinedBatchCarriesForward(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	a := parseDID(t, "did:plc:tttttttttttttttttttttttt")
+	b := parseDID(t, "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu")
+	require.NoError(t, s.SaveChain(t.Context(), a, atmossync.ChainState{Rev: "3lrev1", Data: fixedCID(t)}))
+	s.PromoteChain(a, "3lrev1")
+	failed := s.Snapshot()
+	require.NoError(t, s.SaveChain(t.Context(), b, atmossync.ChainState{Rev: "3lrev1", Data: fixedCID(t)}))
+	s.PromoteChain(b, "3lrev1")
+	next := s.Snapshot()
+
+	s.StageSnapshot(raw.NewBatch(), failed) // never committed
+	batch := raw.NewBatch()
+	s.StageSnapshot(batch, next)
+	require.Equal(t, 2, batch.Len())
+	require.NoError(t, batch.Commit(t.Context()))
+	s.CommitStaged()
+	for _, did := range []atmos.DID{a, b} {
+		durable, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.NotNil(t, durable, "did=%s", did)
+	}
 }

@@ -101,6 +101,9 @@ type Config struct {
 	// metadata that must be tied to the block's prepare-time view, such as the
 	// live relay cursor watermark.
 	//
+	// Every sample reaches OnDurableBatch, in sample order, unless the writer
+	// fails first, so a sampler may hand out deltas.
+	//
 	// The sampler must not call back into the Writer and must be cheap.
 	DurableBatchPrepareValue func() any
 

@@ -101,7 +101,6 @@ func (p *asyncFlushPipeline) finish(result asyncFlushResult) {
 }
 
 func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
-	prepareValue := w.sampleDurableBatchPrepareValueLocked()
 	prepared, err := w.active.PrepareFlush()
 	if err != nil {
 		return nil, fmt.Errorf("ingest: prepare async flush: %w", err)
@@ -109,6 +108,9 @@ func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
 	if prepared == nil {
 		return nil, nil
 	}
+	// Sampled only once there is a batch to carry it: a sample may take
+	// state that no later sample repeats (syncstate snapshots are deltas).
+	prepareValue := w.sampleDurableBatchPrepareValueLocked()
 	job := &asyncFlushJob{
 		id:           w.nextAsyncFlushID,
 		prepared:     prepared,
