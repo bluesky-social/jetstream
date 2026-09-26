@@ -1,0 +1,29 @@
+mutant: m075_sparse_collection_count_stale
+target: segment/sparse.go
+failure-mode: |
+  The sparse rewrite keeps the source's per-collection event counts
+  instead of reducing them by the dropped rows (design §12.2 step 5). The
+  new generation's collection index over-reports, and a collection whose
+  rows were all deleted is never removed from the string table, so
+  collection-filtered planning keeps fetching blocks with nothing to
+  serve.
+expected-detection: |
+  The layer 3 oracle's held reader runs segment.VerifySealedMetadata on
+  every generation it sees while current, which recounts each
+  collection's rows. TestSparseRewriteMatchesRewrite catches it at unit
+  level.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/segment/sparse.go b/segment/sparse.go
+index c33056b..52d873e 100644
+--- a/segment/sparse.go
++++ b/segment/sparse.go
+@@ -558,7 +558,6 @@ func (s *sparseRewrite) collectionIndex() ([]byte, error) {
+ 			return nil, fmt.Errorf("%w: %s drops %d rows of collection %q, footer counts %d",
+ 				ErrInvalidFooter, s.opts.Name, n, name, counts[id])
+ 		}
+-		counts[id] -= n
+ 	}
+ 
+ 	bitmasks := make([][]uint32, len(s.blocks))

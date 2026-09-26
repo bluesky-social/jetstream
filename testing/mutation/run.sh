@@ -388,18 +388,21 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          -count=1 -timeout "$default_timeout") ;;
                 disagg)
                     # Disaggregated-storage tier (Stage 2 S2.19, extended in
-                    # S3.5): kills mutants in the catalog scripts, the hot
-                    # and direct writers, merge, the follower, and live
-                    # ingest's durable batch state (m062-m072). Layers in
-                    # one `go test`: the layer 3 oracle (eight full seeds,
-                    # each a whole lifecycle from an empty catalog with
-                    # leader kills in bootstrap, merge and steady state;
-                    # fake time, one child process per seed, no
-                    # containers), the catalog script and follower contract
-                    # tests, and the live/syncstate regressions.
+                    # S3.5 and S4.5): kills mutants in the catalog scripts,
+                    # the hot and direct writers, merge, the follower, live
+                    # ingest's durable batch state, sparse compaction and
+                    # object GC (m062-m077). Layers in one `go test`: the
+                    # layer 3 oracle (eight full seeds, each a whole
+                    # lifecycle from an empty catalog with leader kills in
+                    # bootstrap, merge, steady state and compaction, a held
+                    # reader over replaced generations, and GC; fake time,
+                    # one child process per seed, no containers), the
+                    # catalog script and follower contract tests, the
+                    # sparse rewrite and GC collector tests, and the
+                    # live/syncstate regressions.
                     cmd=(env JETSTREAM_ORACLE_DISAGG_SEEDS=1,2,3,4,5,6,7,8 go test "${RACE_FLAG[@]}"
-                         ./internal/oracle ./internal/catalog ./internal/catalog/follower ./internal/ingest/live ./internal/ingest/syncstate
-                         -run '^TestDisagg_Oracle$|^TestScripts_|^TestFollower_|^TestServe_|^TestConsumer_Hot_|^TestStateStore_'
+                         ./internal/oracle ./internal/catalog ./internal/catalog/follower ./internal/ingest/live ./internal/ingest/syncstate ./segment ./internal/objstore/protocol
+                         -run '^TestDisagg_Oracle$|^TestScripts_|^TestFollower_|^TestServe_|^TestConsumer_Hot_|^TestStateStore_|^TestSparseRewrite|^TestGC'
                          -count=1 -timeout "$default_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2

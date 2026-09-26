@@ -559,7 +559,7 @@ func (h *disaggHarness) heldPoll(ctx context.Context, hr *disaggHeld, f *followe
 			continue
 		}
 		g := &disaggHeldGen{idx: idx, gen: p.Generation, parts: p, lastCurrent: now}
-		rows, digest, err := heldDecode(ctx, f, g)
+		rows, digest, err := heldDecode(ctx, f, g, true)
 		if err != nil {
 			if ctx.Err() == nil {
 				hr.fail("segment %d generation %d, read while current: %v", idx, g.gen, err)
@@ -584,7 +584,7 @@ func (h *disaggHarness) heldPoll(ctx context.Context, hr *disaggHeld, f *followe
 // current, and requires the same rows. It reports whether the read
 // succeeded. A failure after GC_DELAY has run out is GC's right.
 func (h *disaggHarness) heldRead(ctx context.Context, hr *disaggHeld, f *follower.Follower, g *disaggHeldGen, what string) bool {
-	_, digest, err := heldDecode(ctx, f, g)
+	_, digest, err := heldDecode(ctx, f, g, false)
 	switch {
 	case ctx.Err() != nil:
 		return false
@@ -604,7 +604,12 @@ func (h *disaggHarness) heldRead(ctx context.Context, hr *disaggHeld, f *followe
 	return true
 }
 
-func heldDecode(ctx context.Context, f *follower.Follower, g *disaggHeldGen) (map[uint64][32]byte, [32]byte, error) {
+// heldDecode reads g's rows. With verify it also re-derives the footer
+// metadata from them (segment.VerifySealedMetadata), as the local oracle
+// does for every sealed file: a sparse rewrite patches the header and the
+// collection index rather than rebuilding them, and nothing else on the
+// read path checks its counts.
+func heldDecode(ctx context.Context, f *follower.Follower, g *disaggHeldGen, verify bool) (map[uint64][32]byte, [32]byte, error) {
 	file, err := xrpcapi.ObjectOpener{Gens: disaggFixedParts{g.parts}, Objects: f.Objects()}.OpenSegment(ctx, g.idx)
 	if err != nil {
 		return nil, [32]byte{}, err
@@ -614,6 +619,11 @@ func heldDecode(ctx context.Context, f *follower.Follower, g *disaggHeldGen) (ma
 		return nil, [32]byte{}, err
 	}
 	defer func() { _ = r.Close() }()
+	if verify {
+		if err := segment.VerifySealedMetadata(r); err != nil {
+			return nil, [32]byte{}, err
+		}
+	}
 	rows := map[uint64][32]byte{}
 	d := sha256.New()
 	for i := range r.Blocks() {
