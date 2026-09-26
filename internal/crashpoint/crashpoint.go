@@ -130,6 +130,12 @@ const (
 	// commits, with its metadata batch, but before the writer releases the
 	// block's acks and durable-batch callbacks.
 	AfterDirectBlockCommitBeforeAck Point = "after-direct-block-commit-before-ack"
+
+	// AfterCompactionUploadBeforePublish fires after a disaggregated segment
+	// rewrite's blocks and footer are uploaded but before the publish
+	// transaction. The uploads stay unreferenced; the next pass rewrites the
+	// segment again and GC collects the orphans.
+	AfterCompactionUploadBeforePublish Point = "after-compaction-upload-before-publish"
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -158,6 +164,7 @@ var AllPoints = []Point{
 	AfterDirectBlockCutBeforeUpload,
 	AfterDirectBlockUploadBeforeCommit,
 	AfterDirectBlockCommitBeforeAck,
+	AfterCompactionUploadBeforePublish,
 }
 
 var knownPoints = func() map[Point]struct{} {

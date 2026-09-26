@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
 	"github.com/bluesky-social/jetstream/segment"
 )
@@ -34,66 +36,8 @@ func TestDisagg_RuntimeSteadyState(t *testing.T) {
 func runDisaggHappyPath(t *testing.T) {
 	const liveAfter = 24
 
-	w := newRestartWorld(t, Config{
-		Seed:              53,
-		Accounts:          seedTestAccounts,
-		MinInitialRecords: 2,
-		MaxInitialRecords: 5,
-		LiveEventsSteady:  seedTestLive + liveAfter,
-	})
-	t.Cleanup(func() { require.NoError(t, w.Close()) })
-
-	fake := jetstreamdtest.New(storagefake.Config{
-		Invariants:  catalog.InvariantOptions{MaxEventsPerBlock: seedTestBlock},
-		OnViolation: func(rev uint64, err error) { t.Errorf("catalog invariant at revision %d: %v", rev, err) },
-	})
-	db := fake.DB
-	lease := db.NewLease()
-	require.NoError(t, lease.Acquire(t.Context(), time.Hour))
-	up, err := protocol.NewUploader(protocol.UploaderConfig{Blob: fake.Blob, ArchiveID: db.Archive().ArchiveID, GCDelay: time.Hour, OrphanAge: time.Hour})
-	require.NoError(t, err)
-	seeded, err := SeedCatalog(t.Context(), SeedCatalogConfig{
-		World:             w,
-		LiveEvents:        seedTestLive,
-		Session:           catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: lease.Epoch()}),
-		Uploader:          up,
-		MaxEventsPerBlock: seedTestBlock,
-		MaxSegmentBytes:   seedTestMaxSegment,
-	})
-	require.NoError(t, err)
-	require.NoError(t, lease.Release(t.Context()))
-
-	simLn := newPipeListener()
-	simSrv := &http.Server{Handler: simhttp.NewHandlerWithOptions(w, disaggSimURL, simhttp.HandlerOptions{})}
-	go func() { _ = simSrv.Serve(simLn) }()
-	t.Cleanup(func() { _ = simSrv.Close() })
-
-	publicLn := newPipeListener()
-	sessions := make(chan uint64, 4)
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	opts := disaggPodOptions(fake.Backend, publicLn, simLn.httpClient(), testWriter{t: t})
-	opts.OnSessionStart = func(epoch uint64) { sessions <- epoch }
-	rt, err := jetstreamd.Build(ctx, opts)
-	require.NoError(t, err)
-	done := make(chan error, 1)
-	go func() { done <- rt.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer closeCancel()
-		require.NoError(t, rt.Close(closeCtx))
-		require.NoError(t, <-done)
-	})
-
-	select {
-	case epoch := <-sessions:
-		require.Greater(t, epoch, lease.Epoch(), "the pod's session fences the seeder's")
-	case err := <-done:
-		t.Fatalf("runtime exited before its first session: %v", err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("no writer session started")
-	}
+	pod := startDisaggSeededPod(t, 53, liveAfter, nil)
+	w, db, seeded, ctx := pod.w, pod.db, pod.seeded, pod.ctx
 
 	var added []segment.Event
 	for range liveAfter {
@@ -111,7 +55,7 @@ func runDisaggHappyPath(t *testing.T) {
 	ground, err := GroundTruthFromWorld(w)
 	require.NoError(t, err)
 	client, err := jetstream.Subscribe("http://jetstream.invalid",
-		jetstream.WithHTTPClient(publicLn.httpClient()),
+		jetstream.WithHTTPClient(pod.ln.httpClient()),
 		jetstream.WithAfterSeq(0),
 		jetstream.WithBatchSize(64),
 	)
@@ -146,6 +90,202 @@ func runDisaggHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want+1, next)
 	require.NoError(t, db.Violation())
+}
+
+// TestDisagg_RuntimeCompaction is delete compaction on the shared catalog
+// (plan S4.2): passes run while live traffic deletes and updates seeded
+// records, rewrite sealed segments sparsely, publish new generations, and
+// advance compaction/seq. The client's read of the archive must be compacted
+// through the watermark and still reconstruct the world.
+func TestDisagg_RuntimeCompaction(t *testing.T) {
+	t.Parallel()
+	const liveAfter = 48
+
+	var (
+		mu        sync.Mutex
+		watermark uint64
+		passErr   error
+	)
+	pod := startDisaggSeededPod(t, 59, liveAfter, func(o *jetstreamd.Options) {
+		o.CompactionInterval = 20 * time.Millisecond
+		o.CompactionRewriteWorkers = 2
+		o.Storage.CompactionMemoryBytes = 16 << 10
+		o.OnCompactionPass = func(r jetstreamd.CompactionPassResult) {
+			mu.Lock()
+			defer mu.Unlock()
+			if r.Err != nil && passErr == nil {
+				passErr = r.Err
+			}
+			watermark = max(watermark, r.Watermark)
+		}
+	})
+	w, db, seeded, ctx := pod.w, pod.db, pod.seeded, pod.ctx
+
+	var added int
+	for range liveAfter {
+		frame, err := w.GenerateOneForTest(ctx)
+		require.NoError(t, err)
+		evt, err := decodeOracleFirehoseFrame(frame)
+		require.NoError(t, err)
+		rows, err := expectedSegmentEventsFromFirehoseEvent(w, evt)
+		require.NoError(t, err)
+		added += len(rows)
+	}
+	want := seeded.NextSeq + uint64(added) - 1
+
+	var covered uint64
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		require.NoError(t, passErr)
+		covered = watermark
+		return covered >= want
+	}, 10*time.Second, 5*time.Millisecond, "a pass covers every live row")
+
+	ground, err := GroundTruthFromWorld(w)
+	require.NoError(t, err)
+	client, err := jetstream.Subscribe("http://jetstream.invalid",
+		jetstream.WithHTTPClient(pod.ln.httpClient()),
+		jetstream.WithAfterSeq(0),
+		jetstream.WithBatchSize(64),
+	)
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	readCtx, readCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer readCancel()
+	var got []ObservedEvent
+	for batch, err := range client.Events(readCtx) {
+		require.NoError(t, err)
+		for _, ev := range batch.Events() {
+			got = append(got, observedEventFromClient(t, ev))
+		}
+		// Nothing follows the last row to supersede it, so it survives.
+		if len(got) > 0 && got[len(got)-1].Seq >= want {
+			break
+		}
+	}
+	require.Less(t, len(got), int(want), "compaction dropped superseded rows")
+	require.NoError(t, CheckInvariants(got))
+	require.NoError(t, CheckCompacted(got, covered))
+	model, err := Reconstruct(got)
+	require.NoError(t, err)
+	require.NoError(t, Compare(ground, model))
+
+	// Rewrites published new generations of seeded segments and left the
+	// replaced objects for GC.
+	snap, err := db.Snapshot()
+	require.NoError(t, err)
+	rewritten := 0
+	for _, seg := range snap.Segments {
+		if gen, ok := pod.seededGens[seg.Index]; ok && seg.Namespace == catalog.Main && seg.GenerationID != gen {
+			rewritten++
+		}
+	}
+	require.Positive(t, rewritten, "some seeded segment has a compacted generation")
+	rtx, err := db.BeginRead(ctx)
+	require.NoError(t, err)
+	states, err := rtx.ObjectStates(ctx)
+	require.NoError(t, err)
+	require.NoError(t, rtx.Close(ctx))
+	var objects int64
+	for _, n := range states {
+		objects += n
+	}
+	require.Greater(t, objects, int64(len(snap.Objects)), "the replaced objects wait for GC")
+	require.NoError(t, db.Violation())
+}
+
+// disaggSeededPod is one disaggregated pod running on a seeded steady-state
+// catalog, its writer session started.
+type disaggSeededPod struct {
+	w      *world.World
+	db     *storagefake.DB
+	seeded *SeededCatalog
+	ln     *pipeListener
+	ctx    context.Context
+	// seededGens is each sealed main segment's generation as seeded.
+	seededGens map[uint64]uint64
+}
+
+// startDisaggSeededPod seeds a steady-state catalog from a world with room
+// for liveAfter more events, and starts a pod on it. mutate, when set,
+// adjusts the pod's options.
+func startDisaggSeededPod(t *testing.T, seed uint64, liveAfter int, mutate func(*jetstreamd.Options)) *disaggSeededPod {
+	t.Helper()
+	w := newRestartWorld(t, Config{
+		Seed:              seed,
+		Accounts:          seedTestAccounts,
+		MinInitialRecords: 2,
+		MaxInitialRecords: 5,
+		LiveEventsSteady:  seedTestLive + liveAfter,
+	})
+	t.Cleanup(func() { require.NoError(t, w.Close()) })
+
+	fake := jetstreamdtest.New(storagefake.Config{
+		Invariants:  catalog.InvariantOptions{MaxEventsPerBlock: seedTestBlock},
+		OnViolation: func(rev uint64, err error) { t.Errorf("catalog invariant at revision %d: %v", rev, err) },
+	})
+	db := fake.DB
+	lease := db.NewLease()
+	require.NoError(t, lease.Acquire(t.Context(), time.Hour))
+	up, err := protocol.NewUploader(protocol.UploaderConfig{Blob: fake.Blob, ArchiveID: db.Archive().ArchiveID, GCDelay: time.Hour, OrphanAge: time.Hour})
+	require.NoError(t, err)
+	seeded, err := SeedCatalog(t.Context(), SeedCatalogConfig{
+		World:             w,
+		LiveEvents:        seedTestLive,
+		Session:           catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: lease.Epoch()}),
+		Uploader:          up,
+		MaxEventsPerBlock: seedTestBlock,
+		MaxSegmentBytes:   seedTestMaxSegment,
+	})
+	require.NoError(t, err)
+	require.NoError(t, lease.Release(t.Context()))
+	seededSnap, err := db.Snapshot()
+	require.NoError(t, err)
+	seededGens := map[uint64]uint64{}
+	for _, seg := range seededSnap.Segments {
+		if seg.Namespace == catalog.Main && seg.State == catalog.Sealed {
+			seededGens[seg.Index] = seg.GenerationID
+		}
+	}
+
+	simLn := newPipeListener()
+	simSrv := &http.Server{Handler: simhttp.NewHandlerWithOptions(w, disaggSimURL, simhttp.HandlerOptions{})}
+	go func() { _ = simSrv.Serve(simLn) }()
+	t.Cleanup(func() { _ = simSrv.Close() })
+
+	publicLn := newPipeListener()
+	sessions := make(chan uint64, 4)
+	ctx, cancel := context.WithCancel(t.Context())
+	opts := disaggPodOptions(fake.Backend, publicLn, simLn.httpClient(), testWriter{t: t})
+	opts.OnSessionStart = func(epoch uint64) { sessions <- epoch }
+	if mutate != nil {
+		mutate(&opts)
+	}
+	rt, err := jetstreamd.Build(ctx, opts)
+	if err != nil {
+		cancel()
+		require.NoError(t, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- rt.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		require.NoError(t, rt.Close(closeCtx))
+		require.NoError(t, <-done)
+	})
+
+	select {
+	case epoch := <-sessions:
+		require.Greater(t, epoch, lease.Epoch(), "the pod's session fences the seeder's")
+	case err := <-done:
+		t.Fatalf("runtime exited before its first session: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no writer session started")
+	}
+	return &disaggSeededPod{w: w, db: db, seeded: seeded, ln: publicLn, ctx: ctx, seededGens: seededGens}
 }
 
 // TestDisagg_RuntimeLifecycle is the full lifecycle of a disaggregated pod

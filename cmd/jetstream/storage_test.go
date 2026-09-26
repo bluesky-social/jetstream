@@ -82,7 +82,6 @@ func disaggregatedArgs(extra ...string) []string {
 		"--pg-url=" + secretPGURL,
 		"--s3-region=us-east-1",
 		"--s3-bucket=jetstream",
-		"--compaction-interval=0",
 	}, extra...)
 }
 
@@ -191,12 +190,8 @@ func TestServe_StorageValidation(t *testing.T) {
 		args []string
 		want string
 	}{
-		"compaction on (D5)": {
-			args: []string{"jetstream", "serve", "--storage=disaggregated", "--pg-url=" + secretPGURL, "--s3-region=r", "--s3-bucket=b"},
-			want: "JETSTREAM_COMPACTION_INTERVAL=0",
-		},
 		"unknown mode":    {args: []string{"jetstream", "serve", "--storage=cloud"}, want: "JETSTREAM_STORAGE"},
-		"missing pg url":  {args: []string{"jetstream", "serve", "--storage=disaggregated", "--compaction-interval=0"}, want: "JETSTREAM_PG_URL is required"},
+		"missing pg url":  {args: []string{"jetstream", "serve", "--storage=disaggregated"}, want: "JETSTREAM_PG_URL is required"},
 		"missing bucket":  {args: disaggregatedArgs("--s3-bucket="), want: "JETSTREAM_S3_BUCKET is required"},
 		"missing region":  {args: disaggregatedArgs("--s3-region="), want: "JETSTREAM_S3_REGION is required"},
 		"renew >= lease":  {args: disaggregatedArgs("--leader-renew-interval=3s"), want: "JETSTREAM_LEADER_RENEW_INTERVAL"},

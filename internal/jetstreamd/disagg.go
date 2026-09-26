@@ -397,6 +397,11 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 			opts.OnSteadyStateEvent(ev)
 		}
 	}
+	onCompactionPass := func(result orchestrator.CompactionPassResult) {
+		if opts.OnCompactionPass != nil {
+			opts.OnCompactionPass(CompactionPassResult{Watermark: result.Watermark, Err: result.Err})
+		}
+	}
 	rt.orchMetrics = orchestrator.NewMetrics(reg)
 	rt.leaderMetrics = leader.NewMetrics(reg)
 	rt.sessions = &sessionFactory{
@@ -446,6 +451,11 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 			FailedRepoRetryMaxDelay:    opts.FailedRepoRetryMaxDelay,
 			LiveReconnectBackoff:       opts.LiveReconnectBackoff,
 			LiveDial:                   opts.LiveDial,
+			CompactionInterval:         opts.CompactionInterval,
+			CompactionTombstoneCap:     opts.CompactionTombstoneCap,
+			CompactionRewriteWorkers:   opts.CompactionRewriteWorkers,
+			OnCompactionPass:           onCompactionPass,
+			OnBeforeCompactionPass:     opts.OnBeforeCompactionPass,
 			CrashInjector:              opts.CrashInjector,
 		},
 	}
@@ -658,10 +668,13 @@ func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog
 	}
 
 	s, err := r.sessions.buildWith(meta, &orchestrator.Disaggregated{
-		Session: sess,
-		Direct:  direct,
-		Hot:     hot,
-		Objects: d.objects,
+		Session:               sess,
+		Direct:                direct,
+		Hot:                   hot,
+		Objects:               d.objects,
+		Catalog:               d.follower,
+		Uploader:              d.uploader,
+		CompactionMemoryBytes: st.CompactionMemoryBytes,
 	})
 	if err != nil {
 		return err

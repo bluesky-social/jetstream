@@ -87,21 +87,37 @@ func TestConfig_Validate_Disaggregated(t *testing.T) {
 	}
 	cfg := valid()
 	require.NoError(t, cfg.validate())
+	compacting := func(c *Config) {
+		c.CompactionInterval = time.Minute
+		c.Disaggregated.Catalog = nopCompactionCatalog{}
+		c.Disaggregated.Uploader = nopUploader{}
+	}
+	cfg = valid()
+	compacting(&cfg)
+	require.NoError(t, cfg.validate())
 
 	for name, mutate := range map[string]func(*Config){
-		"no session":            func(c *Config) { c.Disaggregated.Session = nil },
-		"no direct":             func(c *Config) { c.Disaggregated.Direct = nil },
-		"no hot":                func(c *Config) { c.Disaggregated.Hot = nil },
-		"no objects":            func(c *Config) { c.Disaggregated.Objects = nil },
-		"compaction":            func(c *Config) { c.CompactionInterval = time.Minute },
-		"async flush":           func(c *Config) { c.BackfillAsyncFlushWorkers = 2 },
-		"local segment catalog": func(c *Config) { c.Catalog = &localcatalog.Catalog{} },
+		"no session":             func(c *Config) { c.Disaggregated.Session = nil },
+		"no direct":              func(c *Config) { c.Disaggregated.Direct = nil },
+		"no hot":                 func(c *Config) { c.Disaggregated.Hot = nil },
+		"no objects":             func(c *Config) { c.Disaggregated.Objects = nil },
+		"compaction no catalog":  func(c *Config) { compacting(c); c.Disaggregated.Catalog = nil },
+		"compaction no uploader": func(c *Config) { compacting(c); c.Disaggregated.Uploader = nil },
+		"negative memory":        func(c *Config) { c.Disaggregated.CompactionMemoryBytes = -1 },
+		"async flush":            func(c *Config) { c.BackfillAsyncFlushWorkers = 2 },
+		"local segment catalog":  func(c *Config) { c.Catalog = &localcatalog.Catalog{} },
 	} {
 		cfg := valid()
 		mutate(&cfg)
 		require.ErrorIs(t, cfg.validate(), ErrInvalidConfig, name)
 	}
 }
+
+// nopCompactionCatalog and nopUploader are for config validation only.
+type (
+	nopCompactionCatalog struct{ CompactionCatalog }
+	nopUploader          struct{ ingest.ObjectUploader }
+)
 
 // nopObjects is an objstore.Store for config validation only.
 type nopObjects struct{ objstore.Store }

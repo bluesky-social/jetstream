@@ -183,10 +183,6 @@ func (c StorageConfig) Validate(opts Options) error {
 	if opts.DataDir != "" {
 		return errors.New("serve: JETSTREAM_DATA_DIR must be unset when JETSTREAM_STORAGE=disaggregated")
 	}
-	// Plan D5: compaction is off in disaggregated mode until stage 4.
-	if opts.CompactionInterval > 0 {
-		return errors.New("serve: JETSTREAM_STORAGE=disaggregated requires JETSTREAM_COMPACTION_INTERVAL=0 (compaction is not supported in disaggregated mode yet)")
-	}
 	// An injected backend replaces the PostgreSQL and S3 these name.
 	if opts.StorageBackend == nil {
 		if c.PG.URL == "" {

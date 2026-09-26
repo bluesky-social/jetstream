@@ -28,9 +28,30 @@ type Disaggregated struct {
 	// when steady state starts; the caller releases what it opened after
 	// Run returns.
 	Hot func(ctx context.Context) (*ingest.HotConfig, error)
-	// Objects reads the bootstrap_live blocks merge drains:
-	// protocol.Reader.
+	// Objects reads the bootstrap_live blocks merge drains, and the footers
+	// and blocks compaction rewrites: protocol.Reader.
 	Objects objstore.Store
+
+	// Catalog is the follower. Compaction reads the archive through it:
+	// the view, block fetches, and each sealed segment's current
+	// generation. Required when CompactionInterval is set.
+	Catalog CompactionCatalog
+	// Uploader uploads compaction's re-encoded blocks and footers.
+	// Required when CompactionInterval is set.
+	Uploader ingest.ObjectUploader
+	// CompactionMemoryBytes bounds the decode memory that concurrent
+	// segment rewrites hold (design §12.6). Zero means unbounded.
+	CompactionMemoryBytes int64
+}
+
+// CompactionCatalog is the archive as disaggregated compaction reads it.
+// follower.Follower implements it.
+type CompactionCatalog interface {
+	catalog.Catalog
+	Fetcher() catalog.Fetcher
+	// GenerationParts returns Main's sealed segment idx's current
+	// generation, or found=false if there is none.
+	GenerationParts(ctx context.Context, idx uint64) (catalog.GenerationParts, bool, error)
 }
 
 // mergeSource is the bootstrap_live namespace as merge reads it.
@@ -246,8 +267,8 @@ func (o *Orchestrator) sealBootstrapLive(ctx context.Context) error {
 // transaction. Every step before that transaction commits on its own and is
 // safe to repeat, so a crash anywhere resumes here.
 //
-// Merge-tail compaction and its manifest reconcile are skipped: compaction
-// is off in disaggregated mode until stage 4 (D5).
+// Merge-tail compaction runs as in local mode (design §12.4). There is no
+// manifest to reconcile: followers build theirs from the catalog.
 func (o *Orchestrator) runMergeDisaggregated(ctx context.Context) error {
 	d := o.cfg.Disaggregated
 	src := catalogMergeSource{db: d.Session.DB(), objects: d.Objects}
@@ -298,6 +319,11 @@ func (o *Orchestrator) runMergeDisaggregated(ctx context.Context) error {
 	// segment.
 	if err := dst.Close(); err != nil {
 		return fmt.Errorf("orchestrator: merge: close dst: %w", err)
+	}
+	// Main's active segment stays open, so the pass compacts the sealed
+	// segments; steady state's first pass force-rotates and covers the rest.
+	if err := o.runDeleteCompaction(ctx, compactionMergeTail, nil); err != nil {
+		return fmt.Errorf("orchestrator: merge-tail compaction: %w", err)
 	}
 
 	if err := o.simulateCrash(ctx, crashpoint.AfterMergeDstSealBeforeDiscovery); err != nil {

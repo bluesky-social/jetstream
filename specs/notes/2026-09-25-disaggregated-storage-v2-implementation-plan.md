@@ -234,6 +234,11 @@ Stages 2 and 3 run with compaction off in disaggregated mode. Startup refuses
 until S4 lands. Merge skips merge-tail compaction in that mode. The layer 3
 oracle compares against the uncompacted model until S4.
 
+**Resolved (S4.2, 2026-09-26):** S4.2 lifted it. Compaction runs in
+disaggregated mode, merge-tail included, and startup no longer refuses
+`JETSTREAM_COMPACTION_INTERVAL > 0`. S4.4 moves the layer 3 oracle to the
+compacted-model checks.
+
 ### D6. The writer is split into block building and block committing
 
 `segment.Writer` currently both accumulates the pending block and writes the
@@ -1130,7 +1135,7 @@ Design §12, §13, and §26 stage 4.
     decodes to exactly the rows of `segment.Rewrite`. Every field that
     `VerifySealedMetadata` checks exactly must match.
   - A fuzz target over random tombstone sets and segments.
-- [ ] **S4.2 Compaction on the catalog** (L). Deps: S4.1, S2.10.
+- [x] **S4.2 Compaction on the catalog** (L). Deps: S4.1, S2.10.
   - The pass (§12.1): force-rotate, snapshot tombstones and W, pick segments by
     segment DID bloom with `min_seq < W`, rewrite up to
     `JETSTREAM_COMPACTION_REWRITE_WORKERS` at once, upload the new blocks and
@@ -1262,6 +1267,52 @@ mode.
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
 
+- **S4.2 (2026-09-26): Compaction on the catalog.**
+  - The catalog side landed first (`064d45c`): `Session.PublishGeneration`
+    (the source-generation check under `FOR UPDATE`, reference checks, and
+    `checkPublish`: same block count and envelope, strictly fewer events,
+    reused objects only at their own ordinals), `CompareAndSetMeta` for the
+    watermark, and the GC scripts S4.3 drives.
+  - The pass is the local compactor with a disaggregated rewriter
+    (`orchestrator/compact_disagg.go`). `orchestrator.Disaggregated` gained
+    `Catalog` (the follower, as `CompactionCatalog`), `Uploader`, and
+    `CompactionMemoryBytes`. The first two are required when
+    `CompactionInterval` is set.
+  - Deviations and details, recorded in design §10.10, §12.1, §12.4, §12.7,
+    and §18:
+    - The pass reads through the follower, refreshed after the force-rotate
+      and after every chunk that published.
+    - Segment selection is a seq prefilter (no events, or `min_seq` at or
+      above min(highest tombstone seq, chunk end), skips without a fetch);
+      `SparseRewrite` checks the segment bloom itself after fetching the
+      footer through the object cache.
+    - Upload and publish run under the pass context, not the errgroup's, so
+      a sibling worker's failure cannot cancel a catalog transaction and end
+      the session.
+    - The watermark advances by CAS, with the prior taken from the pass-start
+      load and then from each chunk. Local mode still writes it plainly.
+    - `compaction/deadline` is one value (next pass, or running pass's start,
+      or zero), committed at pass start, end, failure, and disable. A failed
+      commit ends the session.
+    - The steady compactor returns an ended session or corruption in
+      disaggregated mode. Every other pass error, and every error in local
+      mode, is logged and retried as before.
+    - Merge-tail compaction runs after merge closes its `main` writer and
+      before discovery, as in local mode, and leaves the active segment to
+      steady state.
+    - The memory budget is one `semaphore.Weighted` per chunk, shared by its
+      workers, passed as `SparseOptions.Reserve`. Zero means unbounded.
+  - New crashpoint `after-compaction-upload-before-publish`; S4.4 kills
+    there. New counters `jetstream_compaction_blocks_examined_total` and
+    `jetstream_compaction_blocks_fetched_total` feed S4.6.
+  - jetstreamd passes the compaction options to disaggregated sessions and
+    no longer refuses `JETSTREAM_COMPACTION_INTERVAL > 0` (D5 resolved).
+  - Tests: `TestDisagg_RuntimeCompaction` runs passes every 20ms under a 16KiB
+    memory budget while live traffic deletes and updates seeded records. The
+    client's read must be compacted through the watermark (`CheckCompacted`)
+    and reconstruct the world, some seeded segment must have a new
+    generation, and the replaced objects must remain for GC. It passes 20
+    runs under `-race`. Config validation covers the new fields.
 - **S4.1 (2026-09-26): Sparse rewrite.**
   - `segment.SparseRewrite(header, footer, fetch, tombstones, opts)` runs
     the §12.2 steps over one generation and returns the changed frames by

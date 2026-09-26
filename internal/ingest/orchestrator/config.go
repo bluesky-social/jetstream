@@ -218,8 +218,7 @@ type Config struct {
 
 	// Disaggregated, when set, runs the lifecycle on the shared catalog
 	// (design §10.10), and DataDir, FS, and Catalog are unused. Store must
-	// be the leader session's fenced metadata store. Compaction must be off
-	// (D5).
+	// be the leader session's fenced metadata store.
 	Disaggregated *Disaggregated
 
 	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
@@ -325,8 +324,12 @@ func (c *Config) validate() error {
 		switch {
 		case d.Session == nil || d.Direct == nil || d.Hot == nil || d.Objects == nil:
 			return fmt.Errorf("%w: Disaggregated needs Session, Direct, Hot, and Objects", ErrInvalidConfig)
-		case c.Catalog != nil || c.CompactionInterval != 0 || c.BackfillAsyncFlushWorkers != 0:
-			return fmt.Errorf("%w: Disaggregated takes neither Catalog, CompactionInterval, nor BackfillAsyncFlushWorkers", ErrInvalidConfig)
+		case c.CompactionInterval != 0 && (d.Catalog == nil || d.Uploader == nil):
+			return fmt.Errorf("%w: Disaggregated compaction needs Catalog and Uploader", ErrInvalidConfig)
+		case d.CompactionMemoryBytes < 0:
+			return fmt.Errorf("%w: Disaggregated CompactionMemoryBytes must not be negative", ErrInvalidConfig)
+		case c.Catalog != nil || c.BackfillAsyncFlushWorkers != 0:
+			return fmt.Errorf("%w: Disaggregated takes neither Catalog nor BackfillAsyncFlushWorkers", ErrInvalidConfig)
 		}
 	} else if c.DataDir == "" {
 		return fmt.Errorf("%w: DataDir is required", ErrInvalidConfig)

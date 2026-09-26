@@ -61,6 +61,8 @@ type Metrics struct {
 	CompactionBytesRewritten    prometheus.Counter
 	CompactionWatermarkSeq      prometheus.Gauge
 	CompactionWatermarkLag      prometheus.Gauge
+	CompactionBlocksExamined    prometheus.Counter
+	CompactionBlocksFetched     prometheus.Counter
 
 	// tombstones is the set the tombstone gauges read. Metrics live for the
 	// process but each writer session builds its own set.
@@ -206,6 +208,16 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Name: "watermark_lag_seconds",
 		Help: "Header-granular witnessed_at lag between the sealed segment tip and the compaction watermark.",
 	})
+	m.CompactionBlocksExamined = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
+		Name: "blocks_examined_total",
+		Help: "Blocks of the segments disaggregated compaction examined; blocks_fetched_total over this is the fraction a sparse rewrite reads.",
+	})
+	m.CompactionBlocksFetched = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
+		Name: "blocks_fetched_total",
+		Help: "Blocks disaggregated compaction's sparse rewrites fetched: candidates plus the vanished-DID check's extra reads.",
+	})
 	reg.MustRegister(
 		m.Phase,
 		m.PhaseTransitions,
@@ -231,6 +243,8 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		m.CompactionBytesRewritten,
 		m.CompactionWatermarkSeq,
 		m.CompactionWatermarkLag,
+		m.CompactionBlocksExamined,
+		m.CompactionBlocksFetched,
 	)
 	if len(tombstones) > 0 {
 		m.SetTombstones(tombstones[0])
@@ -375,4 +389,14 @@ func (m *Metrics) setCompactionWatermarkLag(seconds float64) {
 	if m != nil {
 		m.CompactionWatermarkLag.Set(seconds)
 	}
+}
+
+// addCompactionBlocks counts a disaggregated segment rewrite's blocks and
+// the blocks it fetched.
+func (m *Metrics) addCompactionBlocks(blocks, fetched int) {
+	if m == nil || blocks == 0 {
+		return
+	}
+	m.CompactionBlocksExamined.Add(float64(blocks))
+	m.CompactionBlocksFetched.Add(float64(fetched))
 }

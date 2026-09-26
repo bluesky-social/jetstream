@@ -1135,7 +1135,10 @@ As built (S3.2, S3.3; `internal/ingest/orchestrator/disagg.go`):
   segment.
 - Merge closes its `main` writer rather than sealing it, so the hot writer
   continues that segment.
-- Merge-tail compaction is skipped until stage 4 (D5).
+- Merge-tail compaction (§12.4) runs after merge closes its `main` writer. It
+  compacts `main`'s sealed segments. The still-open active segment is left
+  for steady state's first pass. There is no manifest to reconcile, because
+  followers build theirs from the catalog.
 - The final transaction is `DeleteNamespace(bootstrap_live)`. It carries the
   deletes of `live_segments/seq/next` and `merge/next_source_idx` and the phase
   write.
@@ -1382,6 +1385,38 @@ rewrite fetches only affected blocks.
    `UPDATE metadata_kv SET value = $W WHERE key = 'compaction/seq' AND value = $prior`.
    Zero rows means corruption.
 
+As built (S4.2), the pass is the local compactor with a disaggregated
+rewriter swapped in (`internal/ingest/orchestrator/compact_disagg.go`):
+
+- It reads the archive through the pod's follower. The force-rotate's seal
+  commits before it returns, and the pass refreshes the follower after it, so
+  the pass sees that seal. It refreshes again after any chunk that published,
+  so the next chunk's source generations are current.
+- `W` and the chunking are unchanged: the pass target is the tip after the
+  force-rotate, and a chunk ends where the tombstone cap is reached. Tombstones
+  are collected from the catalog's blocks, not from the live set.
+- Segment selection is a cheap prefilter plus the rewrite itself. A segment
+  with no events, or with `min_seq` at or above the lower of the highest
+  tombstone seq and the chunk end, is skipped without a footer fetch.
+  Otherwise the rewrite fetches the footer through the object cache and
+  checks the segment DID bloom itself.
+- The new blocks and footer upload, and the publish runs, under the pass's
+  context, not the worker group's. A failed catalog transaction ends the
+  session, so one worker's error must fail only the pass, not cancel a
+  sibling's transaction.
+- The watermark CAS takes its prior from the value loaded at pass start, then
+  from each chunk it wrote. Absent means the key did not exist.
+- Local mode retries every failed pass. Disaggregated mode returns an ended
+  session or corruption from the compactor, so the election loop restarts the
+  session or exits. Other errors (a fetch or decode failure, say) fail the
+  pass and it retries, as in local mode.
+- A crash after the upload and before the publish (crashpoint
+  `after-compaction-upload-before-publish`) leaves the uploads unreferenced.
+  The next pass rewrites the segment again, and GC collects the orphans.
+- `jetstream_compaction_blocks_examined_total` and
+  `jetstream_compaction_blocks_fetched_total` count the blocks of the
+  generations the rewriter read and the ones it fetched (§22.4).
+
 ### 12.2 Segment rewrite
 
 Input: one segment's current generation (header, footer from the manifest, block
@@ -1470,6 +1505,11 @@ table membership and counts, and per-block collection sets.
 
 The same code runs during merge, before `phase = steady_state`.
 
+As built (S4.2), it runs after merge closes its `main` writer and before
+merge's discovery pass, as in local mode. It covers `main`'s sealed segments.
+The active segment the hot writer continues is left for steady state's first
+pass.
+
 ### 12.5 Tombstone set on session start
 
 The tombstone set is memory only. On session start, rebuild it by reading every
@@ -1496,6 +1536,12 @@ The compaction scheduler writes its published deadline, and the "pass running
 since" value, to `metadata_kv` under `compaction/deadline`, in a fenced
 transaction. Every pod reads that key through the follower and computes
 Cache-Control exactly as today.
+
+As built (S4.2), the key holds one value, as the local schedule does: the next
+pass while idle, and the running pass's start while one runs. Zero means
+unknown (disabled, or after a failed pass). The compactor writes it at start,
+at each pass start and end, and on failure, each in its own fenced
+transaction. A failed write ends the session.
 
 ## 13. Garbage collection
 
@@ -1766,8 +1812,8 @@ Rules:
 Disaggregated mode is on when `JETSTREAM_STORAGE=disaggregated`. The default is
 `local`. In disaggregated mode `JETSTREAM_DATA_DIR` must be unset. Startup
 refuses if it is set at all (flag or env, whatever the value), so no code path
-writes to local disk by accident. It also refuses
-`JETSTREAM_COMPACTION_INTERVAL > 0` until S4.
+writes to local disk by accident. (Until S4.2 it also refused
+`JETSTREAM_COMPACTION_INTERVAL > 0`.)
 
 S3 credentials are not Jetstream settings. They come from the AWS SDK default
 chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web
