@@ -268,13 +268,15 @@ func (c *Catalog) refreshNamespace(ns catalog.Namespace) error {
 	}
 	c.mu.Unlock()
 
+	// A directory missing when listed held no segments at the sample. A
+	// writer may create it before a second look, and publishes what it
+	// writes there itself.
 	files, err := ingest.SegmentFilesFS(c.fs, dir)
 	if err != nil {
-		if _, statErr := c.fs.Stat(dir); oserror.IsNotExist(statErr) {
-			files = nil
-		} else {
+		if !oserror.IsNotExist(err) {
 			return err
 		}
+		files = nil
 	}
 
 	var (

@@ -303,6 +303,22 @@ func (f *listHookFS) List(dir string) ([]string, error) {
 	return names, err
 }
 
+// TestLocal_RefreshDirectoryCreatedDuringScan: a writer creates a
+// namespace's directory while the background refresh lists it. The listing
+// saw no directory, so the scan holds no segments, and the refresh must not
+// fail because the directory exists by the time it looks again.
+func TestLocal_RefreshDirectoryCreatedDuringScan(t *testing.T) {
+	t.Parallel()
+
+	hfs := &listHookFS{FS: vfs.NewMem()}
+	cat, err := local.New(local.Config{FS: hfs, Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
+	require.NoError(t, err)
+	hfs.hook = func() { require.NoError(t, hfs.MkdirAll(segDir, 0o755)) }
+	require.NoError(t, cat.Refresh(t.Context()))
+	require.Nil(t, hfs.hook, "the hook should have run")
+	require.Empty(t, cat.Snapshot().Segments(catalog.Main))
+}
+
 // TestLocal_RefreshKeepsSegmentsSealedDuringScan is the startup race: the
 // runtime refreshes the catalog in the background while writers already
 // publish seals, and a seal that lands after the scan listed the directory

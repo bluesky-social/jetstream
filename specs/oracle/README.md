@@ -67,3 +67,8 @@ naming the failure mode (not the test).
   and a compaction pass read a sealed block missing seqs, called it storage
   corruption, and stopped. Fixed by allowing holes inside sealed refs'
   envelopes and leaving those seqs vacant in the readable log.
+- [2026-09-26 — the startup catalog load races a writer creating its directory](2026-09-26-catalog-load-races-directory-creation.md):
+  found by `just oracle-sweep` at the Stage 4 exit. Local mode's background
+  catalog load listed `backfill/live_segments` before the session's writer
+  created it, then statted it after, and failed startup. Fixed by trusting
+  the listing's not-exist error.
