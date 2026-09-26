@@ -34,7 +34,7 @@ Prerequisite already landed: the ephemeral dev environment (`just up` /
 | 0 | Remove timestamp import (design §21) | done |
 | 1 | Storage interfaces; local mode moved onto them with no behavior change | done |
 | 2 | Steady state in disaggregated mode on fakes and real storage | done |
-| 3 | Bootstrap, merge, `storage init` | not started |
+| 3 | Bootstrap, merge, `storage init` | in progress |
 | 4 | Sparse compaction and GC | not started |
 | 5 | `storage new-identity`, memory budgets, dashboards, 24h soak | not started |
 
@@ -1043,7 +1043,7 @@ measurements are recorded.
 
 Design §10.6, §10.10, §15.1, and §26 stage 3.
 
-- [ ] **S3.1 Direct mode** (L). Deps: S2 complete.
+- [x] **S3.1 Direct mode** (L). Deps: S2 complete.
   - The block committer for direct mode: freeze the block, upload it
     concurrently (the `async_flush.go` compress workers extended to upload),
     then commit in order via `CommitBlock` with the seq-key check and
@@ -1247,6 +1247,36 @@ mode.
 
 Record deviations from the design and answers to D1-D7 here, newest first, with
 the PR that made them.
+
+- **S3.1 (2026-09-26): Direct mode.**
+  - `ingest.Config.Direct` opens the Writer in direct mode
+    (`internal/ingest/direct.go`) for `main` or `bootstrap_live`. The seq key
+    is the namespace's; the seq lease, `AsyncFlushWorkers`, and `Catalog` are
+    refused.
+  - Deviation: direct mode does not reuse the `async_flush.go` pipeline. It
+    follows the hot writer's shape instead: encode and upload goroutines
+    bounded by `UploadConcurrency`, and one committer goroutine that commits
+    in seq order. The local pipeline is tied to `segment.Writer` and the local
+    commit path.
+  - Admission is `DirectConfig.MaxPendingBlocks` (default twice the upload
+    concurrency), checked before an append adds anything.
+  - Seal: the maintainer's active-segment tracking and seal moved into
+    `maintainer.Segment` (`maintainer/segment.go`), keyed by namespace. The
+    maintainer uses it for `main` in hot mode, and the direct writer uses it
+    through `ingest.SegmentSealer`. The rotation rule runs before and after
+    each block commit.
+  - Close leaves the active segment active, so the hot writer after merge
+    continues it (design §10.10).
+  - Opening `main` in direct mode over hot batches is a corruption error.
+  - Three crash seams, for S3.5: `AfterDirectBlockCutBeforeUpload`,
+    `AfterDirectBlockUploadBeforeCommit`, and `AfterDirectBlockCommitBeforeAck`.
+  - Tests are in `maintainer/direct_test.go`, to use the real sealer:
+    - a two-session swarm per namespace, checking seqs, events, the rotation
+      rule, and hook ordering against storagefake's invariants;
+    - lost and failed block commits;
+    - the leftover full segment;
+    - refusal over hot batches;
+    - config validation.
 
 - **Stage 2 exit (2026-09-25).**
   - Checks at `36a77fd` (S2.23), all passing:

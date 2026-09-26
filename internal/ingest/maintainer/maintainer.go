@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -84,10 +83,8 @@ type Maintainer struct {
 	wake   chan struct{}
 	done   chan struct{}
 
-	// Owned by the run goroutine.
-	segment uint64
-	blocks  []catalog.SealBlock
-	framed  int64
+	// seg is main's active segment, owned by the run goroutine.
+	seg *Segment
 }
 
 var _ ingest.BlockSink = (*Maintainer)(nil)
@@ -126,53 +123,22 @@ func Open(ctx context.Context, cfg Config) (*Maintainer, error) {
 		wake:      make(chan struct{}, 1),
 		done:      make(chan struct{}),
 	}
-	if err := m.load(ctx); err != nil {
+	m.seg, err = OpenSegment(ctx, SegmentConfig{
+		Session:         cfg.Session,
+		Namespace:       catalog.Main,
+		Uploader:        cfg.Uploader,
+		Objects:         cfg.Objects,
+		Cache:           cfg.Cache,
+		MaxSegmentBytes: cfg.MaxSegmentBytes,
+		ReadConcurrency: cfg.ReadConcurrency,
+		Metrics:         cfg.Metrics,
+		Crash:           cfg.Crash,
+	})
+	if err != nil {
 		return nil, err
 	}
-	m.cfg.Metrics.setActiveBytes(m.framed)
 	go m.run()
 	return m, nil
-}
-
-// load reads main's active segment and its blocks in one snapshot.
-func (m *Maintainer) load(ctx context.Context) error {
-	rtx, err := m.cfg.Session.DB().BeginRead(ctx)
-	if err != nil {
-		return fmt.Errorf("maintainer: load active segment: %w", err)
-	}
-	defer func() { _ = rtx.Close(ctx) }()
-	segs, err := rtx.SegmentsSince(ctx, 0)
-	if err != nil {
-		return fmt.Errorf("maintainer: load active segment: %w", err)
-	}
-	found := false
-	for _, s := range segs {
-		if s.Namespace == catalog.Main && s.State == catalog.Active {
-			if found {
-				return catalog.Corruptf(catalog.SourceInvariant, "main has active segments %d and %d", m.segment, s.Index)
-			}
-			m.segment, found = s.Index, true
-		}
-	}
-	if !found {
-		return catalog.Corruptf(catalog.SourceInvariant, "main has no active segment")
-	}
-	rows, err := rtx.ActiveBlocksSince(ctx, 0)
-	if err != nil {
-		return fmt.Errorf("maintainer: load active blocks: %w", err)
-	}
-	for _, r := range rows {
-		if r.Namespace != catalog.Main || r.Segment != m.segment {
-			continue
-		}
-		if r.Ordinal != len(m.blocks) {
-			return catalog.Corruptf(catalog.SourceInvariant, "main segment %d block %d is at ordinal %d",
-				m.segment, len(m.blocks), r.Ordinal)
-		}
-		m.blocks = append(m.blocks, catalog.SealBlock{ObjectID: r.ObjectID, CompressedLength: r.CompressedLength})
-		m.framed += 8 + r.CompressedLength
-	}
-	return nil
 }
 
 // BlockClosed implements ingest.BlockSink. It queues the block and returns
@@ -319,17 +285,14 @@ func (m *Maintainer) handle(it item) error {
 		}
 		return m.rotateIfFull()
 	}
-	if it.seal && len(m.blocks) > 0 {
-		return m.seal(m.ctx)
+	if it.seal {
+		return m.seg.Seal(m.ctx)
 	}
 	return m.rotateIfFull()
 }
 
 func (m *Maintainer) rotateIfFull() error {
-	if len(m.blocks) > 0 && m.framed >= m.cfg.MaxSegmentBytes {
-		return m.seal(m.ctx)
-	}
-	return nil
+	return m.seg.RotateIfFull(m.ctx)
 }
 
 // fail stops the maintainer and ends the session if the failure did not
@@ -377,16 +340,9 @@ func (m *Maintainer) fold(ctx context.Context, b *ingest.ClosedBlock) error {
 		if err != nil {
 			return fmt.Errorf("maintainer: fold block [%d,%d]: %w", b.FirstSeq, b.LastSeq, err)
 		}
-		// The fold appended to whatever the catalog holds as active; the
-		// seal's block list is built from memory, so the two must agree.
-		if res.Segment != m.segment || res.Ordinal != len(m.blocks) {
-			return catalog.Corruptf(catalog.SourceInvariant, "fold of [%d,%d] landed at segment %d ordinal %d; maintainer expected %d/%d",
-				b.FirstSeq, b.LastSeq, res.Segment, res.Ordinal, m.segment, len(m.blocks))
+		if err := m.seg.Committed(res, refs[0], frame); err != nil {
+			return fmt.Errorf("maintainer: fold of [%d,%d]: %w", b.FirstSeq, b.LastSeq, err)
 		}
-		m.cfg.Cache.Add(refs[0].SHA256, frame)
-		m.blocks = append(m.blocks, catalog.SealBlock{ObjectID: res.ObjectID, CompressedLength: int64(len(frame))})
-		m.framed += 8 + int64(len(frame))
-		m.cfg.Metrics.setActiveBytes(m.framed)
 		if b.Folded != nil {
 			b.Folded()
 		}
@@ -419,118 +375,4 @@ func (m *Maintainer) encode(b *ingest.ClosedBlock) ([]byte, segment.BlockInfo, e
 	}
 	frame, info := m.bb.Encode()
 	return frame, info, nil
-}
-
-// seal is §10.8: build the header and footer over the active blocks, upload
-// the footer, and commit the generation.
-func (m *Maintainer) seal(ctx context.Context) error {
-	return obs.Span(ctx, func(ctx context.Context) error {
-		start := time.Now()
-		trace.SpanFromContext(ctx).SetAttributes(
-			attribute.Int64("segment", int64(m.segment)),
-			attribute.Int("blocks", len(m.blocks)))
-		src := newFrameSource(ctx, m.cfg.Objects, m.blocks, m.cfg.ReadConcurrency)
-		header, footer, h, err := segment.BuildSealed(src)
-		src.close()
-		if err != nil {
-			return fmt.Errorf("maintainer: build seal of segment %d: %w", m.segment, err)
-		}
-		if int(h.BlockCount) != len(m.blocks) {
-			return catalog.Corruptf(catalog.SourceSeal, "main segment %d footer indexes %d of %d blocks",
-				m.segment, h.BlockCount, len(m.blocks))
-		}
-		refs, err := m.cfg.Uploader.Upload(ctx, m.cfg.Session, [][]byte{footer})
-		if err != nil {
-			return fmt.Errorf("maintainer: upload footer of segment %d: %w", m.segment, err)
-		}
-		if len(refs) != 1 {
-			return fmt.Errorf("maintainer: upload footer of segment %d: got %d refs", m.segment, len(refs))
-		}
-		if err := m.crash(ctx, crashpoint.AfterSealFooterUploadBeforeCommit); err != nil {
-			return err
-		}
-		_, err = m.cfg.Session.Seal(ctx, catalog.Seal{
-			Namespace: catalog.Main,
-			Segment:   m.segment,
-			Header:    header,
-			Footer:    refs[0],
-			Blocks:    m.blocks,
-		})
-		if err != nil {
-			return fmt.Errorf("maintainer: seal segment %d: %w", m.segment, err)
-		}
-		m.cfg.Cache.Add(refs[0].SHA256, footer)
-		m.segment++
-		m.blocks = nil
-		m.framed = 0
-		m.cfg.Metrics.setActiveBytes(0)
-		m.cfg.Metrics.observeSeal(time.Since(start))
-		return nil
-	})
-}
-
-// frameSource yields the active blocks' frames in order for BuildSealed,
-// keeping up to window reads in flight ahead of it.
-type frameSource struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	objects objstore.Store
-	blocks  []catalog.SealBlock
-	window  int
-	slots   []chan fetched
-	next    int
-	started int
-	wg      sync.WaitGroup
-}
-
-type fetched struct {
-	data []byte
-	err  error
-}
-
-func newFrameSource(ctx context.Context, objects objstore.Store, blocks []catalog.SealBlock, window int) *frameSource {
-	ctx, cancel := context.WithCancel(ctx)
-	return &frameSource{
-		ctx:     ctx,
-		cancel:  cancel,
-		objects: objects,
-		blocks:  blocks,
-		window:  window,
-		slots:   make([]chan fetched, len(blocks)),
-	}
-}
-
-func (s *frameSource) NextFrame() ([]byte, error) {
-	if s.next == len(s.blocks) {
-		return nil, io.EOF
-	}
-	for s.started < len(s.blocks) && s.started < s.next+s.window {
-		i := s.started
-		s.started++
-		ch := make(chan fetched, 1)
-		s.slots[i] = ch
-		s.wg.Go(func() {
-			data, err := s.objects.Get(s.ctx, s.blocks[i].ObjectID)
-			ch <- fetched{data, err}
-		})
-	}
-	i := s.next
-	r := <-s.slots[i]
-	s.slots[i] = nil
-	s.next++
-	b := s.blocks[i]
-	if r.err != nil {
-		return nil, fmt.Errorf("maintainer: read block %d (object %d): %w", i, b.ObjectID, r.err)
-	}
-	if int64(len(r.data)) != b.CompressedLength {
-		return nil, catalog.Corruptf(catalog.SourceRead, "block %d (object %d) is %d bytes; catalog says %d",
-			i, b.ObjectID, len(r.data), b.CompressedLength)
-	}
-	return r.data, nil
-}
-
-// close cancels the reads still in flight and waits for them.
-func (s *frameSource) close() {
-	s.cancel()
-	s.wg.Wait()
 }

@@ -640,8 +640,8 @@ behind a block flush. In disaggregated mode it has two modes:
 | direct | `main` during bootstrap backfill, `bootstrap_live` during bootstrap, `main` during merge | block |
 
 The orchestrator chooses the mode when it opens a writer: `ingest.Config.Hot`
-selects hot mode, and every Writer method dispatches to it, so producers keep
-their `*Writer`. An append's class (§10.5) travels in its context
+selects hot mode and `ingest.Config.Direct` selects direct mode. Every Writer
+method dispatches to the mode, so producers keep their `*Writer`. An append's class (§10.5) travels in its context
 (`ingest.WithClass`); untagged appends are live. The seq write-ahead
 lease (`ReserveClientVisibleSeqs`, `seq/max_reserved`, `seq/gap/*`) is disabled
 in disaggregated mode, because a seq is never visible before it commits.
@@ -916,6 +916,31 @@ never visible to clients until merge finishes.
 
 The existing async-flush pipeline (`AsyncFlushWorkers`) maps onto step 2:
 compress and upload off the writer mutex, commit in order.
+
+As built (S3.1, `internal/ingest/direct.go`):
+
+- `ingest.Config.Direct` selects the mode for `Config.Namespace`. The seq key
+  is always the namespace's (`catalog.SeqKey`), and the local-only fields are
+  refused.
+- The writer does its own encode and upload, as the hot writer does, instead of
+  reusing `AsyncFlushWorkers`. Frozen blocks encode and upload concurrently, up
+  to `UploadConcurrency`. One committer goroutine commits them in seq order.
+- Admission: an append waits while `MaxPendingBlocks` blocks (default twice the
+  upload concurrency) are frozen but not committed. It waits before it appends
+  anything, so an `AppendBatch` still gets contiguous seqs.
+- The active segment is a `maintainer.Segment`, the same type the maintainer
+  seals with in hot mode. The committer is its only caller, so seals serialize
+  with block commits. The rotation rule runs after each block commit, and also
+  before it. The earlier run covers an earlier session that committed the
+  threshold-crossing block and ended before its seal.
+- Flush and DrainDurability commit a short block and do not rotate unless the
+  rule fires, as in local mode. ForceRotate and SealActiveAndClose seal the
+  active segment. Close leaves it active: the next direct writer, or the hot
+  writer after merge, continues it.
+- Session start refuses to open `main` over hot batches (a corruption error):
+  direct mode only precedes hot mode.
+- Crash seams: `AfterDirectBlockCutBeforeUpload`,
+  `AfterDirectBlockUploadBeforeCommit`, and `AfterDirectBlockCommitBeforeAck`.
 
 ### 10.7 Fold
 

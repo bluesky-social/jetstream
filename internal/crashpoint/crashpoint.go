@@ -117,6 +117,19 @@ const (
 	// AfterSealFooterUploadBeforeCommit fires after a seal's footer is
 	// uploaded but before the seal transaction.
 	AfterSealFooterUploadBeforeCommit Point = "after-seal-footer-upload-before-commit"
+
+	// AfterDirectBlockCutBeforeUpload fires after a direct-mode block is
+	// frozen and encoded but before its upload starts.
+	AfterDirectBlockCutBeforeUpload Point = "after-direct-block-cut-before-upload"
+
+	// AfterDirectBlockUploadBeforeCommit fires after a direct-mode block's
+	// object is uploaded but before its block transaction.
+	AfterDirectBlockUploadBeforeCommit Point = "after-direct-block-upload-before-commit"
+
+	// AfterDirectBlockCommitBeforeAck fires after a direct-mode block
+	// commits, with its metadata batch, but before the writer releases the
+	// block's acks and durable-batch callbacks.
+	AfterDirectBlockCommitBeforeAck Point = "after-direct-block-commit-before-ack"
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -142,6 +155,9 @@ var AllPoints = []Point{
 	AfterHotBatchCommitBeforeAck,
 	AfterFoldUploadBeforeCommit,
 	AfterSealFooterUploadBeforeCommit,
+	AfterDirectBlockCutBeforeUpload,
+	AfterDirectBlockUploadBeforeCommit,
+	AfterDirectBlockCommitBeforeAck,
 }
 
 var knownPoints = func() map[Point]struct{} {

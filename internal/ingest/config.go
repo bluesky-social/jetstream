@@ -159,9 +159,19 @@ type Config struct {
 	// a local segment file. SegmentsDir, FS, Store, MaxSegmentBytes,
 	// AsyncFlushWorkers, and Catalog are unused, and the seq lease is off.
 	Hot *HotConfig
+
+	// Direct, if non-nil, opens the writer in disaggregated direct mode
+	// (design §10.6): full blocks commit to the catalog's active segment in
+	// Namespace, as bootstrap and merge write. The same local-only fields
+	// as Hot's are unused, SeqKey is the namespace's, and the seq lease is
+	// off. Hot and Direct are exclusive.
+	Direct *DirectConfig
 }
 
 func (c *Config) validate() error {
+	if c.Direct != nil {
+		return c.validateDirect()
+	}
 	if c.Hot != nil {
 		return c.validateHot()
 	}
