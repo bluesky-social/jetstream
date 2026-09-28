@@ -73,24 +73,20 @@ just up && just test-storage
 just test-storage -run TestReaderRole  # arguments pass through to go test
 ```
 
-To point `serve` at `just up`, select disaggregated storage and pass the connection settings in the environment. The PostgreSQL URL and the S3 keys are secrets, so they never go in `.env`. Jetstream reads the S3 keys from the standard AWS SDK chain, not from a `JETSTREAM_` variable. Disaggregated mode keeps nothing on local disk, so `JETSTREAM_DATA_DIR` must be unset. `.env` sets it, so run the binary directly rather than through `just run`. The pod refuses to start without `GOMEMLIMIT`, and its memory budgets must fit in 75% of it. Compaction must also be off (`JETSTREAM_COMPACTION_INTERVAL=0`) until it supports disaggregated mode.
+To run against the production network on disaggregated storage, set `JETSTREAM_STORAGE=disaggregated` for `just run-prod`. The recipe points jetstream at the `just up` services with their dev credentials, unsets `JETSTREAM_DATA_DIR` (disaggregated mode keeps nothing on local disk), and sets `GOMEMLIMIT=8GiB`, which disaggregated mode requires. The `just up` stores live in 4GB tmpfs mounts, so it also caps the backfill at 5,000 repos unless you pass `--max-backfill-repos` or `--backfill-repos` yourself. Any of these can be overridden from the environment, e.g. `JETSTREAM_S3_ENDPOINT=http://127.0.0.1:19000` for MinIO. For real deployments, the PostgreSQL URL and the S3 keys are secrets, so they never go in `.env`. Jetstream reads the S3 keys from the standard AWS SDK chain, not from a `JETSTREAM_` variable.
 
 A new database needs `jetstream storage init` once first. It probes the bucket, applies the schema, and creates the archive. It refuses a database that already holds one, so after `just down && just up` run it again:
 
 ```sh
-go build -o bin/jetstream ./cmd/jetstream
-export JETSTREAM_PG_URL='postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable' \
-  JETSTREAM_S3_ENDPOINT=http://127.0.0.1:18333 JETSTREAM_S3_PATH_STYLE=true \
-  JETSTREAM_S3_REGION=us-east-1 JETSTREAM_S3_BUCKET=jetstream \
-  AWS_ACCESS_KEY_ID=jetstream AWS_SECRET_ACCESS_KEY=jetstream-dev-secret
-./bin/jetstream storage init
-env -u JETSTREAM_DATA_DIR \
-  JETSTREAM_STORAGE=disaggregated GOMEMLIMIT=8GiB \
-  JETSTREAM_COMPACTION_INTERVAL=0 \
-  ./bin/jetstream serve
+export JETSTREAM_STORAGE=disaggregated
+just run-prod storage init
+just run-prod serve
+
+# a second pod waits as a follower and takes over if the leader dies
+JETSTREAM_ADDR=:8081 JETSTREAM_DEBUG_ADDR=:6061 just run-prod serve
 ```
 
-For MinIO, use `JETSTREAM_S3_ENDPOINT=http://127.0.0.1:19000`. `jetstream serve --help` lists every storage setting under "Disaggregated storage".
+`jetstream serve --help` lists every storage setting under "Disaggregated storage".
 
 To fully reset your local environment (warning: destructive action!):
 

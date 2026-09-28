@@ -182,19 +182,58 @@ run *ARGS:
 run-race *ARGS:
     go run -race ./cmd/jetstream {{ARGS}}
 
-# Run jetstream against real production services.
-run-prod *ARGS:
-    JETSTREAM_RELAY_URL=https://bsky.network \
-    JETSTREAM_PLC_URL=https://plc.directory \
-    JETSTREAM_DATA_DIR=./data-prod \
-    go run ./cmd/jetstream {{ARGS}}
+# Run jetstream against real production services. Arguments are the
+# subcommand and its flags, e.g. `just run-prod serve`. Storage is local
+# (./data-prod) unless JETSTREAM_STORAGE=disaggregated is set, which targets
+# the `just up` services; see _run-prod.
+run-prod *ARGS: (_run-prod "" ARGS)
 
 # Run jetstream against real production services with the race detector enabled.
-run-prod-race *ARGS:
-    JETSTREAM_RELAY_URL=https://bsky.network \
-    JETSTREAM_PLC_URL=https://plc.directory \
-    JETSTREAM_DATA_DIR=./data-prod \
-    go run -race ./cmd/jetstream {{ARGS}}
+run-prod-race *ARGS: (_run-prod "-race" ARGS)
+
+# Shared body of run-prod and run-prod-race. In disaggregated mode, `just up`
+# must be running and `JETSTREAM_STORAGE=disaggregated just run-prod storage
+# init` must have run once since the last `just down`. Every connection
+# setting defaults to the dev services in compose.yaml and can be overridden
+# from the environment, e.g. JETSTREAM_S3_ENDPOINT=http://127.0.0.1:19000 for
+# MinIO.
+[private]
+_run-prod GOFLAGS *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export JETSTREAM_RELAY_URL=https://bsky.network
+    export JETSTREAM_PLC_URL=https://plc.directory
+    case "${JETSTREAM_STORAGE:-local}" in
+    local)
+        export JETSTREAM_DATA_DIR=./data-prod
+        ;;
+    disaggregated)
+        # .env sets it, and disaggregated mode refuses any data dir.
+        unset JETSTREAM_DATA_DIR
+        # Dev credentials from compose.yaml, never real secrets.
+        export JETSTREAM_PG_URL="${JETSTREAM_PG_URL:-postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable}"
+        export JETSTREAM_S3_ENDPOINT="${JETSTREAM_S3_ENDPOINT:-http://127.0.0.1:18333}"
+        export JETSTREAM_S3_PATH_STYLE="${JETSTREAM_S3_PATH_STYLE:-true}"
+        export JETSTREAM_S3_REGION="${JETSTREAM_S3_REGION:-us-east-1}"
+        export JETSTREAM_S3_BUCKET="${JETSTREAM_S3_BUCKET:-jetstream}"
+        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-jetstream}"
+        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-jetstream-dev-secret}"
+        # Disaggregated mode refuses to start without it (design §17).
+        export GOMEMLIMIT="${GOMEMLIMIT:-8GiB}"
+        # The `just up` stores live in 4GB tmpfs mounts, far short of a
+        # full-network backfill, so cap it unless a backfill limit is
+        # already given. The flags check matters because --backfill-repos
+        # cannot be combined with a cap.
+        if [[ -z "${JETSTREAM_MAX_BACKFILL_REPOS:-}${JETSTREAM_BACKFILL_REPOS:-}" && " {{ARGS}} " != *"backfill-repos"* ]]; then
+            export JETSTREAM_MAX_BACKFILL_REPOS=5000
+        fi
+        ;;
+    *)
+        echo "run-prod: JETSTREAM_STORAGE must be local or disaggregated, got ${JETSTREAM_STORAGE}" >&2
+        exit 1
+        ;;
+    esac
+    exec go run {{GOFLAGS}} ./cmd/jetstream {{ARGS}}
 
 # Run the websocket load-test client against a running jetstream server.
 run-client *ARGS:
