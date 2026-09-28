@@ -2,6 +2,7 @@ package status
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -650,9 +651,24 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		pdb PebbleStats
 	)
 
-	if opts.Manifest != nil {
-		if err := opts.Manifest.Wait(ctx); err != nil {
-			return nil, err
+	// A disaggregated archive loads its manifest on the first steady-state
+	// catalog tick (design §11.3), so during bootstrap and merge waiting on
+	// it would never return. The archive view holds every segment then.
+	fast := opts.Manifest != nil
+	archiveReady := true
+	if opts.ArchiveReady != nil {
+		if err := opts.ArchiveReady(ctx); errors.Is(err, lifecycle.ErrBootstrapInProgress) {
+			opts.Manifest = nil
+		} else if err != nil {
+			archiveReady = false
+		}
+	}
+
+	if fast {
+		if opts.Manifest != nil {
+			if err := opts.Manifest.Wait(ctx); err != nil {
+				return nil, err
+			}
 		}
 		bf, err = collectBackfillFast(opts.Store)
 		if err != nil {
@@ -669,7 +685,7 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 			return nil, err
 		}
 	}
-	if opts.ArchiveReady != nil {
+	if !archiveReady {
 		if err := opts.ArchiveReady(ctx); err != nil {
 			return nil, err
 		}

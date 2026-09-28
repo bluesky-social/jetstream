@@ -1,7 +1,10 @@
 package status_test
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -9,6 +12,8 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/segment"
@@ -114,4 +119,29 @@ func TestCollect_NoArchiveOrDataDir(t *testing.T) {
 	require.Equal(t, "main", snap.SegmentAggregate.Trees[0].Dir)
 	require.Equal(t, "bootstrap_live", snap.SegmentAggregate.Trees[1].Dir)
 	require.Zero(t, snap.SegmentAggregate.Network.Segments)
+}
+
+// TestCollect_BootstrapSkipsUnloadedManifest pins the fix for a
+// disaggregated /status that never loaded during bootstrap: the remote
+// manifest loads on the first steady-state catalog tick, so a snapshot
+// taken before then must not wait on it.
+func TestCollect_BootstrapSkipsUnloadedManifest(t *testing.T) {
+	t.Parallel()
+	st, err := pebblestore.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	mft, err := manifest.NewRemote(manifest.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+
+	c, err := status.New(status.Options{
+		Store:        st,
+		Manifest:     mft,
+		ArchiveReady: func(context.Context) error { return lifecycle.ErrBootstrapInProgress },
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	snap, err := c.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, snap.SegmentAggregate.Trees, 2)
 }
