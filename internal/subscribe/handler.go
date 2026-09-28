@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -621,6 +624,14 @@ func runSubscriberLoop(
 	// row. Log the first on each connection; the counter has the rest.
 	encodeErrLogged := false
 
+	writeFailed := func(err error) {
+		if reason := writeFailureReason(ctx, err); reason == "" {
+			deps.Metrics.incCleanDisconnects()
+		} else {
+			deps.Metrics.incDisconnect(reason)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -631,6 +642,11 @@ func runSubscriberLoop(
 			perr := conn.Ping(pingCtx)
 			pcancel()
 			if perr != nil {
+				if writeFailureReason(ctx, perr) == "" {
+					deps.Metrics.incCleanDisconnects()
+				} else {
+					deps.Metrics.incDisconnect(disconnectPingFailed)
+				}
 				return
 			}
 		default:
@@ -650,6 +666,7 @@ func runSubscriberLoop(
 				continue // idle at tip: loop to send a keepalive ping
 			}
 			if errors.Is(err, errColdUnavailable) {
+				deps.Metrics.incDisconnect(disconnectStoreUnavailable)
 				sendError("InternalError", "archive replay unavailable; reconnect")
 				return
 			}
@@ -657,9 +674,11 @@ func runSubscriberLoop(
 				// An object store outage hits every cold reader at once;
 				// the S3 metrics already count it, so do not log per
 				// connection.
+				deps.Metrics.incDisconnect(disconnectStoreUnavailable)
 				sendError("InternalError", "archive storage unavailable; reconnect later")
 				return
 			}
+			deps.Metrics.incDisconnect(disconnectReadError)
 			logger.Warn("read error", "err", err)
 			sendError("InternalError", "stream read failed; reconnect")
 			return
@@ -674,6 +693,7 @@ func runSubscriberLoop(
 		if next <= cursor {
 			logger.Error("tail ReadFrom returned non-advancing cursor",
 				"cursor", cursor, "next", next, "batch", len(batch))
+			deps.Metrics.incDisconnect(disconnectStalledCursor)
 			sendError("InternalError", "stream read failed; reconnect")
 			return
 		}
@@ -756,6 +776,7 @@ func runSubscriberLoop(
 			werr := conn.Write(writeCtx, msgType, payload)
 			wcancel()
 			if werr != nil {
+				writeFailed(werr)
 				return
 			}
 
@@ -773,11 +794,32 @@ func runSubscriberLoop(
 		}
 		if slowDetector.observe(cursor, lag) {
 			deps.Metrics.incAdversarialDrops()
+			deps.Metrics.incDisconnect(disconnectConsumerTooSlow)
 			logger.Warn("dropped adversarially slow subscriber", "cursor", cursor, "lag", lag)
 			sendError("ConsumerTooSlow",
 				fmt.Sprintf("reading below the floor rate %d events behind the tip; reconnect with cursor=%d", lag, cursor))
 			return
 		}
+	}
+}
+
+// writeFailureReason returns the disconnects_total reason for a failed frame
+// write, or "" when the client went away. The reader cancels ctx on a client
+// close, but a client that closes and drops its socket can reset the
+// connection before the reader sees the close, so the write fails first with
+// ECONNRESET or EPIPE and ctx is still live.
+func writeFailureReason(ctx context.Context, err error) string {
+	switch {
+	case ctx.Err() != nil,
+		errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.EPIPE),
+		errors.Is(err, net.ErrClosed),
+		errors.Is(err, io.EOF):
+		return ""
+	case errors.Is(err, context.DeadlineExceeded):
+		return disconnectWriteTimeout
+	default:
+		return disconnectWriteError
 	}
 }
 

@@ -14,6 +14,7 @@ const (
 type Metrics struct {
 	Subscribers         *prometheus.GaugeVec
 	CleanDisconnects    prometheus.Counter
+	Disconnects         *prometheus.CounterVec
 	EventsSent          *prometheus.CounterVec
 	EventsSkippedSync   prometheus.Counter
 	EventsSkippedResync prometheus.Counter
@@ -65,6 +66,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "clean_disconnects_total",
 			Help: "Number of /subscribe connections closed by the client or normal shutdown.",
 		}),
+		Disconnects: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "disconnects_total",
+			Help: "Number of streaming /subscribe connections the server ended, by reason: write_timeout (a frame did not drain within the write timeout), write_error, ping_failed, consumer_too_slow, store_unavailable, read_error, stalled_cursor. Client closes and shutdown are clean_disconnects_total.",
+		}, []string{"reason"}),
 		EventsSent: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "events_sent_total",
@@ -163,7 +169,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"outcome"}),
 	}
 	reg.MustRegister(
-		m.Subscribers, m.CleanDisconnects,
+		m.Subscribers, m.CleanDisconnects, m.Disconnects,
 		m.EventsSent, m.BytesSent, m.BytesEncoded,
 		m.EventsSkippedSync, m.EventsSkippedResync, m.EncodeErrors,
 		m.EventsFiltered, m.EventsOversize,
@@ -173,7 +179,34 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.GapJumps, m.GapValuesSkipped,
 		m.SubprotocolNegotiations,
 	)
+	for _, r := range disconnectReasons {
+		m.Disconnects.WithLabelValues(r)
+	}
 	return m
+}
+
+// Reasons for incDisconnect, pinned so callers can't drift the label
+// cardinality.
+const (
+	disconnectWriteTimeout     = "write_timeout"
+	disconnectWriteError       = "write_error"
+	disconnectPingFailed       = "ping_failed"
+	disconnectConsumerTooSlow  = "consumer_too_slow"
+	disconnectStoreUnavailable = "store_unavailable"
+	disconnectReadError        = "read_error"
+	disconnectStalledCursor    = "stalled_cursor"
+)
+
+var disconnectReasons = []string{
+	disconnectWriteTimeout, disconnectWriteError, disconnectPingFailed,
+	disconnectConsumerTooSlow, disconnectStoreUnavailable, disconnectReadError,
+	disconnectStalledCursor,
+}
+
+func (m *Metrics) incDisconnect(reason string) {
+	if m != nil {
+		m.Disconnects.WithLabelValues(reason).Inc()
+	}
 }
 
 func (m *Metrics) incSubprotocolNegotiation(outcome string) {

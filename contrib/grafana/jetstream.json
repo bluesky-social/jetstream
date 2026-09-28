@@ -3339,6 +3339,17 @@
           "refId": "E",
           "range": true,
           "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason) (rate(jetstream_subscribe_disconnects_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "disconnect {{reason}}/s",
+          "refId": "F",
+          "range": true,
+          "instant": false
         }
       ]
     },
