@@ -416,7 +416,9 @@ func unfoldedCapWithSink(t *testing.T) {
 		synctest.Wait()
 		require.Equal(t, uint64(9), w.NextSeq(), "over the cap nothing is admitted")
 		cancel()
-		require.ErrorIs(t, <-canceled, context.Canceled)
+		err := <-canceled
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, ErrAppendCancelled)
 
 		blocks, _ := sink.snapshot()
 		require.Len(t, blocks, 2)

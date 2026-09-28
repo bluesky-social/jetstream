@@ -8,10 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/storagefake"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -515,4 +518,55 @@ func TestSplitRecordPath(t *testing.T) {
 		_, _, reason := splitRecordPath(tc.in)
 		require.Equal(t, tc.reason, reason, "input %q", tc.in)
 	}
+}
+
+// unfoldingSink never folds a closed block, so a hot writer stops admitting
+// appends once MaxUnfoldedEvents events have committed.
+type unfoldingSink struct{}
+
+func (unfoldingSink) BlockClosed(ingest.ClosedBlock) {}
+func (unfoldingSink) Rotate(context.Context) error   { return nil }
+
+// TestSegmentHandler_CancelledAppendIsNoWriterError pins the fix for a
+// disaggregated serve that died when the MaxRepos cap cancelled repos
+// blocked on writer backpressure: an append that stops waiting for room
+// because its repo's ctx ended abandons the repo without reporting a
+// writer failure, which would end the whole backfill run.
+func TestSegmentHandler_CancelledAppendIsNoWriterError(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		db := storagefake.New(storagefake.Config{})
+		lock := db.NewLease()
+		require.NoError(t, lock.Acquire(t.Context(), time.Hour))
+		s := catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: lock.Epoch()})
+		_, err := s.InitNamespace(t.Context(), catalog.Main, nil)
+		require.NoError(t, err)
+		w, err := ingest.Open(ingest.Config{
+			Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MaxEventsPerBlock: 4,
+			Hot:               &ingest.HotConfig{Session: s, Sink: unfoldingSink{}, MaxUnfoldedEvents: 4},
+		})
+		require.NoError(t, err)
+
+		h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		var writerErr error
+		h.onWriterError = func(err error) { writerErr = err }
+
+		r, commit := buildMultiRecordRepo(t, "did:plc:fill", "app.bsky.feed.post", 8)
+		require.NoError(t, h.HandleRepo(t.Context(), "did:plc:fill", r, commit))
+		require.NoError(t, w.Flush(t.Context()))
+
+		r, commit = buildSingleRecordRepo(t, "did:plc:capped", "app.bsky.feed.post", "a", map[string]any{"text": "a"})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- h.HandleRepo(ctx, "did:plc:capped", r, commit) }()
+		synctest.Wait() // blocked over the unfolded cap
+		cancel()
+		err = <-done
+		require.ErrorIs(t, err, ingest.ErrAppendCancelled)
+		require.NoError(t, writerErr, "a cancelled wait must not abort the writer")
+		require.Equal(t, uint64(9), w.NextSeq(), "the cancelled repo appended nothing")
+		require.NoError(t, w.Close())
+		require.NoError(t, s.Err())
+	})
 }

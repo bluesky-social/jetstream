@@ -597,7 +597,7 @@ func (d *directWriter) waitLocked(ctx context.Context) error {
 	select {
 	case <-ch:
 	case <-ctx.Done():
-		err = ctx.Err()
+		err = fmt.Errorf("%w: %w", ErrAppendCancelled, ctx.Err())
 	}
 	d.mu.Lock()
 	d.waiters--

@@ -366,6 +366,60 @@ func TestDirect_DrainHoldsAppends(t *testing.T) {
 	require.Len(t, e.directState(catalog.Main).events(), 2)
 }
 
+// An append cancelled while it waits for room under MaxPendingBlocks
+// returns ErrAppendCancelled and leaves the writer and session usable: the
+// backfill cap cancels repos mid-wait, and that must not end the leader
+// session.
+func TestDirect_CancelledWaitKeepsWriter(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	rng := rand.New(rand.NewPCG(11, 11))
+	blockHeld := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var held atomic.Bool
+	var failures atomic.Int32
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{
+		OnDurableBatch: func(context.Context, metastore.Batch, uint64, bool, any) (func(), func(error), error) {
+			if held.CompareAndSwap(false, true) {
+				close(blockHeld)
+				<-release
+			}
+			return nil, nil, nil
+		},
+	}, ingest.DirectConfig{
+		UploadConcurrency: 1,
+		MaxPendingBlocks:  1,
+		OnFailure:         func(error) { failures.Add(1) },
+	})
+
+	evs := testEvents(rng, 2*blockEvents)
+	require.NoError(t, w.AppendBatch(t.Context(), evs[:blockEvents]))
+	<-blockHeld // the full block is pending, so the next append waits
+
+	ctx, cancel := context.WithCancel(t.Context())
+	appended := make(chan error, 1)
+	go func() { appended <- w.AppendBatch(ctx, evs[blockEvents:]) }()
+	select {
+	case err := <-appended:
+		t.Fatalf("append finished with no room (err=%v)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	err := <-appended
+	require.ErrorIs(t, err, ingest.ErrAppendCancelled)
+	require.ErrorIs(t, err, context.Canceled)
+
+	unblock()
+	require.NoError(t, w.AppendBatch(t.Context(), evs[blockEvents:]))
+	require.NoError(t, w.Close())
+	require.NoError(t, e.s.Err(), "the session survives")
+	require.Zero(t, failures.Load())
+	require.Len(t, e.directState(catalog.Main).events(), 2*blockEvents)
+}
+
 // A failed block commit ends the writer and the session. The next session
 // resumes at the committed seq key; a lost commit's block counts.
 func TestDirect_CommitFailure(t *testing.T) {

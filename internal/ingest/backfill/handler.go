@@ -131,6 +131,14 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 			}
 			if err := h.writer.AppendBatch(ctx, batch); err != nil {
 				err = fmt.Errorf("backfill: did=%s append batch: %w", did, err)
+				// A disaggregated writer waits for room under ctx, so a
+				// cancelled repo (shutdown, the MaxRepos cap) can end an
+				// append without harming the writer. Like the walk's own
+				// ctx check, that abandons the repo but is no writer
+				// failure.
+				if errors.Is(err, ingest.ErrAppendCancelled) {
+					return err
+				}
 				h.abortOnWriterError(err)
 				return err
 			}
