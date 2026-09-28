@@ -3,6 +3,7 @@ package jetstreamd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -11,6 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/leader"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
 )
 
@@ -59,4 +61,24 @@ func TestSessionStore_ReadFailureEndsSession(t *testing.T) {
 		require.ErrorIs(t, sess.Err(), catalog.ErrSessionEnded, name)
 		require.False(t, leader.DefaultFatal(sessionError(errors.New("fallout"), sess)), name)
 	}
+}
+
+// An object store that stayed unreachable past its retry budget restarts the
+// session instead of exiting the process (design §16), unless the error is
+// also corruption. This is the S3 outage from the disaggregated test-bed
+// findings, where a compaction rebuild's failed GET was fatal.
+func TestSessionError_ObjectStoreUnavailableRestarts(t *testing.T) {
+	t.Parallel()
+	sess := catalog.NewSession(catalog.SessionConfig{DB: storagefake.New(storagefake.Config{}), Epoch: 1})
+	outage := fmt.Errorf("orchestrator: compaction: rebuild: s3: get %q: %w: gave up after 3 attempts", "k", objstore.ErrUnavailable)
+
+	err := sessionError(outage, sess)
+	require.ErrorIs(t, err, objstore.ErrUnavailable)
+	require.ErrorIs(t, err, leader.ErrRestartSession)
+	require.False(t, leader.DefaultFatal(err))
+
+	require.True(t, leader.DefaultFatal(sessionError(errors.New("some other failure"), sess)))
+
+	corrupt := &catalog.CorruptionError{Source: catalog.SourceRead, Err: outage}
+	require.True(t, leader.DefaultFatal(sessionError(corrupt, sess)), "corruption stays fatal")
 }

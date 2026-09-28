@@ -766,6 +766,9 @@ func sessionError(err error, sess *catalog.Session) error {
 	if serr := sess.Err(); serr != nil {
 		return serr
 	}
+	if errors.Is(err, objstore.ErrUnavailable) && !errors.Is(err, leader.ErrRestartSession) {
+		return fmt.Errorf("%w: %w", leader.ErrRestartSession, err)
+	}
 	return err
 }
 

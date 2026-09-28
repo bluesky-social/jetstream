@@ -190,6 +190,7 @@ func TestRetryTimeout(t *testing.T) {
 		start := time.Now()
 		err := b.PutKey(t.Context(), "k", []byte("x"))
 		require.ErrorContains(t, err, "gave up after")
+		require.ErrorIs(t, err, objstore.ErrUnavailable, "an exhausted retry budget restarts a leader session and is a 503 to readers")
 		elapsed := time.Since(start)
 		require.LessOrEqual(t, elapsed, 30*time.Second)
 		require.Greater(t, elapsed, 25*time.Second, "backoff is capped, so attempts continue until near the deadline")
@@ -211,6 +212,7 @@ func TestAttemptTimeoutBoundedByRetryTimeout(t *testing.T) {
 		_, err := b.GetKey(t.Context(), "k")
 		require.Error(t, err)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.ErrorIs(t, err, objstore.ErrUnavailable)
 		require.LessOrEqual(t, time.Since(start), 5*time.Second)
 		require.GreaterOrEqual(t, ft.Faults[0].Fired(), int64(2))
 	})
@@ -244,6 +246,7 @@ func TestFinalErrorsNotRetried(t *testing.T) {
 			_, err := b.GetKey(t.Context(), "missing")
 			require.Error(t, err)
 			require.Equal(t, c.notFound, errors.Is(err, objstore.ErrNotFound), "%v", err)
+			require.NotErrorIs(t, err, objstore.ErrUnavailable, "a final answer is not an outage")
 			total := 0.0
 			for _, r := range []string{"ok", "not_found", "error", "timeout", "canceled", "invalid_range"} {
 				total += requests(cfg.Metrics, "get", r)
@@ -317,6 +320,7 @@ func TestCanceledDuringBackoff(t *testing.T) {
 		defer cancel()
 		err := b.PutKey(ctx, "k", []byte("x"))
 		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NotErrorIs(t, err, objstore.ErrUnavailable, "the caller gave up, not the store")
 	})
 }
 

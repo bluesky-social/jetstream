@@ -317,8 +317,8 @@ func call[T any](ctx context.Context, b *Blob, sem chan struct{}, op, key string
 		}
 		wait := b.backoff(attempt)
 		if time.Now().Add(wait).After(deadline) {
-			return zero, finish(ctx, span, attempt, fmt.Errorf("s3: %s %q: gave up after %d attempts in %v: %w",
-				op, fullKey, attempt, time.Since(start).Round(time.Millisecond), err))
+			return zero, finish(ctx, span, attempt, fmt.Errorf("s3: %s %q: %w: gave up after %d attempts in %v: %w",
+				op, fullKey, objstore.ErrUnavailable, attempt, time.Since(start).Round(time.Millisecond), err))
 		}
 		t := time.NewTimer(wait)
 		select {

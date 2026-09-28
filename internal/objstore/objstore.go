@@ -33,6 +33,13 @@ var (
 	// with the new reference (design §7.5 step 2). If its reference still
 	// names the object, that is corruption at the caller's level.
 	ErrGone = errors.New("objstore: object no longer available")
+
+	// ErrUnavailable means the store could not answer within its retry
+	// budget: network errors, timeouts, 5xx, or throttling outlasted every
+	// attempt. It says nothing about the object, so it is never corruption.
+	// A leader session that sees it restarts instead of exiting, and a
+	// serving path answers 503 (design §16).
+	ErrUnavailable = errors.New("objstore: store unavailable")
 )
 
 // Blob is raw, unverified key/value transport for immutable objects.
