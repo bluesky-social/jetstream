@@ -224,6 +224,9 @@ witnessed_at at cutover):
   drive an archive sweep.
 - A time resume that the server clamps (`#info OutdatedCursor`) surfaces as
   the recoverable `ErrCursorClamped`: the caller may have a gap.
+- A seq resume beyond the server's next seq (`#info FutureCursor`) is only
+  logged. The server starts at the live tip, and the client's dedup drops
+  every event at or below `lastSeq` until the tip passes it.
 
 Failover by time is approximate: instances witness the same event at
 slightly different times, so the rewind must cover the skew between them.

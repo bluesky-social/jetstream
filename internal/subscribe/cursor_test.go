@@ -171,6 +171,7 @@ func TestResolveCursor_ZeroSeqFloorsToOne(t *testing.T) {
 	require.Equal(t, uint64(1), p.StartSeq,
 		"seq 0 is a sentinel; replay must floor to the first real event (seq 1)")
 	require.True(t, p.Clamped, "flooring 0 up to 1 is a clamp")
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "seq 0 holds no event, so nothing is skipped")
 }
 
 // TestResolveCursor_TimestampEmptyArchiveFloorsToOne is the timestamp-path
@@ -192,6 +193,7 @@ func TestResolveCursor_TimestampEmptyArchiveFloorsToOne(t *testing.T) {
 	require.Equal(t, uint64(1), p.StartSeq,
 		"a timestamp cursor on an empty archive must floor to seq 1, not the seq-0 sentinel")
 	require.True(t, p.Clamped)
+	require.Equal(t, subscribe.NoticeNone, p.Notice)
 }
 
 func TestResolveCursor_TimestampEmptyArchiveClampsAcrossInitialGap(t *testing.T) {
@@ -206,6 +208,7 @@ func TestResolveCursor_TimestampEmptyArchiveClampsAcrossInitialGap(t *testing.T)
 	require.Equal(t, uint64(5), p.StartSeq)
 	require.True(t, p.Clamped)
 	require.Equal(t, "gap", p.ClampReason)
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "a registered gap holds no events")
 }
 
 func TestResolveCursor_NonNumericRejected(t *testing.T) {
@@ -226,6 +229,18 @@ func TestResolveCursor_FutureSeqDropsToLive(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 	require.True(t, p.Clamped, "Clamped is informational here; future-cursor is a special clamp case")
+	require.Equal(t, subscribe.NoticeFutureSeq, p.Notice)
+}
+
+// TestResolveCursor_NextSeqCursorIsNotFuture: a cursor equal to NextSeq is a
+// client resuming just after the newest event, the ordinary reconnect, so it
+// must not be announced as a future cursor.
+func TestResolveCursor_NextSeqCursorIsNotFuture(t *testing.T) {
+	t.Parallel()
+	p, err := subscribe.ResolveCursor("1000", subscribe.CursorEnv{NextSeq: 1000})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeLive, p.Mode)
+	require.Equal(t, subscribe.NoticeNone, p.Notice)
 }
 
 // TestResolveCursor_ZeroNextSeqDropsToLive pins the CursorEnv.NextSeq contract:
@@ -257,6 +272,7 @@ func TestResolveCursor_ZeroNextSeqDropsToLive(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 	require.True(t, p.Clamped, "future-cursor drop-to-live is reported as a clamp")
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "an unstarted writer cannot say the cursor is ahead")
 }
 
 func TestResolveCursor_FutureTimestampDropsToLive(t *testing.T) {
@@ -357,6 +373,7 @@ func TestResolveCursor_SeqGapEndingAtFloorIsNotTooOld(t *testing.T) {
 	require.Equal(t, uint64(200), p.StartSeq)
 	require.True(t, p.Clamped)
 	require.Equal(t, "gap", p.ClampReason)
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "a registered gap holds no events")
 }
 
 func TestResolveCursor_SeqGapEndingBelowFloorIsTooOld(t *testing.T) {
@@ -437,6 +454,7 @@ func TestResolveCursor_TimeUSBelowFloorClampsEvenWhenRejectBelowFloor(t *testing
 	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
 	require.True(t, p.Clamped)
 	require.Equal(t, uint64(100), p.StartSeq)
+	require.Equal(t, subscribe.NoticeBeforeArchive, p.Notice)
 }
 
 func TestResolveCursor_SeqAboveFloorPreserved(t *testing.T) {
@@ -643,6 +661,7 @@ func TestResolveCursor_TimeUSTranslationLandingInGapClampsToEnd(t *testing.T) {
 	require.Equal(t, uint64(200), p.StartSeq)
 	require.True(t, p.Clamped)
 	require.Equal(t, "gap", p.ClampReason)
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "a registered gap holds no events")
 }
 
 func TestResolveCursor_TimeUSOlderThanAllSegmentsClampsToFloor(t *testing.T) {
@@ -667,6 +686,36 @@ func TestResolveCursor_TimeUSOlderThanAllSegmentsClampsToFloor(t *testing.T) {
 	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
 	require.True(t, p.Clamped)
 	require.Equal(t, uint64(100), p.StartSeq, "clamped to oldest sealed segment's MinSeq")
+	require.Equal(t, subscribe.NoticeBeforeArchive, p.Notice)
+}
+
+// TestResolveCursor_TimeUSBelowLookbackFloorNotice: a timestamp that lands in
+// a retained segment older than the lookback window is moved up to the floor,
+// skipping retained events, which the notice must say.
+func TestResolveCursor_TimeUSBelowLookbackFloorNotice(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	hoursAgo := func(h int) int64 { return now - int64(time.Duration(h)*time.Hour/time.Microsecond) }
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 1, maxSeq: 99,
+		minWitnessedAt: hoursAgo(72), maxWitnessedAt: hoursAgo(60),
+		eventCount: 10,
+	})
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 100, maxSeq: 199,
+		minWitnessedAt: hoursAgo(10), maxWitnessedAt: hoursAgo(5),
+		eventCount: 10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(hoursAgo(65), 10), subscribe.CursorEnv{
+		Manifest: m, NextSeq: 200, Lookback: 36 * time.Hour,
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.Equal(t, uint64(100), p.StartSeq)
+	require.Equal(t, subscribe.NoticeBelowRetention, p.Notice)
 }
 
 func TestResolveCursor_TimeUSAtThresholdExactly(t *testing.T) {

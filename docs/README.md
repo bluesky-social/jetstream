@@ -646,7 +646,7 @@ Timestamp cursors translate against `witnessed_at`. Sealed history uses the segm
 Cursor lookback is bounded to the most recent 36 hours by default (matching jetstream v1), tunable via `--cursor-lookback`. The two endpoints handle a too-old cursor differently, on purpose:
 
 - `/subscribe` (v1) clamps a below-floor cursor **silently** and starts at the oldest event in the window, preserving wire parity with jetstream-legacy (real legacy consumers depend on this; a v1 `/subscribe` never rejects an old cursor). The clamp is made operator-visible via a distinct metric label.
-- The v2 endpoint **rejects** a below-floor seq cursor with a pre-upgrade HTTP 400 whose XRPC error envelope names `CursorTooOld` and carries the floor seq in the message, rather than silently dropping the `(cursor, floor]` gap. This is what lets a backfilling client detect a slow handoff and re-backfill from its last seq (Section 2.1). The v2 timestamp-cursor path still clamps (legacy timestamp translation), and announces the clamp in-band: the first frame is an `#info OutdatedCursor` message naming the seq actually resumed from.
+- The v2 endpoint **rejects** a below-floor seq cursor with a pre-upgrade HTTP 400 whose XRPC error envelope names `CursorTooOld` and carries the floor seq in the message, rather than silently dropping the `(cursor, floor]` gap. This is what lets a backfilling client detect a slow handoff and re-backfill from its last seq (Section 2.1). The v2 timestamp-cursor path still clamps (legacy timestamp translation), and announces the clamp in-band: the first frame is an `#info OutdatedCursor` message naming the seq actually resumed from. A clamp that only skips registered gaps loses nothing and sends no notice. A seq cursor beyond the next seq to be assigned (typically one from another archive) starts at the live tip after an `#info FutureCursor` message.
 
 Cursors in the future drop into live-tip mode (no replay) on both endpoints.
 
@@ -679,7 +679,7 @@ The message union has five variants:
 
 - `#commit` — a record mutation. `record` is its [atproto JSON data-model](https://atproto.com/specs/data-model) value and is absent on deletes. Per [DRISL](https://dasl.ing/drisl.html), consumers can encode this value as canonical DAG-CBOR for CID verification, MST reconstruction, or typed decoding; the stream does not duplicate it as base64 CBOR.
 - `#identity`, `#account`, `#sync` — wrap the upstream `com.atproto.sync.subscribeRepos` events verbatim (the wrapped event's `seq` and `time` are the upstream relay's, distinct from jetstream's envelope fields). `#sync` is never emitted on the legacy v1 wire.
-- `#info` — a seq-less advisory (`OutdatedCursor` after a clamped timestamp-cursor resume).
+- `#info` — a seq-less advisory (`OutdatedCursor` after a clamped timestamp-cursor resume, `FutureCursor` after a seq cursor beyond the tip).
 
 > TODO: `prevRev` on all events (Fig suggestion) — carried over from the pre-lexicon draft; would be an additive lexicon change.
 

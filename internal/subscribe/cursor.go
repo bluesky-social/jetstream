@@ -68,7 +68,30 @@ type CursorPlan struct {
 	// ClampReason distinguishes lossless registered-gap clamps from legacy
 	// floor/future/sentinel clamps for observability.
 	ClampReason string
+
+	// Notice says why the stream may not start where the client asked, for
+	// the v2 #info frame. It is NoticeNone when the start is exact, or moved
+	// only past seqs no event holds (seq 0, registered gaps).
+	Notice CursorNotice
 }
+
+// CursorNotice classifies a cursor the stream cannot honor exactly.
+type CursorNotice int
+
+const (
+	NoticeNone CursorNotice = iota
+	// NoticeBelowRetention: a timestamp cursor older than the lookback
+	// floor; events between it and the floor are not replayed.
+	NoticeBelowRetention
+	// NoticeBeforeArchive: a timestamp cursor older than the oldest
+	// archived event. Nothing retained is skipped, but the archive cannot
+	// say whether it once held older events.
+	NoticeBeforeArchive
+	// NoticeFutureSeq: a seq cursor beyond the next seq the writer will
+	// assign, such as one from another archive. The stream starts at the
+	// live tip, below the cursor.
+	NoticeFutureSeq
+)
 
 // CursorEnv bundles the runtime dependencies the resolver consults.
 // Each field is independently optional so tests can drive narrow
@@ -175,7 +198,13 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 		// future", so it also drops to live rather than falling through to
 		// seq replay or the RejectBelowFloor too-old rejection.
 		if env.NextSeq == 0 || uint64(n) >= env.NextSeq {
-			return CursorPlan{Mode: ModeLive, Requested: n, Clamped: true}, nil
+			live := CursorPlan{Mode: ModeLive, Requested: n, Clamped: true}
+			// A cursor at NextSeq is a client resuming after the last event;
+			// only one past it names seqs this archive has never assigned.
+			if env.NextSeq > 0 && uint64(n) > env.NextSeq {
+				live.Notice = NoticeFutureSeq
+			}
+			return live, nil
 		}
 		startSeq := uint64(n)
 		// Seq 0 is the pure "nothing yet" sentinel (design §R8): it is never
@@ -241,6 +270,7 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 	plan.StartSeq = startSeq
 	if clamped {
 		plan.Clamped = true
+		plan.Notice = NoticeBeforeArchive
 	}
 	// Floor the replay start to seq 1 before gap normalization: seq 0 is the
 	// pure "nothing yet" sentinel and is never allocated. Translation returns
@@ -270,6 +300,7 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 		if plan.StartSeq < floorSeq {
 			plan.StartSeq = floorSeq
 			plan.Clamped = true
+			plan.Notice = NoticeBelowRetention
 		}
 	}
 	if end, ok := env.Gaps.EndContaining(plan.StartSeq); ok {

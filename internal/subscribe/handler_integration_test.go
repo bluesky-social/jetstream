@@ -246,6 +246,48 @@ func TestHandler_V2ClampedTimestampCursorEmitsOutdatedCursorInfo(t *testing.T) {
 		"the info message names the seq actually resumed from")
 }
 
+// TestHandler_V2FutureSeqCursorEmitsFutureCursorInfo: a seq cursor past the
+// next seq (say, one saved from another archive) starts at the live tip,
+// below the cursor. The client dedups events at or below its cursor, so
+// without the notice it would silently drop events until the tip passed it.
+// A cursor equal to the next seq is an ordinary reconnect and gets no notice.
+func TestHandler_V2FutureSeqCursorEmitsFutureCursorInfo(t *testing.T) {
+	t.Parallel()
+	srv := newCursorReplaySubscription(t, 200, 299, true)
+	dial := func(ctx context.Context, cursor string) *websocket.Conn {
+		conn, dialResp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/?cursor="+cursor, nil)
+		require.NoError(t, err)
+		if dialResp != nil && dialResp.Body != nil {
+			_ = dialResp.Body.Close()
+		}
+		t.Cleanup(func() { _ = conn.CloseNow() })
+		return conn
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, frame, err := dial(ctx, "5000").Read(ctx)
+	require.NoError(t, err)
+	var envelope struct {
+		Payload struct {
+			Type    string `json:"$type"`
+			Name    string `json:"name"`
+			Message string `json:"message"`
+		} `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(frame, &envelope))
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#info", envelope.Payload.Type)
+	require.Equal(t, "FutureCursor", envelope.Payload.Name)
+	require.Contains(t, envelope.Payload.Message, "5000")
+	require.Contains(t, envelope.Payload.Message, "live tip")
+
+	// Nothing is written after the tip, so any frame here is a spurious notice.
+	quiet, cancelQuiet := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancelQuiet()
+	_, frame, err = dial(ctx, "300").Read(quiet)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "unexpected frame %s", frame)
+}
+
 // TestHandler_V1TooOldCursorClampsAndUpgrades pins v1 parity: with the reject
 // flag unset, the same below-floor cursor is silently clamped to the floor and
 // the connection upgrades to a websocket (no 400), matching legacy jetstream.

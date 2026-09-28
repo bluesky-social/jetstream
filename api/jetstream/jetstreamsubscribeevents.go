@@ -1289,7 +1289,7 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalJSONAt(data []byte, pos int
 
 // JetstreamSubscribeEvents_Info is a "info" in the network.bsky.jetstream.subscribeEvents schema.
 //
-// An advisory, non-fatal notice about the stream (mirrors com.atproto.sync.subscribeRepos#info). Carries no seq and does not advance the cursor. OutdatedCursor is sent as the first frame when a unix-microseconds timestamp cursor below the retention floor was clamped up to the floor; the message names the seq actually resumed from.
+// An advisory, non-fatal notice about the stream (mirrors com.atproto.sync.subscribeRepos#info). Carries no seq and does not advance the cursor. Cursor notices are sent as the first frame. OutdatedCursor: a unix-microseconds timestamp cursor below the retention floor or the oldest archived event was clamped up to it, so events may have been missed; the message names the seq actually resumed from. FutureCursor: a seq cursor beyond the next seq to be assigned (for example one from another archive) started at the live tip, below the cursor.
 type JetstreamSubscribeEvents_Info struct {
 	LexiconTypeID string            `json:"$type,omitempty"`
 	Message       gt.Option[string] `json:"message,omitzero"`

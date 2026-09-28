@@ -79,7 +79,8 @@ type Subscription struct {
 	// subprotocol, kinds/dids/collections filters, XRPC errors, and
 	// server-push only. It emits sync and resync replacement rows,
 	// rejects below-floor seqs with CursorTooOld, and announces timestamp
-	// clamping with OutdatedCursor. These policies must stay together.
+	// clamping with OutdatedCursor and future seq cursors with
+	// FutureCursor. These policies must stay together.
 	// False preserves the legacy /subscribe contract. See doc.go.
 	V2 bool
 }
@@ -486,16 +487,12 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		startSeq = deps.Tail.Tip()
 	}
 
-	// A clamped v2 timestamp cursor starts at the retention floor, not
-	// where the client asked; say so in-band before the first event
-	// (subscribeRepos's OutdatedCursor precedent) instead of silently
-	// clamping. Seq-mode below-floor was already rejected pre-upgrade,
-	// and a future cursor clamping to the live tip is the defined
-	// semantics of "start at tip", not a degradation — Mode filters both
-	// out here.
-	if deps.V2 && cursorPlan.Clamped && cursorPlan.Mode == ModeReplayTimeUS {
-		info, ierr := EncodeV2Info("OutdatedCursor",
-			fmt.Sprintf("requested timestamp cursor below retention floor; starting at seq %d", startSeq))
+	// A v2 stream that cannot start where the client asked says so in-band
+	// before the first event (subscribeRepos's OutdatedCursor precedent)
+	// instead of moving the cursor silently. Seq-mode below-floor was
+	// already rejected pre-upgrade.
+	if name, msg := cursorNoticeInfo(cursorPlan, startSeq); deps.V2 && name != "" {
+		info, ierr := EncodeV2Info(name, msg)
 		if ierr != nil {
 			logger.Error("encode info frame", "err", ierr)
 		} else if !writeFrame(ctx, conn, wantZstd, info) {
@@ -508,6 +505,21 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		timeFloorUS = cursorPlan.Requested
 	}
 	runSubscriberLoop(ctx, conn, deps, loadFilter, startSeq, timeFloorUS, scheme, logger)
+}
+
+// cursorNoticeInfo returns the #info name and message for plan's notice, or
+// "" for none. A replay notice names the seq actually resumed from; a live
+// start has none until the first event arrives.
+func cursorNoticeInfo(plan CursorPlan, startSeq uint64) (name, message string) {
+	switch plan.Notice {
+	case NoticeBelowRetention:
+		return "OutdatedCursor", fmt.Sprintf("requested timestamp cursor below retention floor; starting at seq %d", startSeq)
+	case NoticeBeforeArchive:
+		return "OutdatedCursor", fmt.Sprintf("requested timestamp cursor precedes the oldest archived event; starting at seq %d", startSeq)
+	case NoticeFutureSeq:
+		return "FutureCursor", fmt.Sprintf("requested seq cursor %d is beyond this archive's next seq; starting at the live tip", plan.Requested)
+	}
+	return "", ""
 }
 
 // writeFrame writes one already-encoded v2 frame, compressing it for

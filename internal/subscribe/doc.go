@@ -83,7 +83,10 @@
 //   - V2 rejects a below-floor seq with HTTP 400 CursorTooOld and the floor
 //     seq, allowing clients to backfill the missing range.
 //   - Both endpoints clamp timestamp cursors. V2 first sends an info
-//     OutdatedCursor naming the resumed seq.
+//     OutdatedCursor naming the resumed seq, unless the clamp only skipped
+//     registered gaps, which hold no events.
+//   - Both endpoints start a seq cursor at or beyond the next seq at the live
+//     tip. V2 first sends an info FutureCursor when the cursor is past it.
 //   - Timestamp resolution uses sealed indexes or the active writer's block
 //     bounds, then suppresses rows before the exact witnessed_at boundary in
 //     the one candidate block. It does not replay from the active segment's
