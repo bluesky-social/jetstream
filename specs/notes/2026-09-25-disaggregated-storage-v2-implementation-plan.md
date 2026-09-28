@@ -1152,8 +1152,9 @@ Design §12, §13, and §26 stage 4.
     - mark, in pages of 10,000;
     - claim up to 1,000 plus the in-transaction re-check, where a hit is
       corruption;
-    - delete outside the transaction, where "not found" (404 or 403) is
-      success;
+    - delete outside the transaction, where a missing key is success and a
+      403 is a failed delete (a DELETE's 403 is a denial, not a missing key;
+      design §13);
     - forget;
     - a `deleting` rows resume path.
   - This is backend-neutral code over `catalog.Tx` (D1).

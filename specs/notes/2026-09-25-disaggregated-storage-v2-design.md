@@ -1644,7 +1644,7 @@ over the catalog's `GCMark`, `GCClaim`, and `GCForget` scripts, each one fenced
   exactly the batch it left.
 - Deletes run concurrently, bounded by `JETSTREAM_S3_UPLOAD_CONCURRENCY`.
   `Blob.DeleteKey` already treats a missing key as success. A 403 is not
-  treated as "not found": the plan's "404 or 403" rule would forget a row
+  treated as "not found": a "404 or 403" rule would forget a row
   whose key a misconfigured credential could not delete, leaking the object
   silently. A failed delete fails the run but not the session; its batch stays
   `deleting`, `jetstream_gc_delete_failures_total` counts it, and the next run
