@@ -405,6 +405,8 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		ReadBatch:   opts.SubscribeReadBatch,
 		SlowWindow:  opts.SubscribeSlowWindow,
 		SlowMinRate: opts.SubscribeSlowMinRate,
+
+		ColdEventsPerSec: opts.SubscribeColdEventsPerSec,
 	}, coldRd.Read, f.NextSeq)
 	if err != nil {
 		return fail(fmt.Errorf("serve: build subscribe tail: %w", err))

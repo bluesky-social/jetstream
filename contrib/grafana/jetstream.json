@@ -3451,7 +3451,7 @@
       "id": 37,
       "type": "timeseries",
       "title": "Hot vs cold reads",
-      "description": "ReadFrom calls served from the in-memory readable log vs falling through to the cold disk reader.",
+      "description": "ReadFrom calls served from the in-memory readable log vs falling through to the cold disk reader, and how many subscribers are on average waiting on the shared cold replay budget (JETSTREAM_SUBSCRIBE_COLD_EVENTS_PER_SEC).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3578,6 +3578,17 @@
           "expr": "sum(rate(jetstream_subscribe_cold_reads_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "cold (disk)/s",
           "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(jetstream_subscribe_cold_throttle_seconds_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "subscribers waiting on cold budget",
+          "refId": "C",
           "range": true,
           "instant": false
         }

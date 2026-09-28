@@ -321,6 +321,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		ReadBatch:   opts.SubscribeReadBatch,
 		SlowWindow:  opts.SubscribeSlowWindow,
 		SlowMinRate: opts.SubscribeSlowMinRate,
+
+		ColdEventsPerSec: opts.SubscribeColdEventsPerSec,
 	}, coldRd.Read, slot.nextSeq)
 	if err != nil {
 		return fail(fmt.Errorf("serve: build subscribe tail: %w", err))

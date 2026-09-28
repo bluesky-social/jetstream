@@ -139,6 +139,7 @@ type Options struct {
 	SubscribeReadBatch             int
 	SubscribeSlowWindow            time.Duration
 	SubscribeSlowMinRate           float64
+	SubscribeColdEventsPerSec      float64
 	CursorBlockIndexCacheSize      int
 	CompactionInterval             time.Duration
 	CompactionTombstoneCap         int

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 )
@@ -49,6 +52,7 @@ type Tail struct {
 	metrics   *Metrics
 	readBatch int
 	slowCfg   slowConfig
+	coldLimit *rate.Limiter // nil = unlimited
 
 	// connMu guards the graceful-close registry below. It is distinct
 	// from mu: mu guards read-log source publication; the conn registry tracks
@@ -80,6 +84,12 @@ func New(cfg Config, cold coldReader, nextSeq func() uint64) (*Tail, error) {
 		window:       cfg.SlowWindow,
 		lagThreshold: cfg.SlowLagThreshold,
 		minRate:      cfg.SlowMinRate,
+	}
+	if cfg.ColdEventsPerSec > 0 {
+		// A burst of one second, and at least one batch, lets a pod with
+		// no replay load serve a short replay at full speed.
+		burst := max(int(cfg.ColdEventsPerSec), cfg.ReadBatch)
+		t.coldLimit = rate.NewLimiter(rate.Limit(cfg.ColdEventsPerSec), burst)
 	}
 	t.conns = make(map[uint64]func())
 	return t, nil
@@ -145,8 +155,7 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 					return out, next, nil
 				}
 				if !atTip && cursor < log.FloorSeq() {
-					t.metrics.incColdReads()
-					return t.cold(ctx, cursor, max)
+					return t.readCold(ctx, cursor, max)
 				}
 				select {
 				case t.blocked <- cursor:
@@ -166,8 +175,7 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 			}
 		}
 		if nextSeq != nil && cursor < nextSeq() {
-			t.metrics.incColdReads()
-			return t.cold(ctx, cursor, max)
+			return t.readCold(ctx, cursor, max)
 		}
 
 		select {
@@ -180,6 +188,33 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 		case <-notify:
 		}
 	}
+}
+
+// readCold serves a cold batch, then charges it to the process's cold
+// budget. It pays after reading because the batch size is only known then;
+// the wait delays this subscriber's next read, and the budget reserves in
+// arrival order, so concurrent replays slow down evenly instead of one
+// monopolizing it. A cancelled wait still returns the batch: the tokens are
+// spent, and the caller sees ctx on its next write or read.
+func (t *Tail) readCold(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
+	t.metrics.incColdReads()
+	batch, next, err := t.cold(ctx, cursor, max)
+	if err != nil || t.coldLimit == nil || len(batch) == 0 {
+		return batch, next, err
+	}
+	// ReserveN fails only for n above the burst, which New sizes to at least
+	// one batch; a cold reader returning more than max is not charged.
+	r := t.coldLimit.ReserveN(time.Now(), len(batch))
+	if d := r.Delay(); r.OK() && d > 0 {
+		t.metrics.addColdThrottle(d)
+		timer := time.NewTimer(d)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+		}
+	}
+	return batch, next, nil
 }
 
 // Tip returns the live-edge seq where a no-cursor (live) subscriber starts: it

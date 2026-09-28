@@ -1,6 +1,10 @@
 package subscribe
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 const (
 	metricsNamespace = "jetstream"
@@ -40,6 +44,7 @@ type Metrics struct {
 	// Pull-fanout series (2026-05-31):
 	HotReads         prometheus.Counter
 	ColdReads        prometheus.Counter
+	ColdThrottle     prometheus.Counter
 	AdversarialDrops prometheus.Counter
 	GapJumps         prometheus.Counter
 	GapValuesSkipped prometheus.Counter
@@ -147,6 +152,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "cold_reads_total",
 			Help: "Number of ReadFrom calls that fell through to the cold (disk) reader.",
 		}),
+		ColdThrottle: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "cold_throttle_seconds_total",
+			Help: "Time subscribers spent waiting on the per-process cold read budget (JETSTREAM_SUBSCRIBE_COLD_EVENTS_PER_SEC).",
+		}),
 		AdversarialDrops: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "adversarial_drops_total",
@@ -175,7 +185,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.EventsFiltered, m.EventsOversize,
 		m.OptionsUpdates, m.OptionsUpdateErrors,
 		m.CursorRequests, m.CursorResolveSeconds,
-		m.HotReads, m.ColdReads, m.AdversarialDrops,
+		m.HotReads, m.ColdReads, m.ColdThrottle, m.AdversarialDrops,
 		m.GapJumps, m.GapValuesSkipped,
 		m.SubprotocolNegotiations,
 	)
@@ -320,6 +330,12 @@ func (m *Metrics) incColdReads() {
 		return
 	}
 	m.ColdReads.Inc()
+}
+func (m *Metrics) addColdThrottle(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.ColdThrottle.Add(d.Seconds())
 }
 func (m *Metrics) incAdversarialDrops() {
 	if m == nil {

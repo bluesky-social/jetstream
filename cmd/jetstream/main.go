@@ -376,6 +376,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE"),
 				Value:   5,
 			},
+			&cli.FloatFlag{
+				Name:    "subscribe-cold-events-per-sec",
+				Usage:   "Events/sec this process serves from cold (archive) reads, summed over all subscribers, so replays cannot starve the live tail. 0 disables the limit.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_COLD_EVENTS_PER_SEC"),
+				Value:   200_000,
+			},
 			&cli.IntFlag{
 				Name:    "cursor-block-index-cache-size",
 				Usage:   "Deprecated compatibility no-op: sealed segment metadata is always resident in the manifest.",
@@ -703,6 +709,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		SubscribeReadBatch:             cmd.Int("subscribe-read-batch"),
 		SubscribeSlowWindow:            cmd.Duration("subscribe-slow-window"),
 		SubscribeSlowMinRate:           cmd.Float("subscribe-slow-min-rate"),
+		SubscribeColdEventsPerSec:      cmd.Float("subscribe-cold-events-per-sec"),
 		CursorBlockIndexCacheSize:      cmd.Int("cursor-block-index-cache-size"),
 		CompactionInterval:             cmd.Duration("compaction-interval"),
 		CompactionTombstoneCap:         cmd.Int("compaction-tombstone-cap"),
