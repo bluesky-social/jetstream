@@ -739,6 +739,14 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				continue
 			}
 
+			// A resync replaces a whole repo: its rows go through bulk
+			// admission, as backfill does, so a large repo cannot stall
+			// the live tail (design §10.5).
+			appendCtx := ctx
+			if evt.Resync != streaming.ResyncNone {
+				appendCtx = ingest.WithClass(ctx, ingest.ClassBulk)
+			}
+
 			// The last row that will be appended carries the promotion.
 			lastKept := -1
 			for i := range segEvts {
@@ -775,7 +783,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				if i == lastKept {
 					c.promoteAt.Store(&promoteMark{row: &segEvts[i], group: segEvts})
 				}
-				err := c.writer.Append(ctx, &segEvts[i])
+				err := c.writer.Append(appendCtx, &segEvts[i])
 				if i == lastKept {
 					c.promoteAt.Store(nil)
 				}

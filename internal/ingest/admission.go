@@ -33,19 +33,20 @@ import (
 // they wait on may have moved: a commit, a fold, a live append finishing, a
 // failure, or Close.
 
-// appendBulk appends events as bulk chunks: at most BulkChunkMaxEvents, and
-// never past the open block.
-func (h *hotWriter) appendBulk(ctx context.Context, events []segment.Event) (err error) {
+// appendBulk appends n events as bulk chunks: at most BulkChunkMaxEvents,
+// and never past the open block. It takes the events through at, as
+// appendLive does, so OnAppend sees the caller's pointers.
+func (h *hotWriter) appendBulk(ctx context.Context, n int, at func(int) *segment.Event) (err error) {
 	h.mu.Lock()
 	defer h.endIfFailed(&err)
 	defer h.mu.Unlock()
-	for len(events) > 0 {
-		n, err := h.admitLocked(ctx, ClassBulk, events)
+	for off := 0; off < n; {
+		chunk, err := h.admitLocked(ctx, ClassBulk, n-off, func(i int) *segment.Event { return at(off + i) })
 		if err != nil {
 			return err
 		}
-		for i := range events[:n] {
-			if err = h.appendLocked(ClassBulk, &events[i]); err != nil {
+		for i := range chunk {
+			if err = h.appendLocked(ClassBulk, at(off+i)); err != nil {
 				break
 			}
 		}
@@ -53,25 +54,25 @@ func (h *hotWriter) appendBulk(ctx context.Context, events []segment.Event) (err
 		if err != nil {
 			return err
 		}
-		events = events[n:]
+		off += chunk
 	}
 	return nil
 }
 
 // admitLocked waits, releasing mu while it does, until an append of class
 // may proceed. For a bulk append it returns the size of the next chunk of
-// events and holds that chunk's permits in bulkCredit.
-func (h *hotWriter) admitLocked(ctx context.Context, class Class, events []segment.Event) (int, error) {
+// of the n events at offers and holds that chunk's permits in bulkCredit.
+func (h *hotWriter) admitLocked(ctx context.Context, class Class, n int, at func(int) *segment.Event) (int, error) {
 	var start time.Time
 	for {
 		if err := h.usableLocked(); err != nil {
 			h.cfg.Metrics.incAppendErrors()
 			return 0, err
 		}
-		var n int
+		var chunk int
 		var raw int64
 		if class == ClassBulk {
-			n, raw = h.bulkChunkLocked(events)
+			chunk, raw = h.bulkChunkLocked(n, at)
 		}
 		if h.admissibleLocked(class, raw) {
 			if class == ClassBulk {
@@ -83,7 +84,7 @@ func (h *hotWriter) admitLocked(ctx context.Context, class Class, events []segme
 				waited = time.Since(start)
 			}
 			h.cfg.Metrics.observeAdmissionWait(class, waited)
-			return n, nil
+			return chunk, nil
 		}
 		if start.IsZero() {
 			start = time.Now()
@@ -115,7 +116,7 @@ func (h *hotWriter) admissibleLocked(class Class, raw int64) bool {
 
 // bulkChunkLocked sizes the next bulk chunk so that it fits the open bulk
 // batch and the open block, and returns its raw bytes.
-func (h *hotWriter) bulkChunkLocked(events []segment.Event) (int, int64) {
+func (h *hotWriter) bulkChunkLocked(avail int, at func(int) *segment.Event) (int, int64) {
 	room := h.hot.BulkChunkMaxEvents
 	if b := h.batch; b != nil && b.class == ClassBulk {
 		room -= b.n
@@ -124,10 +125,10 @@ func (h *hotWriter) bulkChunkLocked(events []segment.Event) (int, int64) {
 	if h.block != nil {
 		blockRoom -= len(h.block.events)
 	}
-	n := min(len(events), room, blockRoom)
+	n := min(avail, room, blockRoom)
 	var raw int64
-	for i := range events[:n] {
-		raw += rawEventBytes(&events[i])
+	for i := range n {
+		raw += rawEventBytes(at(i))
 	}
 	return n, raw
 }

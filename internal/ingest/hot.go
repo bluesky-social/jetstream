@@ -535,20 +535,19 @@ func rawEventBytes(ev *segment.Event) int64 {
 }
 
 func (h *hotWriter) append(ctx context.Context, ev *segment.Event) error {
+	at := func(int) *segment.Event { return ev }
 	if ClassOf(ctx) == ClassBulk {
-		evs := []segment.Event{*ev}
-		err := h.appendBulk(ctx, evs)
-		ev.Seq, ev.WitnessedAt = evs[0].Seq, evs[0].WitnessedAt
-		return err
+		return h.appendBulk(ctx, 1, at)
 	}
-	return h.appendLive(ctx, 1, func(int) *segment.Event { return ev })
+	return h.appendLive(ctx, 1, at)
 }
 
 func (h *hotWriter) appendBatch(ctx context.Context, events []segment.Event) error {
+	at := func(i int) *segment.Event { return &events[i] }
 	if ClassOf(ctx) == ClassBulk {
-		return h.appendBulk(ctx, events)
+		return h.appendBulk(ctx, len(events), at)
 	}
-	return h.appendLive(ctx, len(events), func(i int) *segment.Event { return &events[i] })
+	return h.appendLive(ctx, len(events), at)
 }
 
 // appendLive appends n events, admitting each one: a single admission for
@@ -563,7 +562,7 @@ func (h *hotWriter) appendLive(ctx context.Context, n int, at func(int) *segment
 	// A bulk appender may be yielding to this one.
 	defer h.signalLocked()
 	for i := range n {
-		if _, err := h.admitLocked(ctx, ClassLive, nil); err != nil {
+		if _, err := h.admitLocked(ctx, ClassLive, 0, nil); err != nil {
 			return err
 		}
 		if err := h.appendLocked(ClassLive, at(i)); err != nil {
