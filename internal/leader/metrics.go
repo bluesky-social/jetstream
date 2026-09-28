@@ -23,6 +23,7 @@ type Metrics struct {
 	SessionsTotal  *prometheus.CounterVec
 	LeaseLostTotal prometheus.Counter
 	AcquireErrors  prometheus.Counter
+	SlowAcquires   prometheus.Counter
 	RenewErrors    prometheus.Counter
 	ReleaseErrors  prometheus.Counter
 	FenceFailures  prometheus.Counter
@@ -55,6 +56,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"result"}),
 		LeaseLostTotal: counter("lease_lost_total", "Sessions cancelled because the lease was lost."),
 		AcquireErrors:  counter("acquire_errors_total", "Acquire attempts that failed for a reason other than the lock being held."),
+		SlowAcquires:   counter("slow_acquires_total", "Acquires that took at least half the lease and were confirmed by a renew before the session started."),
 		RenewErrors:    counter("renew_errors_total", "Renew attempts that failed for a reason other than losing the lock."),
 		ReleaseErrors:  counter("release_errors_total", "Best-effort releases that failed."),
 		FenceFailures:  counter("fence_failures_total", "Leader write transactions rejected by the epoch fence."),
@@ -63,7 +65,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.SessionsTotal.WithLabelValues(r)
 	}
 	reg.MustRegister(m.IsLeader, m.Epoch, m.SessionStarts, m.SessionsTotal,
-		m.LeaseLostTotal, m.AcquireErrors, m.RenewErrors, m.ReleaseErrors, m.FenceFailures)
+		m.LeaseLostTotal, m.AcquireErrors, m.SlowAcquires, m.RenewErrors, m.ReleaseErrors, m.FenceFailures)
 	return m
 }
 
@@ -93,6 +95,12 @@ func (m *Metrics) leaseLost() {
 func (m *Metrics) acquireError() {
 	if m != nil {
 		m.AcquireErrors.Inc()
+	}
+}
+
+func (m *Metrics) slowAcquire() {
+	if m != nil {
+		m.SlowAcquires.Inc()
 	}
 }
 

@@ -430,6 +430,102 @@ func TestRun_AcquireRetriesUntilHeld(t *testing.T) {
 	})
 }
 
+// A store that stalls commits an Acquire long after the call started. The
+// session must not lose a lease it still holds on its first renew
+// (specs/notes/2026-09-28-disaggregated-testbed-findings.md finding 6).
+func TestRun_SlowAcquireKeepsLease(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := bubbleCtx(t)
+		defer cancel()
+		lk := &fakeLocker{
+			acquire: func(int) error {
+				time.Sleep(5 * time.Second)
+				return nil
+			},
+			// A renew past the local deadline fails, as a real call would.
+			renew: func(ctx context.Context, _ int) error { return ctx.Err() },
+		}
+		reg := prometheus.NewRegistry()
+		m := NewMetrics(reg)
+		rec := newRecorder(nil, 1)
+		go func() {
+			time.Sleep(time.Minute)
+			cancel()
+		}()
+		require.NoError(t, Run(ctx, Config{Locker: lk, Metrics: m}, rec.session))
+		ends := rec.endsCopy()
+		require.Len(t, ends, 1)
+		require.Equal(t, sessionEnd{epoch: 1, started: 5 * time.Second, ended: time.Minute}, ends[0])
+		require.InDelta(t, 0, testutil.ToFloat64(m.LeaseLostTotal), 0)
+		require.InDelta(t, 0, testutil.ToFloat64(m.RenewErrors), 0)
+		require.InDelta(t, 1, testutil.ToFloat64(m.SlowAcquires), 0)
+	})
+}
+
+// A slow Acquire whose lease is already gone starts no session under that
+// epoch; the loop acquires again.
+func TestRun_SlowAcquireLostLeaseReacquires(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := bubbleCtx(t)
+		defer cancel()
+		lk := &fakeLocker{
+			acquire: func(n int) error {
+				if n == 1 {
+					time.Sleep(5 * time.Second)
+				}
+				return nil
+			},
+			renew: func(_ context.Context, n int) error {
+				if n == 1 {
+					return streaming.ErrNotHolder
+				}
+				return nil
+			},
+		}
+		rec := newRecorder(cancel, 1)
+		require.NoError(t, Run(ctx, Config{Locker: lk}, rec.session))
+		ends := rec.endsCopy()
+		require.Len(t, ends, 1)
+		require.Equal(t, uint64(2), ends[0].epoch)
+		require.Equal(t, 5*time.Second+DefaultAcquireInterval, ends[0].started)
+		// Only the session's epoch is released: ErrNotHolder means the first
+		// epoch has nothing left to free.
+		require.Equal(t, []uint64{2}, lk.releasedEpochs())
+	})
+}
+
+// A confirming renew that fails ambiguously releases the lock before trying
+// again, because the store may have kept the lease.
+func TestRun_SlowAcquireRenewErrorReleases(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := bubbleCtx(t)
+		defer cancel()
+		lk := &fakeLocker{
+			acquire: func(n int) error {
+				if n == 1 {
+					time.Sleep(5 * time.Second)
+				}
+				return nil
+			},
+			renew: func(_ context.Context, n int) error {
+				if n == 1 {
+					return errors.New("connection reset")
+				}
+				return nil
+			},
+		}
+		rec := newRecorder(cancel, 1)
+		require.NoError(t, Run(ctx, Config{Locker: lk}, rec.session))
+		ends := rec.endsCopy()
+		require.Len(t, ends, 1)
+		require.Equal(t, uint64(2), ends[0].epoch)
+		require.Equal(t, []uint64{1, 2}, lk.releasedEpochs())
+	})
+}
+
 func TestRun_ShutdownWhileWaitingForLock(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {

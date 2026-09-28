@@ -148,7 +148,16 @@ func acquire(ctx context.Context, cfg Config) (time.Time, bool) {
 		start := time.Now()
 		err := cfg.Locker.Acquire(ctx, cfg.Lease)
 		if err == nil {
-			return start, true
+			if time.Since(start) < cfg.Lease/2 {
+				return start, true
+			}
+			if confirmed, ok := confirm(ctx, cfg); ok {
+				return confirmed, true
+			}
+			if !sleep(ctx, cfg.AcquireInterval) {
+				return time.Time{}, false
+			}
+			continue
 		}
 		if ctx.Err() != nil {
 			return time.Time{}, false
@@ -161,6 +170,42 @@ func acquire(ctx context.Context, cfg Config) (time.Time, bool) {
 			return time.Time{}, false
 		}
 	}
+}
+
+// confirm renews a lease whose Acquire took at least half of it. A stalled
+// store can commit an Acquire long after the call started, and the local
+// lease clock starts at the call, so the first scheduled renew would find
+// its deadline already gone and end a session that just began. Renewing now
+// restarts the clock from a known point. This call is not bounded by the
+// local deadline, because no session is writing yet and the lock checks
+// expiry itself. It returns the renew's start time, or false after
+// releasing the lock when the renew failed.
+func confirm(ctx context.Context, cfg Config) (time.Time, bool) {
+	cfg.Metrics.slowAcquire()
+	start := time.Now()
+	callCtx, callCancel := context.WithTimeout(ctx, cfg.Lease)
+	err := cfg.Locker.Renew(callCtx, cfg.Lease)
+	callCancel()
+	if err == nil {
+		return start, true
+	}
+	if ctx.Err() != nil {
+		return time.Time{}, false
+	}
+	cfg.Logger.Warn("leader: lease acquired too slowly to keep", "epoch", cfg.Locker.Epoch(), "err", err)
+	if errors.Is(err, streaming.ErrNotHolder) {
+		return time.Time{}, false
+	}
+	cfg.Metrics.renewError()
+	// The renew may have failed after the store kept the lease. Release is
+	// fenced by epoch and holder, so it cannot free a successor's lock.
+	releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ReleaseTimeout)
+	if rerr := cfg.Locker.Release(releaseCtx); rerr != nil && !errors.Is(rerr, streaming.ErrNotHolder) {
+		cfg.Metrics.releaseError()
+		cfg.Logger.Warn("leader: release failed", "epoch", cfg.Locker.Epoch(), "err", rerr)
+	}
+	releaseCancel()
+	return time.Time{}, false
 }
 
 // runOnce runs one session under a held lock and releases the lock
