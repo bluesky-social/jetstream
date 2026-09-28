@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/datamodel"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/segment"
@@ -159,6 +160,12 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 			payload, err := r.Store.GetBlock(cid)
 			if err != nil {
 				return fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
+			}
+			// Counter-only, like the path gate: a hostile repo must not
+			// drive log volume.
+			if err := datamodel.CheckRecord(payload); err != nil {
+				h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonInvalidDataModel)
+				return nil //nolint:nilerr // an invalid record is dropped, not a failed repo
 			}
 
 			ev := segment.Event{

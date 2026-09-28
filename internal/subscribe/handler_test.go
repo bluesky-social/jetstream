@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -19,6 +20,7 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/gt"
 	"github.com/klauspost/compress/zstd"
 	"github.com/prometheus/client_golang/prometheus"
@@ -1930,4 +1932,74 @@ func TestHandler_CompressionSchemeMetrics(t *testing.T) {
 	_ = readOneFrame(t, ctx, connNone)
 	_ = readOneFrame(t, ctx, connDeflate)
 	_ = readOneZstdFrame(t, ctx, connZstd)
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// TestHandler_EncodeErrorsLoggedOncePerConnection: rows archived outside the
+// atproto data model are skipped and counted, and a replay through many of
+// them logs once per connection rather than once per row.
+func TestHandler_EncodeErrorsLoggedOncePerConnection(t *testing.T) {
+	t.Parallel()
+
+	b, _ := newReadLogTail(t, 1<<20, noCold)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	var logs lockedBuffer
+	srv := httptest.NewServer(NewHandler(Subscription{
+		Tail:    b,
+		Store:   newSteadyStateStore(t),
+		Metrics: metrics,
+		Logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	waitForTailBlocked(t, b)
+
+	float, err := cbor.Marshal(map[string]any{"v": 1.5})
+	require.NoError(t, err)
+	var seq uint64
+	const bad = 5
+	for i := range bad {
+		appendSeq(t, b, &seq, &segment.Event{
+			WitnessedAt: 1779719010267528,
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:float",
+			Collection:  "net.anisota.x",
+			Rkey:        fmt.Sprintf("r%d", i),
+			Rev:         "3l3qo2vutsw2b",
+			Payload:     float,
+		})
+	}
+	publishIdentity(t, b, &seq, "did:plc:after", 1)
+
+	_, frame, err := conn.Read(ctx)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "did:plc:after", got["did"], "the unencodable rows must be skipped")
+	require.InDelta(t, float64(bad), testutil.ToFloat64(metrics.EncodeErrors), 0)
+	require.Equal(t, 1, strings.Count(logs.String(), `msg="encode error`), logs.String())
 }

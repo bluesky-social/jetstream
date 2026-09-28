@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/datamodel"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/stretchr/testify/require"
@@ -144,6 +145,27 @@ func FuzzDecodeRecordMapEquivalence(f *testing.F) {
 		require.NoError(t, json.Unmarshal(jsonBytes, &ref))
 		require.NotNil(t, ref, "converter accepted a payload the canonical path treats as non-object")
 		require.Equal(t, ref, got, "accepted value must equal the canonical CBOR->JSON conversion")
+	})
+}
+
+// FuzzDecodeRecordMatchesIngestGate pins the client decoder to the server's
+// ingest gate: a record the gate archives must decode, and a record the
+// client rejects must never have been archived.
+func FuzzDecodeRecordMatchesIngestGate(f *testing.F) {
+	for _, rec := range []any{
+		map[string]any{"$type": "app.bsky.feed.like", "subject": map[string]any{"cid": "x"}},
+		map[string]any{"v": 1.5},
+		`{"$type":"app.bsky.feed.post"}`,
+	} {
+		if p, err := cbor.Marshal(rec); err == nil {
+			f.Add(p)
+		}
+	}
+	f.Add([]byte{0xa0, 0xa0})
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		gateErr := datamodel.CheckRecord(payload)
+		_, decodeErr := decodeRecordMap(payload)
+		require.Equal(t, gateErr == nil, decodeErr == nil, "gate=%v client=%v payload=%x", gateErr, decodeErr, payload)
 	})
 }
 

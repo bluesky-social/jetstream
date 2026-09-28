@@ -615,6 +615,11 @@ func runSubscriberLoop(
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
+	// An unencodable row is skipped for every subscriber that reaches it,
+	// so replaying a range full of them would log once per subscriber per
+	// row. Log the first on each connection; the counter has the rest.
+	encodeErrLogged := false
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -704,7 +709,11 @@ func runSubscriberLoop(
 			}
 			if eerr != nil {
 				deps.Metrics.incEncodeErrors()
-				logger.Warn("encode error", "err", eerr, "kind", int(e.Event.Kind), "did", e.Event.DID)
+				if !encodeErrLogged {
+					encodeErrLogged = true
+					logger.Warn("encode error; further encode errors on this connection are counted only",
+						"err", eerr, "seq", e.Event.Seq, "kind", int(e.Event.Kind), "did", e.Event.DID)
+				}
 				continue
 			}
 

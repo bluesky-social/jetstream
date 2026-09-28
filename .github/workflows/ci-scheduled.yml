@@ -74,7 +74,9 @@ jobs:
         include:
           - { package: ".", target: FuzzDecodeLiveFrame }
           - { package: ".", target: FuzzDecodeRecordMapEquivalence }
+          - { package: ".", target: FuzzDecodeRecordMatchesIngestGate }
           - { package: "./internal/catalog", target: FuzzDecodeHotBatch }
+          - { package: "./internal/datamodel", target: FuzzCheckRecordServable }
           - { package: "./internal/ingest/live", target: FuzzLoadUpstreamCursor }
           - { package: "./internal/ingest/live", target: FuzzUpstreamCursorRoundTrip }
           - { package: "./internal/ingest/syncstate", target: FuzzChainStateRoundTrip }

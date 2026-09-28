@@ -444,6 +444,44 @@ func TestSegmentHandler_ResyncDropsInvalidPathOnceKeepsSiblings(t *testing.T) {
 		"the drop must be counted exactly once across pre-check and append walks")
 }
 
+// TestSegmentHandler_InvalidDataModelDropsRecordKeepsSiblings: a record
+// outside the atproto data model is dropped and counted once, on both the
+// full-repo and resync paths, and its siblings archive.
+func TestSegmentHandler_InvalidDataModelDropsRecordKeepsSiblings(t *testing.T) {
+	t.Parallel()
+
+	float, err := cbor.Marshal(map[string]any{"v": 1.5})
+	require.NoError(t, err)
+	str, err := cbor.Marshal(`{"$type":"app.bsky.feed.post"}`)
+	require.NoError(t, err)
+
+	for _, resync := range []bool{false, true} {
+		for name, bad := range map[string][]byte{"float": float, "string": str} {
+			w := newTestIngest(t)
+			dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+			h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			h.dropMetrics = dropMetrics
+
+			did := atmos.DID("did:plc:badmodel")
+			r, commit := buildHostileKeyRepo(t, did, "app.bsky.feed.post/good")
+			cid := cbor.ComputeCID(cbor.CodecDagCBOR, bad)
+			require.NoError(t, r.Store.PutBlock(cid, bad))
+			require.NoError(t, r.Tree.Insert("app.bsky.feed.post/bad", cid))
+
+			want := uint64(2)
+			if resync {
+				require.NoError(t, h.HandleRepoResync(t.Context(), did, r, commit), name)
+				want = 3 // the KindSync tombstone plus the good record
+			} else {
+				require.NoError(t, h.HandleRepo(t.Context(), did, r, commit), name)
+			}
+			require.Equal(t, want, w.NextSeq(), "%s resync=%v", name, resync)
+			require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceBackfill, ingest.DropReasonInvalidDataModel)), 0,
+				"%s resync=%v", name, resync)
+		}
+	}
+}
+
 // TestSegmentHandler_MissingDownloadedRecordBlockSurfacesError pins the
 // handler's post-fix contract for a missing record block. Completeness of a
 // downloaded full repo is now verified UPSTREAM, before HandleRepo runs:

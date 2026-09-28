@@ -49,6 +49,14 @@ const (
 	// (partial CARs are spec-permitted but unarchivable). Drops the
 	// op; siblings survive.
 	DropReasonMissingBlock DropReason = "missing_block"
+
+	// DropReasonInvalidDataModel: a create/update record is not a
+	// DAG-CBOR map of atproto data-model values (a float, a non-SHA-256
+	// CID link, a top-level string, trailing bytes). Such a record
+	// cannot be rendered as atproto JSON, so the websocket and the Go
+	// client would disagree about whether it exists. Drops the op;
+	// siblings survive.
+	DropReasonInvalidDataModel DropReason = "invalid_data_model"
 )
 
 var dropSources = []DropSource{DropSourceLive, DropSourceBackfill}
@@ -59,6 +67,7 @@ var dropReasons = []DropReason{
 	DropReasonInvalidRkey,
 	DropReasonFieldTooLong,
 	DropReasonMissingBlock,
+	DropReasonInvalidDataModel,
 }
 
 // DropMetrics owns the shared dropped-events counter family for both
@@ -84,8 +93,9 @@ func NewDropMetrics(reg prometheus.Registerer) *DropMetrics {
 			Help: "Number of upstream records or events dropped at the ingest validation " +
 				"gate, labeled by ingest path (source) and drop reason. Spec-invalid input " +
 				"(invalid_rev, invalid_collection, invalid_rkey) is distinguished from " +
-				"spec-valid-but-unrepresentable (field_too_long) and from upstream " +
-				"omissions (missing_block).",
+				"spec-valid-but-unrepresentable (field_too_long), from upstream " +
+				"omissions (missing_block), and from records outside the atproto data " +
+				"model (invalid_data_model).",
 		}, []string{"source", "reason"}),
 		bound: make(map[DropSource]map[DropReason]prometheus.Counter, len(dropSources)),
 	}
