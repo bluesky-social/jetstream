@@ -100,6 +100,11 @@ type disaggregated struct {
 	cache          *objcache.Cache
 	catalogMetrics *catalog.Metrics
 	maintMetrics   *maintainer.Metrics
+	// gcLastRun is when this process last started a GC run, or first
+	// started a session. It outlives sessions so that a leader whose
+	// sessions restart more often than the GC interval still collects.
+	// Only runGC touches it, and sessions run one at a time.
+	gcLastRun time.Time
 }
 
 type memoryBudget struct {
@@ -734,7 +739,11 @@ func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog
 // retried next interval.
 func (r *Runtime) runGC(ctx context.Context, epoch uint64, sess *catalog.Session, onFailure func(error)) error {
 	d := r.disagg
-	t := time.NewTicker(r.opts.Storage.GC.Interval)
+	interval := r.opts.Storage.GC.Interval
+	if d.gcLastRun.IsZero() {
+		d.gcLastRun = time.Now()
+	}
+	t := time.NewTimer(gcDelay(d.gcLastRun, time.Now(), interval))
 	defer t.Stop()
 	for {
 		select {
@@ -742,6 +751,8 @@ func (r *Runtime) runGC(ctx context.Context, epoch uint64, sess *catalog.Session
 			return nil
 		case <-t.C:
 		}
+		d.gcLastRun = time.Now()
+		t.Reset(interval)
 		res, err := d.gc.Run(ctx, sess, d.backend.DB)
 		switch {
 		case err == nil:
@@ -760,10 +771,18 @@ func (r *Runtime) runGC(ctx context.Context, epoch uint64, sess *catalog.Session
 	}
 }
 
+// gcDelay is how long a new session waits for its first GC run: the rest of
+// the interval since the last run, or no time at all once one is overdue.
+func gcDelay(last, now time.Time, interval time.Duration) time.Duration {
+	return max(last.Add(interval).Sub(now), 0)
+}
+
 // sessionError is what a leader session reports to the leader loop. When the
 // catalog session ended first, its error is the cause and everything after
 // it, often a cancellation, is fallout; corruption from elsewhere still
-// wins so it stays fatal.
+// wins so it stays fatal. An object store that stayed unreachable past its
+// retry budget restarts the session (design §16): a new leader would hit
+// the same outage, so exiting would only turn it into a crash loop.
 func sessionError(err error, sess *catalog.Session) error {
 	if err == nil {
 		return nil
