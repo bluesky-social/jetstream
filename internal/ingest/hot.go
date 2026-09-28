@@ -300,13 +300,14 @@ type hotWriter struct {
 	liveWaiting atomic.Int64
 	bucket      *tokenBucket // nil: every live batch commits inline
 
-	mu      sync.Mutex
-	nextSeq uint64
-	block   *hotBlock
-	batch   *hotBatch
-	queue   []hotItem
-	closed  bool
-	err     error // sticky failure
+	mu        sync.Mutex
+	nextSeq   uint64
+	witnessed witnessedFloor
+	block     *hotBlock
+	batch     *hotBatch
+	queue     []hotItem
+	closed    bool
+	err       error // sticky failure
 
 	// Admission state (admission.go), all under mu.
 	waiters int
@@ -389,7 +390,7 @@ func openHot(cfg Config) (*Writer, error) {
 	cfg.Hot = &hc
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"), slog.String("mode", "hot"))
 
-	next, rows, err := readHotState(context.Background(), hc.Session.DB())
+	next, rows, floor, err := readHotState(context.Background(), hc.Session.DB())
 	if err != nil {
 		return nil, err
 	}
@@ -424,6 +425,8 @@ func openHot(cfg Config) (*Writer, error) {
 		nextSeq:  next,
 		block:    block,
 
+		witnessed: witnessedFloor{us: floor},
+
 		changed:       make(chan struct{}),
 		committedNext: next,
 		foldedNext:    unfoldedFrom,
@@ -440,31 +443,35 @@ func openHot(cfg Config) (*Writer, error) {
 	return w, nil
 }
 
-// readHotState reads seq/next at session start (design §10.2) and the hot
-// batches still unfolded (§10.5 rule 9). seq/next is the committed value:
-// whatever an earlier session assigned but never committed is reassigned.
-func readHotState(ctx context.Context, db catalog.DB) (next uint64, rows []catalog.HotBatchRow, err error) {
+// readHotState reads seq/next at session start (design §10.2), the hot
+// batches still unfolded (§10.5 rule 9), and the witnessed_at floor.
+// seq/next is the committed value: whatever an earlier session assigned but
+// never committed is reassigned.
+func readHotState(ctx context.Context, db catalog.DB) (next uint64, rows []catalog.HotBatchRow, floor int64, err error) {
 	tx, err := db.BeginRead(ctx)
 	if err != nil {
-		return 0, nil, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
+		return 0, nil, 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
 	}
 	defer func() { _ = tx.Close(ctx) }()
 	vals, err := tx.MetaGet(ctx, [][]byte{[]byte(catalog.MainSeqKey)})
 	if err != nil {
-		return 0, nil, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
+		return 0, nil, 0, fmt.Errorf("ingest: read %s: %w", catalog.MainSeqKey, err)
 	}
 	v, found := vals[catalog.MainSeqKey]
 	if next, err = catalog.DecodeSeq(catalog.MainSeqKey, v, found); err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	if rows, err = tx.HotBatches(ctx, math.MaxUint64); err != nil {
-		return 0, nil, fmt.Errorf("ingest: read hot batches: %w", err)
+		return 0, nil, 0, fmt.Errorf("ingest: read hot batches: %w", err)
 	}
 	if len(rows) > 0 && rows[len(rows)-1].LastSeq+1 != next {
-		return 0, nil, catalog.Corruptf(catalog.SourceHotBatch, "hot batches end at seq %d, but %s is %d",
+		return 0, nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "hot batches end at seq %d, but %s is %d",
 			rows[len(rows)-1].LastSeq, catalog.MainSeqKey, next)
 	}
-	return next, rows, nil
+	if floor, err = readWitnessedFloor(ctx, tx, catalog.Main, rows); err != nil {
+		return 0, nil, 0, err
+	}
+	return next, rows, floor, nil
 }
 
 // resumeBlock turns r into the open block after checking that it holds
@@ -531,7 +538,7 @@ func (h *hotWriter) append(ctx context.Context, ev *segment.Event) error {
 	if ClassOf(ctx) == ClassBulk {
 		evs := []segment.Event{*ev}
 		err := h.appendBulk(ctx, evs)
-		ev.Seq = evs[0].Seq
+		ev.Seq, ev.WitnessedAt = evs[0].Seq, evs[0].WitnessedAt
 		return err
 	}
 	return h.appendLive(ctx, 1, func(int) *segment.Event { return ev })
@@ -596,15 +603,16 @@ func (h *hotWriter) appendLocked(class Class, ev *segment.Event) error {
 
 	candidate := *ev
 	candidate.Seq = h.nextSeq
+	candidate.WitnessedAt = h.witnessed.clamp(h.cfg.Metrics, candidate.WitnessedAt)
 	// The hook runs before the event is buffered, and a hook error fails
 	// the writer: otherwise the event would still commit with its batch
 	// while the caller, told Append failed, retries it. The hook gets ev
 	// itself, since observers match rows by pointer (live.promoteMark).
 	if h.cfg.OnAppend != nil {
-		prev := ev.Seq
-		ev.Seq = candidate.Seq
+		prev, prevWitnessed := ev.Seq, ev.WitnessedAt
+		ev.Seq, ev.WitnessedAt = candidate.Seq, candidate.WitnessedAt
 		if err := h.cfg.OnAppend(ev); err != nil {
-			ev.Seq = prev
+			ev.Seq, ev.WitnessedAt = prev, prevWitnessed
 			h.cfg.Metrics.incAppendErrors()
 			err = fmt.Errorf("ingest: on_append: %w", err)
 			h.failLocked(err)
@@ -617,7 +625,7 @@ func (h *hotWriter) appendLocked(class Class, ev *segment.Event) error {
 	b := h.batch
 	b.n++
 	b.raw += rawEventBytes(&candidate)
-	ev.Seq = candidate.Seq
+	ev.Seq, ev.WitnessedAt = candidate.Seq, candidate.WitnessedAt
 	h.nextSeq++
 	h.cfg.Metrics.incEventsAppended()
 	h.cfg.Metrics.setNextSeq(h.nextSeq)

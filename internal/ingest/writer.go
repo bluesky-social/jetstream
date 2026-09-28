@@ -42,6 +42,7 @@ type Writer struct {
 	nextSeq        uint64
 	durableNextSeq uint64
 	reservedEnd    uint64
+	witnessed      witnessedFloor
 	gaps           *seqspace.Gaps
 	readLog        *ReadableLog
 	closed         bool
@@ -177,6 +178,14 @@ func Open(cfg Config) (*Writer, error) {
 		}
 		if tailFound {
 			maxSeq, foundEvents = tailMax, true
+		}
+	}
+
+	w.witnessed.us = maxBlockWitnessed(w.active.Blocks())
+	if w.witnessed.us == 0 && hasExisting {
+		if w.witnessed.us, err = sealedTailWitnessed(cfg.FS, cfg.SegmentsDir, w.activeIdx); err != nil {
+			_ = w.active.Close()
+			return nil, err
 		}
 	}
 
@@ -459,12 +468,13 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 		w.cfg.Metrics.incAppendErrors()
 		return nil, fmt.Errorf("ingest: sequence lease exhausted at seq %d (reserved end %d)", candidate.Seq, w.reservedEnd)
 	}
+	candidate.WitnessedAt = w.witnessed.clamp(w.cfg.Metrics, candidate.WitnessedAt)
 	full, err := w.active.Append(candidate)
 	if err != nil {
 		w.cfg.Metrics.incAppendErrors()
 		return nil, fmt.Errorf("ingest: append: %w", err)
 	}
-	ev.Seq = candidate.Seq
+	ev.Seq, ev.WitnessedAt = candidate.Seq, candidate.WitnessedAt
 	w.nextSeq++
 	w.cfg.Metrics.incEventsAppended()
 	w.cfg.Metrics.setNextSeq(w.nextSeq)

@@ -197,6 +197,15 @@ func TestDirect_Swarm(t *testing.T) {
 	}
 }
 
+// skewed stamps events up to 5ms early, as a source that stamps before it
+// waits for the writer does.
+func skewed(rng *rand.Rand, evs []segment.Event) []segment.Event {
+	for i := range evs {
+		evs[i].WitnessedAt -= int64(rng.IntN(5000))
+	}
+	return evs
+}
+
 func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 	e := newEnv(t, rng.IntN(2) == 0)
 	ns := catalog.Main
@@ -241,12 +250,12 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 				for range 5 + prng.IntN(30) {
 					switch prng.IntN(8) {
 					case 0, 1, 2:
-						evs := testEvents(prng, 1)
+						evs := skewed(prng, testEvents(prng, 1))
 						require.NoError(t, w.Append(t.Context(), &evs[0]))
 						record(evs...)
 						mine = evs[0].Seq
 					case 3, 4:
-						evs := testEvents(prng, 1+prng.IntN(2*maxBlock))
+						evs := skewed(prng, testEvents(prng, 1+prng.IntN(2*maxBlock)))
 						require.NoError(t, w.AppendBatch(t.Context(), evs))
 						for i := 1; i < len(evs); i++ {
 							require.Equal(t, evs[i-1].Seq+1, evs[i].Seq, "a batch's seqs are contiguous")
@@ -301,6 +310,9 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 	for i, ev := range got {
 		require.Equal(t, uint64(i+1), ev.Seq, "committed seqs are gap-free from 1")
 		requireSameEvent(t, bySeq[ev.Seq], ev)
+		if i > 0 {
+			require.GreaterOrEqual(t, ev.WitnessedAt, got[i-1].WitnessedAt, "witnessed_at is monotonic with seq")
+		}
 	}
 	// The rotation rule seals as soon as a block takes the segment to the
 	// threshold, so no generation holds a block past it. ForceRotate seals
@@ -311,6 +323,44 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 	if ns == catalog.BootstrapLive {
 		require.Equal(t, uint64(1), e.seqKey(catalog.Main), "main is untouched")
 	}
+}
+
+// A direct session's floor comes from the previous session's active blocks,
+// or from the sealed generation's header once no active block is left.
+func TestDirect_WitnessedMonotonicAcrossSessions(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	rng := rand.New(rand.NewPCG(3, 3))
+	appendAt := func(w *ingest.Writer, us int64) int64 {
+		ev := testEvents(rng, 1)[0]
+		ev.WitnessedAt = us
+		require.NoError(t, w.Append(t.Context(), &ev))
+		return ev.WitnessedAt
+	}
+	open := func() *ingest.Writer {
+		return e.directWriter(catalog.Main, 1<<20, ingest.Config{}, ingest.DirectConfig{})
+	}
+	w := open()
+	require.Equal(t, int64(1000), appendAt(w, 1000))
+	require.Equal(t, int64(1000), appendAt(w, 900))
+	require.NoError(t, w.Close())
+
+	e.restart()
+	w = open()
+	require.Equal(t, int64(1000), appendAt(w, 500), "the floor comes from the active blocks")
+	require.Equal(t, int64(2000), appendAt(w, 2000))
+	require.NoError(t, w.SealActiveAndClose())
+
+	e.restart()
+	w = open()
+	require.Equal(t, int64(2000), appendAt(w, 10), "the floor comes from the sealed generation")
+	require.NoError(t, w.Close())
+
+	var got []int64
+	for _, ev := range e.directState(catalog.Main).events() {
+		got = append(got, ev.WitnessedAt)
+	}
+	require.Equal(t, []int64{1000, 1000, 1000, 2000, 2000}, got)
 }
 
 // DrainDurability's checkpoint covers every event appended before it commits,

@@ -119,16 +119,17 @@ type directWriter struct {
 	wake     chan struct{} // committer: queue grew
 	done     chan struct{} // committer exited
 
-	mu       sync.Mutex
-	nextSeq  uint64
-	block    *directBlock
-	queue    []directItem
-	pending  int // blocks frozen and not yet committed
-	checkpts int // metadata-only commits queued and not yet run
-	waiters  int
-	changed  chan struct{} // closed and replaced when pending or checkpts drops
-	closed   bool
-	err      error // sticky failure
+	mu        sync.Mutex
+	nextSeq   uint64
+	witnessed witnessedFloor
+	block     *directBlock
+	queue     []directItem
+	pending   int // blocks frozen and not yet committed
+	checkpts  int // metadata-only commits queued and not yet run
+	waiters   int
+	changed   chan struct{} // closed and replaced when pending or checkpts drops
+	closed    bool
+	err       error // sticky failure
 }
 
 type directBlock struct {
@@ -167,7 +168,7 @@ func openDirect(cfg Config) (*Writer, error) {
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"), slog.String("mode", "direct"),
 		slog.String("namespace", string(cfg.Namespace)))
 
-	next, err := readDirectState(context.Background(), dc.Session.DB(), cfg.Namespace)
+	next, floor, err := readDirectState(context.Background(), dc.Session.DB(), cfg.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -178,17 +179,18 @@ func openDirect(cfg Config) (*Writer, error) {
 	w.readLog = newReadableLog(next, cfg.ReadLogRetentionBytes, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &directWriter{
-		cfg:     &w.cfg,
-		direct:  w.cfg.Direct,
-		readLog: w.readLog,
-		logger:  w.cfg.Logger,
-		ctx:     ctx,
-		cancel:  cancel,
-		uploads: make(chan struct{}, dc.UploadConcurrency),
-		wake:    make(chan struct{}, 1),
-		done:    make(chan struct{}),
-		nextSeq: next,
-		changed: make(chan struct{}),
+		cfg:       &w.cfg,
+		direct:    w.cfg.Direct,
+		readLog:   w.readLog,
+		logger:    w.cfg.Logger,
+		ctx:       ctx,
+		cancel:    cancel,
+		uploads:   make(chan struct{}, dc.UploadConcurrency),
+		wake:      make(chan struct{}, 1),
+		done:      make(chan struct{}),
+		nextSeq:   next,
+		witnessed: witnessedFloor{us: floor},
+		changed:   make(chan struct{}),
 	}
 	w.direct = d
 	cfg.Metrics.setNextSeq(next)
@@ -198,37 +200,39 @@ func openDirect(cfg Config) (*Writer, error) {
 }
 
 // readDirectState reads the namespace's seq key at session start (design
-// §10.2). It is the committed value: whatever an earlier session assigned
-// but never committed is reassigned. Main must hold no hot batches: direct
-// mode precedes hot mode, and a block committed behind hot batches would
-// break the seq tiling.
-func readDirectState(ctx context.Context, db catalog.DB, ns catalog.Namespace) (uint64, error) {
+// §10.2), and the witnessed_at floor. The seq key is the committed value:
+// whatever an earlier session assigned but never committed is reassigned.
+// Main must hold no hot batches: direct mode precedes hot mode, and a block
+// committed behind hot batches would break the seq tiling.
+func readDirectState(ctx context.Context, db catalog.DB, ns catalog.Namespace) (next uint64, floor int64, err error) {
 	key := catalog.SeqKey(ns)
 	tx, err := db.BeginRead(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("ingest: read %s: %w", key, err)
+		return 0, 0, fmt.Errorf("ingest: read %s: %w", key, err)
 	}
 	defer func() { _ = tx.Close(ctx) }()
 	vals, err := tx.MetaGet(ctx, [][]byte{[]byte(key)})
 	if err != nil {
-		return 0, fmt.Errorf("ingest: read %s: %w", key, err)
+		return 0, 0, fmt.Errorf("ingest: read %s: %w", key, err)
 	}
 	v, found := vals[key]
-	next, err := catalog.DecodeSeq(key, v, found)
-	if err != nil {
-		return 0, err
+	if next, err = catalog.DecodeSeq(key, v, found); err != nil {
+		return 0, 0, err
 	}
 	if ns == catalog.Main {
 		rows, err := tx.HotBatches(ctx, math.MaxUint64)
 		if err != nil {
-			return 0, fmt.Errorf("ingest: read hot batches: %w", err)
+			return 0, 0, fmt.Errorf("ingest: read hot batches: %w", err)
 		}
 		if len(rows) > 0 {
-			return 0, catalog.Corruptf(catalog.SourceHotBatch, "direct mode opened over hot batches [%d,%d]",
+			return 0, 0, catalog.Corruptf(catalog.SourceHotBatch, "direct mode opened over hot batches [%d,%d]",
 				rows[0].FirstSeq, rows[len(rows)-1].LastSeq)
 		}
 	}
-	return next, nil
+	if floor, err = readWitnessedFloor(ctx, tx, ns, nil); err != nil {
+		return 0, 0, err
+	}
+	return next, floor, nil
 }
 
 func (d *directWriter) append(ctx context.Context, ev *segment.Event) error {
@@ -279,13 +283,14 @@ func (d *directWriter) appendLocked(ev *segment.Event) error {
 
 	candidate := *ev
 	candidate.Seq = d.nextSeq
+	candidate.WitnessedAt = d.witnessed.clamp(d.cfg.Metrics, candidate.WitnessedAt)
 	// As in hot mode, the hook runs before the event is buffered and a hook
 	// error fails the writer, so an event whose Append failed never commits.
 	if d.cfg.OnAppend != nil {
-		prev := ev.Seq
-		ev.Seq = candidate.Seq
+		prev, prevWitnessed := ev.Seq, ev.WitnessedAt
+		ev.Seq, ev.WitnessedAt = candidate.Seq, candidate.WitnessedAt
 		if err := d.cfg.OnAppend(ev); err != nil {
-			ev.Seq = prev
+			ev.Seq, ev.WitnessedAt = prev, prevWitnessed
 			d.cfg.Metrics.incAppendErrors()
 			err = fmt.Errorf("ingest: on_append: %w", err)
 			d.failLocked(err)
@@ -294,7 +299,7 @@ func (d *directWriter) appendLocked(ev *segment.Event) error {
 	}
 	entry := catalog.NewLogEntry(&candidate)
 	blk.events = append(blk.events, *entry.Event())
-	ev.Seq = candidate.Seq
+	ev.Seq, ev.WitnessedAt = candidate.Seq, candidate.WitnessedAt
 	d.nextSeq++
 	d.cfg.Metrics.incEventsAppended()
 	d.cfg.Metrics.setNextSeq(d.nextSeq)

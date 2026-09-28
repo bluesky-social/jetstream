@@ -19,6 +19,7 @@ type Metrics struct {
 	BlocksFlushed             prometheus.Counter
 	SegmentsRotated           prometheus.Counter
 	AppendErrors              prometheus.Counter
+	WitnessedClamped          prometheus.Counter
 	ActiveSegBytes            prometheus.Gauge
 	NextSeq                   prometheus.Gauge
 	ReadLogBytes              prometheus.Gauge
@@ -70,6 +71,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "append_errors_total",
 			Help: "Number of Writer.Append calls that returned a non-nil error.",
+		}),
+		WitnessedClamped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "witnessed_clamped_total",
+			Help: "Number of appended events whose witnessed_at was raised to the previous event's, keeping it monotonic with seq.",
 		}),
 		ActiveSegBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -177,7 +183,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.EventsAppended, m.BlocksFlushed, m.SegmentsRotated,
-		m.AppendErrors, m.ActiveSegBytes, m.NextSeq,
+		m.AppendErrors, m.WitnessedClamped, m.ActiveSegBytes, m.NextSeq,
 		m.ReadLogBytes, m.ReadLogPinnedBytes, m.ReadLogPinnedOverrunBytes,
 		m.ReadLogFloorSeq, m.ReadLogDurableSeq,
 		m.SeqReservedEnd, m.SeqReservationHeadroom,
@@ -245,6 +251,12 @@ func (m *Metrics) incSegmentsRotated() {
 func (m *Metrics) incAppendErrors() {
 	if m != nil {
 		m.AppendErrors.Inc()
+	}
+}
+
+func (m *Metrics) incWitnessedClamped() {
+	if m != nil {
+		m.WitnessedClamped.Inc()
 	}
 }
 

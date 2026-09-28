@@ -180,7 +180,9 @@ func testEvent(rng *rand.Rand, producer int) segment.Event {
 		payload[i] = byte(rng.Uint32())
 	}
 	return segment.Event{
-		WitnessedAt: time.Now().UnixMicro(),
+		// Up to 5ms early, as a source that stamps before it waits for
+		// the writer does.
+		WitnessedAt: time.Now().UnixMicro() - int64(rng.IntN(5000)),
 		Kind:        segment.KindCreate,
 		DID:         fmt.Sprintf("did:plc:p%d", producer),
 		Collection:  "app.bsky.feed.post",
@@ -466,6 +468,9 @@ func runHotSwarm(t *testing.T, rng *rand.Rand) {
 		for i, ev := range b.Events {
 			require.Equal(t, b.FirstSeq+uint64(i), ev.Seq)
 			requireSameEvent(t, appended[ev.Seq], ev)
+			if i > 0 {
+				require.GreaterOrEqual(t, ev.WitnessedAt, b.Events[i-1].WitnessedAt, "witnessed_at is monotonic with seq")
+			}
 		}
 		want = b.LastSeq + 1
 	}
