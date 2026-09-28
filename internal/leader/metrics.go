@@ -46,7 +46,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Epoch: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "epoch",
-			Help: "Writer epoch of this process's most recent session.",
+			Help: "Writer epoch of this process's session while it runs one, else 0.",
 		}),
 		SessionStarts: counter("session_starts_total", "Writer sessions started."),
 		SessionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -83,6 +83,9 @@ func (m *Metrics) sessionEnded(reason string) {
 		return
 	}
 	m.IsLeader.Set(0)
+	// A follower that kept its last epoch would look like a second leader
+	// on a dashboard.
+	m.Epoch.Set(0)
 	m.SessionsTotal.WithLabelValues(reason).Inc()
 }
 

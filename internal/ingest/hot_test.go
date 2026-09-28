@@ -767,7 +767,10 @@ func TestHot_ResumeContinuesOpenBlock(t *testing.T) {
 			require.Equal(t, HotBatchInfo{FirstSeq: row.FirstSeq, LastSeq: row.LastSeq, ObjectID: row.ObjectID}, b.Batches[i])
 		}
 		require.Equal(t, uint64(7), b.Batches[len(prior)].FirstSeq)
+		require.NotZero(t, testutil.ToFloat64(m.HotUnfoldedEvents))
 		require.NoError(t, w2.Close())
+		require.Zero(t, testutil.ToFloat64(m.HotUnfoldedEvents), "a closed writer reports no backlog")
+		require.Zero(t, testutil.ToFloat64(m.HotInlineTokens))
 	})
 }
 

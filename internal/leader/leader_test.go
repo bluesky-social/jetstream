@@ -460,6 +460,7 @@ func TestRun_SlowAcquireKeepsLease(t *testing.T) {
 		require.InDelta(t, 0, testutil.ToFloat64(m.LeaseLostTotal), 0)
 		require.InDelta(t, 0, testutil.ToFloat64(m.RenewErrors), 0)
 		require.InDelta(t, 1, testutil.ToFloat64(m.SlowAcquires), 0)
+		require.InDelta(t, 0, testutil.ToFloat64(m.Epoch), 0)
 	})
 }
 

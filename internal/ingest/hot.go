@@ -1198,6 +1198,7 @@ func (h *hotWriter) close() error {
 	<-h.agerDone
 	h.cancel()
 	h.encoders.Wait()
+	h.cfg.Metrics.resetHot()
 	return h.failure()
 }
 

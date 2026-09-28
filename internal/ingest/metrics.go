@@ -338,6 +338,20 @@ func (m *Metrics) setHotInlineTokens(v float64) {
 	}
 }
 
+// resetHot zeroes the hot writer's state gauges when it closes. The process
+// keeps its registry across leader sessions, so a follower would otherwise
+// report its last session's backlog forever.
+func (m *Metrics) resetHot() {
+	if m == nil {
+		return
+	}
+	m.HotUnfoldedEvents.Set(0)
+	m.HotInlineTokens.Set(0)
+	for _, c := range []Class{ClassLive, ClassBulk} {
+		m.HotPendingBytes.WithLabelValues(c.String()).Set(0)
+	}
+}
+
 func (m *Metrics) observeAdmissionWait(c Class, d time.Duration) {
 	if m != nil {
 		m.AdmissionWait.WithLabelValues(c.String()).Observe(d.Seconds())
