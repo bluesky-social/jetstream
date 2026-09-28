@@ -93,6 +93,10 @@ type S3Config struct {
 	UploadConcurrency int
 	ReadConcurrency   int
 	RetryTimeout      time.Duration
+	// ReadRetryTimeout is the retry budget for reads made on behalf of
+	// clients (cold replay, archive downloads). It is shorter than
+	// RetryTimeout so an outage answers 503 promptly.
+	ReadRetryTimeout time.Duration
 }
 
 // LeaderConfig is JETSTREAM_LEADER_*.
@@ -129,6 +133,7 @@ func DefaultStorageConfig() StorageConfig {
 			UploadConcurrency: s3.DefaultUploadConcurrency,
 			ReadConcurrency:   s3.DefaultReadConcurrency,
 			RetryTimeout:      s3.DefaultRetryTimeout,
+			ReadRetryTimeout:  s3.DefaultReadRetryTimeout,
 		},
 		Leader: LeaderConfig{
 			Lease:           leader.DefaultLease,
@@ -210,6 +215,7 @@ func (c StorageConfig) Validate(opts Options) error {
 	}
 	for name, d := range map[string]time.Duration{
 		"JETSTREAM_S3_RETRY_TIMEOUT":              c.S3.RetryTimeout,
+		"JETSTREAM_S3_READ_RETRY_TIMEOUT":         c.S3.ReadRetryTimeout,
 		"JETSTREAM_LEADER_LEASE":                  c.Leader.Lease,
 		"JETSTREAM_LEADER_RENEW_INTERVAL":         c.Leader.RenewInterval,
 		"JETSTREAM_LEADER_ACQUIRE_INTERVAL":       c.Leader.AcquireInterval,
@@ -264,6 +270,7 @@ func (c StorageConfig) LogValue() slog.Value {
 		slog.Int("s3_upload_concurrency", c.S3.UploadConcurrency),
 		slog.Int("s3_read_concurrency", c.S3.ReadConcurrency),
 		slog.Duration("s3_retry_timeout", c.S3.RetryTimeout),
+		slog.Duration("s3_read_retry_timeout", c.S3.ReadRetryTimeout),
 		slog.Duration("leader_lease", c.Leader.Lease),
 		slog.Duration("leader_renew_interval", c.Leader.RenewInterval),
 		slog.Duration("leader_acquire_interval", c.Leader.AcquireInterval),

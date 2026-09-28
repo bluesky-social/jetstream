@@ -35,6 +35,9 @@ type Config struct {
 	// Listener delivers NOTIFY revisions. Nil means the follower only polls.
 	Listener catalog.Listener
 	Blob     objstore.Blob
+	// ServeBlob backs Objects, Fetch, and SealedMetadata, the reads made on
+	// behalf of clients; refreshes use Blob. Nil means Blob.
+	ServeBlob objstore.Blob
 	// ArchiveID must match the catalog's archive row; a mismatch is fatal.
 	ArchiveID [16]byte
 	// Cache is the process's verified-object cache. May be nil.
@@ -135,6 +138,9 @@ func New(cfg Config) (*Follower, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.ServeBlob == nil {
+		cfg.ServeBlob = cfg.Blob
+	}
 	f := &Follower{
 		cfg:      cfg,
 		log:      cfg.Logger.With(slog.String("component", "catalog_follower")),
@@ -142,7 +148,7 @@ func New(cfg Config) (*Follower, error) {
 		doorbell: make(chan struct{}, 1),
 		failed:   make(chan struct{}),
 	}
-	rd, err := f.reader(f)
+	rd, err := f.reader(f, cfg.ServeBlob)
 	if err != nil {
 		return nil, err
 	}
@@ -157,10 +163,10 @@ func New(cfg Config) (*Follower, error) {
 	return f, nil
 }
 
-func (f *Follower) reader(rows protocol.RowSource) (*protocol.Reader, error) {
+func (f *Follower) reader(rows protocol.RowSource, blob objstore.Blob) (*protocol.Reader, error) {
 	return protocol.NewReader(protocol.ReaderConfig{
 		Rows:           rows,
-		Blob:           f.cfg.Blob,
+		Blob:           blob,
 		ArchiveID:      f.cfg.ArchiveID,
 		Cache:          f.cfg.Cache,
 		Metrics:        f.cfg.ProtocolMetrics,
@@ -306,7 +312,7 @@ func (f *Follower) runTick(ctx context.Context) error {
 		objects = old.objects
 	}
 	objects = objects.with(c.objects)
-	rd, err := f.reader(tickRows{objects: objects, db: protocol.DBRows{DB: f.cfg.DB}})
+	rd, err := f.reader(tickRows{objects: objects, db: protocol.DBRows{DB: f.cfg.DB}}, f.cfg.Blob)
 	if err != nil {
 		return err
 	}

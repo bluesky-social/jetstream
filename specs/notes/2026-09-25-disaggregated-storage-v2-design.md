@@ -1835,7 +1835,7 @@ prefix. The old deployment must never run against the restored database.
 | Commit result unknown | Session ends; next session reads what actually committed |
 | PostgreSQL unreachable | Leader: renew fails, session ends within one lease. Readers: mirror ages; not ready after 30s; open streams wait |
 | PostgreSQL HA failover | As unreachable, then recovery |
-| S3 unreachable | Uploads retry up to 30s, then the session ends. Live inline batches keep committing until the unfolded cap, then appends block. Readers: cold reads fail with 503; hot reads keep working |
+| S3 unreachable | Uploads retry up to 30s, then the session restarts (`objstore.ErrUnavailable` → `leader.ErrRestartSession`). Live inline batches keep committing until the first upload or session-start read gives up, so ingest tolerates about `JETSTREAM_S3_RETRY_TIMEOUT` of outage, not "until the unfolded cap": every new session start reads S3 (tombstone and hot-state rebuild). Readers: cold reads retry for `JETSTREAM_S3_READ_RETRY_TIMEOUT` (10s), then getBlock and getSegment answer 503 with `Retry-After`, and websocket cold replay sends an `InternalError` frame; hot reads keep working. A getSegment body that fails after its headers are written is cut short |
 | S3 returns wrong bytes | Read-back check fails; retry with a new key |
 | Referenced object missing or corrupt | Reader: request fails, `jetstream_storage_corruption_total` increments. Leader: session ends, process exits |
 | `NOTIFY` lost | 250ms polling covers it |
@@ -1904,6 +1904,7 @@ identity, instance role). There is no `JETSTREAM_S3_*` credential variable.
 | `JETSTREAM_S3_UPLOAD_CONCURRENCY` | 8 | concurrent uploads |
 | `JETSTREAM_S3_READ_CONCURRENCY` | 32 | concurrent GETs for footer load and prefetch |
 | `JETSTREAM_S3_RETRY_TIMEOUT` | 30s | give up on one S3 operation after this |
+| `JETSTREAM_S3_READ_RETRY_TIMEOUT` | 10s | retry budget for S3 reads that serve clients (cold replay, archive download, repo export); after it they answer 503 |
 | `JETSTREAM_LEADER_LEASE` | 3s | lease duration |
 | `JETSTREAM_LEADER_RENEW_INTERVAL` | 1s | renew period |
 | `JETSTREAM_LEADER_ACQUIRE_INTERVAL` | 500ms | acquire attempt period |

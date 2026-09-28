@@ -108,6 +108,7 @@ func TestServeOptionsFromCLI_StorageEnv(t *testing.T) {
 		"JETSTREAM_S3_UPLOAD_CONCURRENCY":         "3",
 		"JETSTREAM_S3_READ_CONCURRENCY":           "5",
 		"JETSTREAM_S3_RETRY_TIMEOUT":              "11s",
+		"JETSTREAM_S3_READ_RETRY_TIMEOUT":         "12s",
 		"JETSTREAM_LEADER_LEASE":                  "4s",
 		"JETSTREAM_LEADER_RENEW_INTERVAL":         "2s",
 		"JETSTREAM_LEADER_ACQUIRE_INTERVAL":       "300ms",
@@ -137,7 +138,7 @@ func TestServeOptionsFromCLI_StorageEnv(t *testing.T) {
 		PG:   jetstreamd.PGConfig{URL: secretPGURL, MaxConns: 7},
 		S3: jetstreamd.S3Config{
 			Endpoint: "http://127.0.0.1:18333", Region: "us-east-1", Bucket: "jetstream", Prefix: "pfx/",
-			PathStyle: true, UploadConcurrency: 3, ReadConcurrency: 5, RetryTimeout: 11 * time.Second,
+			PathStyle: true, UploadConcurrency: 3, ReadConcurrency: 5, RetryTimeout: 11 * time.Second, ReadRetryTimeout: 12 * time.Second,
 		},
 		Leader: jetstreamd.LeaderConfig{Lease: 4 * time.Second, RenewInterval: 2 * time.Second, AcquireInterval: 300 * time.Millisecond},
 		Hot: jetstreamd.HotConfig{
@@ -190,20 +191,21 @@ func TestServe_StorageValidation(t *testing.T) {
 		args []string
 		want string
 	}{
-		"unknown mode":    {args: []string{"jetstream", "serve", "--storage=cloud"}, want: "JETSTREAM_STORAGE"},
-		"missing pg url":  {args: []string{"jetstream", "serve", "--storage=disaggregated"}, want: "JETSTREAM_PG_URL is required"},
-		"missing bucket":  {args: disaggregatedArgs("--s3-bucket="), want: "JETSTREAM_S3_BUCKET is required"},
-		"missing region":  {args: disaggregatedArgs("--s3-region="), want: "JETSTREAM_S3_REGION is required"},
-		"renew >= lease":  {args: disaggregatedArgs("--leader-renew-interval=3s"), want: "JETSTREAM_LEADER_RENEW_INTERVAL"},
-		"poll >= view":    {args: disaggregatedArgs("--catalog-poll-interval=30s"), want: "JETSTREAM_CATALOG_POLL_INTERVAL"},
-		"zero budget":     {args: disaggregatedArgs("--object-cache-bytes=0"), want: "JETSTREAM_OBJECT_CACHE_BYTES must be > 0"},
-		"zero gc delay":   {args: disaggregatedArgs("--gc-delay=0"), want: "JETSTREAM_GC_DELAY must be > 0"},
-		"zero pool":       {args: disaggregatedArgs("--pg-max-conns=0"), want: "JETSTREAM_PG_MAX_CONNS must be > 0"},
-		"no GOMEMLIMIT":   {args: disaggregatedArgs(), want: "GOMEMLIMIT must be set"},
-		"negative hot":    {args: disaggregatedArgs("--hot-pending-bytes=-1"), want: "JETSTREAM_HOT_PENDING_BYTES must be > 0"},
-		"zero block age":  {args: disaggregatedArgs("--block-max-age=0"), want: "JETSTREAM_BLOCK_MAX_AGE must be > 0"},
-		"zero view age":   {args: disaggregatedArgs("--max-view-age=0"), want: "JETSTREAM_MAX_VIEW_AGE must be > 0"},
-		"zero s3 retries": {args: disaggregatedArgs("--s3-retry-timeout=0"), want: "JETSTREAM_S3_RETRY_TIMEOUT must be > 0"},
+		"unknown mode":         {args: []string{"jetstream", "serve", "--storage=cloud"}, want: "JETSTREAM_STORAGE"},
+		"missing pg url":       {args: []string{"jetstream", "serve", "--storage=disaggregated"}, want: "JETSTREAM_PG_URL is required"},
+		"missing bucket":       {args: disaggregatedArgs("--s3-bucket="), want: "JETSTREAM_S3_BUCKET is required"},
+		"missing region":       {args: disaggregatedArgs("--s3-region="), want: "JETSTREAM_S3_REGION is required"},
+		"renew >= lease":       {args: disaggregatedArgs("--leader-renew-interval=3s"), want: "JETSTREAM_LEADER_RENEW_INTERVAL"},
+		"poll >= view":         {args: disaggregatedArgs("--catalog-poll-interval=30s"), want: "JETSTREAM_CATALOG_POLL_INTERVAL"},
+		"zero budget":          {args: disaggregatedArgs("--object-cache-bytes=0"), want: "JETSTREAM_OBJECT_CACHE_BYTES must be > 0"},
+		"zero gc delay":        {args: disaggregatedArgs("--gc-delay=0"), want: "JETSTREAM_GC_DELAY must be > 0"},
+		"zero pool":            {args: disaggregatedArgs("--pg-max-conns=0"), want: "JETSTREAM_PG_MAX_CONNS must be > 0"},
+		"no GOMEMLIMIT":        {args: disaggregatedArgs(), want: "GOMEMLIMIT must be set"},
+		"negative hot":         {args: disaggregatedArgs("--hot-pending-bytes=-1"), want: "JETSTREAM_HOT_PENDING_BYTES must be > 0"},
+		"zero block age":       {args: disaggregatedArgs("--block-max-age=0"), want: "JETSTREAM_BLOCK_MAX_AGE must be > 0"},
+		"zero view age":        {args: disaggregatedArgs("--max-view-age=0"), want: "JETSTREAM_MAX_VIEW_AGE must be > 0"},
+		"zero s3 retries":      {args: disaggregatedArgs("--s3-retry-timeout=0"), want: "JETSTREAM_S3_RETRY_TIMEOUT must be > 0"},
+		"zero s3 read retries": {args: disaggregatedArgs("--s3-read-retry-timeout=0"), want: "JETSTREAM_S3_READ_RETRY_TIMEOUT must be > 0"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

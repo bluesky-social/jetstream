@@ -6,6 +6,7 @@ package xrpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 	"go.opentelemetry.io/otel/trace"
@@ -148,6 +150,27 @@ func responseDeadline(ctx context.Context, w http.ResponseWriter, d time.Duratio
 	}
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
 	return context.WithTimeout(ctx, d)
+}
+
+// storeRetryAfter is the Retry-After, in seconds, on a 503 for an object
+// store outage. The store has already retried for its read budget, so an
+// immediate client retry would only queue behind the same outage.
+const storeRetryAfter = "5"
+
+// storeUnavailable returns the 503 for a read that failed because the object
+// store did not answer within its retry budget (design §1838), or nil for
+// any other error. It sets Retry-After, so call it before anything is
+// written.
+func storeUnavailable(w http.ResponseWriter, err error) error {
+	if !errors.Is(err, objstore.ErrUnavailable) {
+		return nil
+	}
+	w.Header().Set("Retry-After", storeRetryAfter)
+	return &xrpc.Error{
+		StatusCode: http.StatusServiceUnavailable,
+		Name:       "ServiceUnavailable",
+		Message:    "archive storage is unavailable; retry later",
+	}
 }
 
 func withReady(ready lifecycle.Readiness, h xrpcserver.Handler) xrpcserver.Handler {

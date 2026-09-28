@@ -198,6 +198,31 @@ func TestRetryTimeout(t *testing.T) {
 	})
 }
 
+// TestWithRetryTimeout checks that a derived Blob gives up on its own
+// budget and leaves the original's alone.
+func TestWithRetryTimeout(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ft := &s3test.FaultTransport{Base: s3test.NewFake(), Faults: []*s3test.Fault{
+			{Kind: s3test.FaultStatus, Status: 503},
+		}}
+		cfg := fakeConfig(ft)
+		cfg.RetryTimeout = 30 * time.Second
+		b := s3test.New(t, cfg)
+		reads := b.WithRetryTimeout(3 * time.Second)
+
+		start := time.Now()
+		_, err := reads.GetKey(t.Context(), "k")
+		require.ErrorIs(t, err, objstore.ErrUnavailable)
+		require.LessOrEqual(t, time.Since(start), 3*time.Second)
+
+		start = time.Now()
+		_, err = b.GetKey(t.Context(), "k")
+		require.ErrorIs(t, err, objstore.ErrUnavailable)
+		require.Greater(t, time.Since(start), 25*time.Second)
+	})
+}
+
 // TestAttemptTimeoutBoundedByRetryTimeout checks that a connection that
 // hangs on every attempt still fails at RetryTimeout.
 func TestAttemptTimeoutBoundedByRetryTimeout(t *testing.T) {

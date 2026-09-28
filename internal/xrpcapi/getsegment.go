@@ -52,6 +52,9 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 		// the generic NotFound, so clients matching on the published name work.
 		return &xrpc.Error{StatusCode: http.StatusNotFound, Name: "SegmentNotFound", Message: "segment not found"}
 	}
+	if xerr := storeUnavailable(w, err); xerr != nil {
+		return xerr
+	}
 	if err != nil {
 		// The segment exists but cannot be opened: a real inconsistency
 		// (rotation/deletion race, corrupt header). Surface it loudly.

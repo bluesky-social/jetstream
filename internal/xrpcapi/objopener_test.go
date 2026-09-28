@@ -311,6 +311,69 @@ func TestObjectOpener_Errors(t *testing.T) {
 	}
 }
 
+// unavailableObjects fails every read the way the S3 Blob does once its
+// retry budget runs out.
+type unavailableObjects struct{}
+
+func (unavailableObjects) Get(context.Context, uint64) ([]byte, error) {
+	return nil, fmt.Errorf("s3: get \"k\": %w: gave up after 4 attempts in 10s: 503", objstore.ErrUnavailable)
+}
+
+func (u unavailableObjects) GetRange(ctx context.Context, id uint64, _, _ int64) ([]byte, error) {
+	return u.Get(ctx, id)
+}
+
+// An object store outage is a 503 with Retry-After for getBlock, not a 500,
+// and is not logged per request (the finding 5 and 9f in
+// specs/notes/2026-09-28-disaggregated-testbed-findings.md). getSegment
+// has written its headers by the time it reads an object, so it can only
+// cut the body short.
+func TestObjectOpener_StoreUnavailable(t *testing.T) {
+	t.Parallel()
+	const idx = 3
+	raw := rawFile(t, writeSealedSegmentBlocks(t, t.TempDir(), idx, 1, 2, 3))
+	parts, _ := newMemObjects().split(t, raw, 1, 100)
+	gens := &fakeGens{idx: idx}
+	gens.set(parts)
+	var logs lockedBuffer
+	ts := httptest.NewServer(archiveMux(New(Config{
+		Opener: ObjectOpener{Gens: gens, Objects: unavailableObjects{}},
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})))
+	t.Cleanup(ts.Close)
+	segName := fmt.Sprintf("seg_%010d.jss", idx)
+
+	resp := doGet(t, blockURL(ts.URL, segName, 1))
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, storeRetryAfter, resp.Header.Get("Retry-After"))
+	require.Equal(t, "ServiceUnavailable", readXRPCError(t, resp))
+	require.NotContains(t, logs.String(), "level=ERROR")
+
+	resp = doGet(t, getSegURL(ts.URL, segName))
+	defer func() { _ = resp.Body.Close() }()
+	_, err := io.ReadAll(resp.Body)
+	require.Error(t, err, "a body cut short by the outage must not read as a complete file")
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
+
 // Every object read of an archive response runs under the response cutoff,
 // and a response past its cutoff stops reading instead of finishing.
 func TestArchiveResponseCutoff(t *testing.T) {

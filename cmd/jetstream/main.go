@@ -515,6 +515,10 @@ func storageFlags() []cli.Flag {
 			Sources: cli.EnvVars("JETSTREAM_S3_RETRY_TIMEOUT"), Value: def.S3.RetryTimeout,
 		},
 		&cli.DurationFlag{
+			Name: "s3-read-retry-timeout", Category: cat, Usage: "Retry budget for S3 reads that serve clients; after it they answer 503",
+			Sources: cli.EnvVars("JETSTREAM_S3_READ_RETRY_TIMEOUT"), Value: def.S3.ReadRetryTimeout,
+		},
+		&cli.DurationFlag{
 			Name: "leader-lease", Category: cat, Usage: "Writer lease duration",
 			Sources: cli.EnvVars("JETSTREAM_LEADER_LEASE"), Value: def.Leader.Lease,
 		},
@@ -604,6 +608,7 @@ func storageConfigFromCommand(cmd *cli.Command) (jetstreamd.StorageConfig, strin
 			UploadConcurrency: cmd.Int("s3-upload-concurrency"),
 			ReadConcurrency:   cmd.Int("s3-read-concurrency"),
 			RetryTimeout:      cmd.Duration("s3-retry-timeout"),
+			ReadRetryTimeout:  cmd.Duration("s3-read-retry-timeout"),
 		},
 		Leader: jetstreamd.LeaderConfig{
 			Lease:           cmd.Duration("leader-lease"),

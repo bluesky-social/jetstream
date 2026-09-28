@@ -53,6 +53,10 @@ type StorageBackend struct {
 	// poll.
 	Listener catalog.Listener
 	Blob     objstore.Blob
+	// ServeBlob serves reads made on behalf of clients: cold replay,
+	// archive downloads, and repo export. Its retry budget is shorter than
+	// Blob's, so an outage fails those requests promptly. Nil means Blob.
+	ServeBlob objstore.Blob
 	// Archive checks the schema and format versions and returns the
 	// archive row.
 	Archive func(ctx context.Context) (catalog.ArchiveRow, error)
@@ -171,6 +175,7 @@ func openBackend(ctx context.Context, cfg StorageConfig, pgMetrics *pgstore.Metr
 		DB:            pg,
 		Listener:      pg,
 		Blob:          blob,
+		ServeBlob:     blob.WithRetryTimeout(cfg.S3.ReadRetryTimeout),
 		Archive:       pg.CheckVersions,
 		CreateArchive: pg.Initialize,
 		NewLease:      func() leader.Locker { return pg.NewLease() },
@@ -316,6 +321,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		DB:              backend.DB,
 		Listener:        backend.Listener,
 		Blob:            backend.Blob,
+		ServeBlob:       backend.ServeBlob,
 		ArchiveID:       archive.ArchiveID,
 		Cache:           cache,
 		Manifest:        mft,

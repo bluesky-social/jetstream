@@ -21,6 +21,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -650,6 +651,13 @@ func runSubscriberLoop(
 			}
 			if errors.Is(err, errColdUnavailable) {
 				sendError("InternalError", "archive replay unavailable; reconnect")
+				return
+			}
+			if errors.Is(err, objstore.ErrUnavailable) {
+				// An object store outage hits every cold reader at once;
+				// the S3 metrics already count it, so do not log per
+				// connection.
+				sendError("InternalError", "archive storage unavailable; reconnect later")
 				return
 			}
 			logger.Warn("read error", "err", err)

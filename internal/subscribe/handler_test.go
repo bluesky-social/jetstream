@@ -11,12 +11,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
@@ -2002,4 +2005,51 @@ func TestHandler_EncodeErrorsLoggedOncePerConnection(t *testing.T) {
 	require.Equal(t, "did:plc:after", got["did"], "the unencodable rows must be skipped")
 	require.InDelta(t, float64(bad), testutil.ToFloat64(metrics.EncodeErrors), 0)
 	require.Equal(t, 1, strings.Count(logs.String(), `msg="encode error`), logs.String())
+}
+
+// An object store outage during a cold read closes the connection with an
+// error frame telling the client to come back later, without a log line per
+// connection: every cold reader hits it at once.
+func TestHandler_ColdStoreUnavailableErrorFrame(t *testing.T) {
+	t.Parallel()
+
+	cold := func(context.Context, uint64, int) ([]*Entry, uint64, error) {
+		return nil, 0, fmt.Errorf("follower: fetch block: %w", objstore.ErrUnavailable)
+	}
+	// The subscriber anchors live at 100, then the tip moves past it, so
+	// its next read goes cold as it would after falling behind.
+	var tip atomic.Uint64
+	tip.Store(100)
+	b := newTail(tailConfig{cold: cold, nextSeq: tip.Load, logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	var logs lockedBuffer
+	srv := httptest.NewServer(NewHandler(Subscription{
+		Tail:   b,
+		Store:  newSteadyStateStore(t),
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		V2:     true,
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	waitForTailBlocked(t, b)
+	tip.Store(200)
+	b.SetReadLogSource(func() *ingest.ReadableLog { return nil }) // wakes the parked reader
+
+	var got struct {
+		Type    string `json:"$type"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(readOneFrame(t, ctx, conn), &got))
+	require.Equal(t, "error", got.Type)
+	require.Equal(t, "InternalError", got.Error)
+	require.Contains(t, got.Message, "storage unavailable")
+	require.NotContains(t, logs.String(), "read error")
 }

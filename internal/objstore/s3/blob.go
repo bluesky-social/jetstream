@@ -38,6 +38,7 @@ const (
 	DefaultUploadConcurrency = 8
 	DefaultReadConcurrency   = 32
 	DefaultRetryTimeout      = 30 * time.Second
+	DefaultReadRetryTimeout  = 10 * time.Second
 	DefaultAttemptTimeout    = 10 * time.Second
 )
 
@@ -173,6 +174,17 @@ func New(ctx context.Context, cfg Config) (*Blob, error) {
 		backoffMax:     2 * time.Second,
 	}
 	return b, nil
+}
+
+// WithRetryTimeout returns a Blob that shares b's client, concurrency
+// slots, and metrics but gives up on each call after d instead. Pods serve
+// client reads through a shorter budget (JETSTREAM_S3_READ_RETRY_TIMEOUT) so
+// an outage answers 503 promptly instead of holding every cold request for
+// the writer's full budget. A non-positive d keeps b's budget.
+func (b *Blob) WithRetryTimeout(d time.Duration) *Blob {
+	c := *b
+	c.retryTimeout = orDefault(d, b.retryTimeout)
+	return &c
 }
 
 func orDefault[T int | time.Duration](v, def T) T {

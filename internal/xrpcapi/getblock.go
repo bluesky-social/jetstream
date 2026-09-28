@@ -55,6 +55,15 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 		}
 		return err
 	}
+	// readFailed answers a failed read: 503 when the object store is out,
+	// which is not logged per request, and otherwise a logged 500.
+	readFailed := func(err error, logMsg, clientMsg string, attrs ...any) error {
+		if xerr := storeUnavailable(w, err); xerr != nil {
+			return fail(resultUnavailable, xerr)
+		}
+		h.logger.Error(logMsg, append(attrs, slog.Any("err", err))...)
+		return fail(resultError, xrpcserver.InternalError(clientMsg))
+	}
 
 	name, err := r.Params.String("segment")
 	if err != nil {
@@ -92,9 +101,8 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 		})
 	}
 	if err != nil {
-		h.logger.Error("getBlock: open sealed file failed",
-			slog.String("name", name), slog.Any("err", err))
-		return fail(resultError, xrpcserver.InternalError("failed to open segment"))
+		return readFailed(err, "getBlock: open sealed file failed", "failed to open segment",
+			slog.String("name", name))
 	}
 	defer func() { _ = f.Close() }()
 
@@ -122,9 +130,8 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 		} else {
 			frame, err := bf.BlockFrame(blockIdx)
 			if err != nil {
-				h.logger.Error("getBlock: read block object failed",
-					slog.String("name", name), slog.Int("block", blockIdx), slog.Any("err", err))
-				return fail(resultError, xrpcserver.InternalError("failed to read block"))
+				return readFailed(err, "getBlock: read block object failed", "failed to read block",
+					slog.String("name", name), slog.Int("block", blockIdx))
 			}
 			content, contentSize = bytes.NewReader(frame), int64(len(frame))
 		}
@@ -133,18 +140,16 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 		// do not allocate a buffer proportional to the compressed frame.
 		section, err := segment.BlockFrameSection(f, hdr, blockIdx)
 		if err != nil {
-			h.logger.Error("getBlock: validate block frame failed",
-				slog.String("name", name), slog.Int("block", blockIdx), slog.Any("err", err))
-			return fail(resultError, xrpcserver.InternalError("failed to read block"))
+			return readFailed(err, "getBlock: validate block frame failed", "failed to read block",
+				slog.String("name", name), slog.Int("block", blockIdx))
 		}
 		content = section
 		contentSize = section.Size()
 	} else {
 		frame, err := segment.ReadBlockFrame(f, hdr, blockIdx)
 		if err != nil {
-			h.logger.Error("getBlock: read block frame failed",
-				slog.String("name", name), slog.Int("block", blockIdx), slog.Any("err", err))
-			return fail(resultError, xrpcserver.InternalError("failed to read block"))
+			return readFailed(err, "getBlock: read block frame failed", "failed to read block",
+				slog.String("name", name), slog.Int("block", blockIdx))
 		}
 		content = bytes.NewReader(frame)
 		contentSize = int64(len(frame))
