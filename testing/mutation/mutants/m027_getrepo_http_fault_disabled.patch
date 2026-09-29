@@ -20,8 +20,15 @@ expected-tier: default
 tiers: default,stress
 
 diff --git a/internal/simulator/http/faults.go b/internal/simulator/http/faults.go
+index 2e8b0f0..4e0bf8b 100644
 --- a/internal/simulator/http/faults.go
 +++ b/internal/simulator/http/faults.go
-@@ -501 +501 @@ func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {
+@@ -482,7 +482,7 @@ func (p *FaultPlan) maybeGetRepoHTTPFault(did string) (int, bool) {
+ 	p.getRepo.mu.Lock()
+ 	defer p.getRepo.mu.Unlock()
+ 	st, ok := p.getRepo.httpByDID[did]
 -	if !ok || st.remaining <= 0 {
 +	if !ok || st.remaining >= 0 {
+ 		return 0, false
+ 	}
+ 	st.remaining--

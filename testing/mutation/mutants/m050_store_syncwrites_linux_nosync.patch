@@ -15,9 +15,12 @@ expected-tier: powerloss
 tiers: powerloss
 
 diff --git a/internal/store/sync_unix.go b/internal/store/sync_unix.go
-index 229b4ff..a925e98 100644
+index 14cb702..5bbd368 100644
 --- a/internal/store/sync_unix.go
 +++ b/internal/store/sync_unix.go
-@@ -14 +14 @@ import "github.com/cockroachdb/pebble"
+@@ -15,4 +15,4 @@ import "github.com/cockroachdb/pebble"
+ // as package-level *WriteOptions singletons, and Go has no const
+ // for pointer types, so we use var. It is never reassigned at
+ // runtime; treat it as immutable.
 -var SyncWrites = pebble.Sync
 +var SyncWrites = pebble.NoSync

@@ -14,8 +14,15 @@ expected-tier: seqlease
 tiers: seqlease
 
 diff --git a/internal/ingest/seqlease.go b/internal/ingest/seqlease.go
+index 8f4d58c..f3387eb 100644
 --- a/internal/ingest/seqlease.go
 +++ b/internal/ingest/seqlease.go
-@@ -49 +49 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, hadSegments bool) (initializedSeqLease, error) {
+@@ -54,7 +54,7 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, had
+ 			if err != nil {
+ 				return initializedSeqLease{}, err
+ 			}
 -			nextSeq = priorReserved
 +			nextSeq = durableNext
+ 			createdGap = true
+ 		}
+ 	} else if (hadSegments || seqFound) && !cfg.UnreservedSeqsUnobservable {

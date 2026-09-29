@@ -14,8 +14,15 @@ expected-tier: pdsbackfill
 tiers: pdsbackfill
 
 diff --git a/internal/ingest/backfill/store.go b/internal/ingest/backfill/store.go
+index 0cf5b63..bc50ad8 100644
 --- a/internal/ingest/backfill/store.go
 +++ b/internal/ingest/backfill/store.go
-@@ -873 +873 @@ func (s *Store) onDiscover(_ context.Context, host string, entry atmossync.ListReposEntry) error {
+@@ -919,7 +919,7 @@ func (s *Store) onDiscover(_ context.Context, host string, entry atmossync.ListR
+ 			Status:    StatusNotStarted,
+ 			StartedAt: timeNow(),
+ 		},
 -		PDS: host, Host: bucket, Active: entry.Active,
 +		PDS: "", Host: bucket, Active: entry.Active,
+ 	}
+ 	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil, host); err != nil {
+ 		return err

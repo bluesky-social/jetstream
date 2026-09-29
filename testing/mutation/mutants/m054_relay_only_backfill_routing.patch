@@ -15,14 +15,20 @@ expected-tier: pdsbackfill
 tiers: pdsbackfill,default
 
 diff --git a/internal/ingest/backfill/run.go b/internal/ingest/backfill/run.go
+index 984f2b4..1cba793 100644
 --- a/internal/ingest/backfill/run.go
 +++ b/internal/ingest/backfill/run.go
-@@ -150,5 +150,3 @@ func Run(ctx context.Context, cfg Config) error {
+@@ -188,11 +188,9 @@ func Run(ctx context.Context, cfg Config) error {
+ 			return drain()
+ 		}
+ 
 -		newHostClient := cfg.NewHostClient
 -		if newHostClient == nil {
 -			newHostClient = NewHostClientBuilder(cfg.RelayURL, cfg.HTTPClient)
--		}
--
 +		newHostClient := func(string) (*atmossync.Client, error) {
 +			return relay, nil
-+		}
+ 		}
+-
+ 		var limited atomic.Bool
+ 		engineOpts := atmosbackfill.Options{
+ 			Relay: relay, NewHostClient: gt.Some(newHostClient), Store: st.AtmosStore(), Handler: handler,

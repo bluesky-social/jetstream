@@ -13,8 +13,15 @@ expected-tier: seqlease
 tiers: seqlease
 
 diff --git a/internal/ingest/writer.go b/internal/ingest/writer.go
+index e81ceba..09a7be3 100644
 --- a/internal/ingest/writer.go
 +++ b/internal/ingest/writer.go
-@@ -992 +992 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force, terminal bool, prepareValue any) error {
+@@ -1016,7 +1016,7 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
+ 		// right source for metadata-only drains, which do not themselves advance
+ 		// the event-backed durable-batch argument.
+ 		reservedEnd = w.nextSeq
 -		if !terminal {
 +		if terminal {
+ 			var err error
+ 			reservedEnd, err = seqspace.ReserveEnd(w.nextSeq, w.cfg.MaxEventsPerBlock)
+ 			if err != nil {

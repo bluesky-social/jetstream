@@ -14,10 +14,17 @@ expected-tier: seqlease
 tiers: seqlease
 
 diff --git a/internal/ingest/seqlease.go b/internal/ingest/seqlease.go
+index 8f4d58c..155599c 100644
 --- a/internal/ingest/seqlease.go
 +++ b/internal/ingest/seqlease.go
-@@ -85,3 +85 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, hadSegments bool) (initializedSeqLease, error) {
+@@ -88,9 +88,7 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, had
+ 	// Canonicalize the registry in the same startup transaction even when no
+ 	// new gap was created. Older/manual records may be valid but adjacent; one
+ 	// normalized representation bounds startup reads and status cardinality.
 -	if err := stageSeqGaps(b, gaps); err != nil {
 -		return initializedSeqLease{}, err
 -	}
 +	// BUG: vacancy registry write omitted.
+ 	if err := b.Commit(context.Background()); err != nil {
+ 		return initializedSeqLease{}, cfg.wrapSegmentPersistenceError("initializing sequence lease", err)
+ 	}

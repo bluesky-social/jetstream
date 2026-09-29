@@ -69,7 +69,7 @@ Past campaigns found:
 
 ### Adding a mutant
 
-Only add mutants that model a realistic single-edit bug. Every mutant should compile, avoid trivial panics, carry the metadata header above (including `expected-tier` stated before the first run), and be retired when code movement makes it stale or dead. After adding one, bank it KILLED via `just mutation-baseline` so the gate enforces the new coverage.
+Only add mutants that model a realistic single-edit bug. Every mutant should compile, avoid trivial panics, carry the metadata header above (including `expected-tier` stated before the first run), and be retired when code movement makes it stale or dead. Generate the patch with `git diff` and its default 3 context lines. A zero-context hunk is anchored only by its line number, so it drifts onto an identical line elsewhere as the file changes. The driver applies patches without `--unidiff-zero`, and `TestCatalogPatchesCarryContext` (`testing/mutation/gate`) fails `just` on one (see `specs/gotchas.md`). After adding one, bank it KILLED via `just mutation-baseline` so the gate enforces the new coverage.
 
 ### After changing ingest, segment, or orchestrator logic
 

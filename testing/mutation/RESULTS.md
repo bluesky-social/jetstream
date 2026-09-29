@@ -1823,3 +1823,34 @@ executioner from "pending #262" to "active".
 Full-campaign re-run deferred to Jim on a clean tree per the mutation-gate
 dirty-tree guard; the scoped m044/m045 re-runs above cover the tier this change
 touches.
+
+## Refresh 2026-09-29 — last zero-context patches converted; two had drifted
+
+A check with plain `git apply --check` reported 12 mutants as stale. They were
+not: the driver applied patches with `--unidiff-zero`, and those 12, plus m050,
+were the catalog's remaining zero-context patches, which plain `git apply`
+always rejects. Every one still applied under the driver's flags. But each
+zero-context patch was re-derived as a 3-line context diff at its authoring
+commit and re-applied at HEAD. That showed two had drifted onto an identical
+line in a sibling function, the failure `specs/gotchas.md` describes for m044:
+
+- **m027** mutated `maybeGetRepoResponseFault` instead of
+  `maybeGetRepoHTTPFault`, so it no longer modeled the fault it documents.
+- **m060** mutated `drainAsync` instead of `drainSync`, the other branch of
+  `DrainDurability`.
+
+Both kept reporting KILLED, so the gate could not see it. m058's context moved
+in the metastore refactor (`cfg.Store.Commit` became `b.Commit`), but its hunk
+still landed correctly.
+
+Changes: all 13 patches (m015, m026, m027, m043, m050, m052–m058, m060) are
+now 3-line context diffs pinned to the site their header describes, each
+verified to round-trip with a clean tree. `run.sh` applies and reverts without
+`--unidiff-zero`, so a zero-context patch reports STALE instead of drifting,
+and `TestCatalogPatchesCarryContext` (`testing/mutation/gate`) fails the
+default `just` run on one.
+
+Re-run through the driver: all 13 KILLED at their baseline tiers (m015, m026,
+m027, m043 @default; m050 @powerloss; m052–m055 @pdsbackfill; m056–m058, m060
+@seqlease). m027 now dies on "configured getRepo HTTP faults must fire", as its
+`expected-detection` predicts. No baseline change.

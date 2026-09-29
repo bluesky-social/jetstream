@@ -13,9 +13,16 @@ expected-tier: pdsbackfill
 tiers: pdsbackfill
 
 diff --git a/internal/ingest/backfill/store.go b/internal/ingest/backfill/store.go
+index 0cf5b63..e567715 100644
 --- a/internal/ingest/backfill/store.go
 +++ b/internal/ingest/backfill/store.go
-@@ -990 +990,2 @@ func (s *Store) HostCursor(ctx context.Context, hostname string) (string, bool, error) {
+@@ -1035,7 +1035,8 @@ func (s *Store) HostCursor(ctx context.Context, hostname string) (string, bool,
+ 	if err != nil {
+ 		return "", false, err
+ 	}
 -	return host.ListReposCursor, host.Enumerated, nil
 +	drained := host.Enumerated || host.State == string(atmosbackfill.HostStateExhausted)
 +	return host.ListReposCursor, drained, nil
+ }
+ 
+ func (s *Store) SaveHostCursor(ctx context.Context, hostname, cursor string) error {
