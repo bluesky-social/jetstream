@@ -28,7 +28,7 @@ These summarize and route; `docs/README.md` and each package's `doc.go` remain a
 ```
 *.go              public Go client API
 cmd/
-  jetstream/      main binary: serve, inspect-segment, timestamp import, version
+  jetstream/      main binary: serve, inspect-segment, version
   simulator/      local PLC + PDS + Relay on :7777
 segment/          on-disk segment file format (header, blocks, footer, reader, writer, sealer); public API
 internal/
@@ -40,11 +40,11 @@ internal/
   subscribe/      websocket /subscribe endpoint (v1 protocol parity) + cold reader
   xrpcapi/        archive download over HTTP/XRPC (planSnapshot, getSegment, getBlock)
   server/         HTTP listeners (public :8080, opt-in debug :6060) and middleware
-  store/          pebble-backed cursor + metadata store
+  metastore/      metadata store interface (cursors, seq, backfill rows); pebblestore/ (local), memstore/ (tests), storetest/ (contract)
+  store/          instrumented pebble handle; only metastore/pebblestore may import it
+  objstore/       object (blob) store interface; memblob/ (tests), blobtest/ (contract)
   manifest/       segment manifest (directory scan + self-describing headers)
   tombstone/      delete/update/account tombstone set for compaction
-  timestamp/      operator timestamp-import pipeline
-  importer/       import job manager
   repoexport/     reconstruct a repo CAR/MST from archived events
   identity/       DID resolution
   status/         /status endpoint collector
@@ -74,7 +74,10 @@ just test ./segment -run TestX  # one test (gotestsum forwards args after `--`)
 just bench ./segment            # benchmarks
 just fuzz 30s ./segment         # fuzz every Fuzz* target for 30s each
 just modernize                  # apply gopls modernize rewrites
+just up / just down             # ephemeral Postgres + SeaweedFS + MinIO (compose.yaml, testing/devenv/)
 ```
+
+The `just up` environment must stay stateless: tmpfs for every data dir, no named volumes, no writable bind mounts. `just down` fails if anything from the `jetstream-dev` compose project survives. Its S3 app credentials deliberately lack ListBucket. SeaweedFS and MinIO still return 404 for a missing key, but real AWS S3 returns 403 in that case, so object-store code must not rely on 404 alone to mean "missing".
 
 Oracle tests live in `internal/oracle` and compare Jetstream's durable output against a simulator model. Run them after changes to ingest, segment persistence, lifecycle/orchestrator phases, cursor handling, or restart recovery:
 
@@ -122,6 +125,8 @@ Use the package-level metrics/tracer rather than rolling your own. `obs.Tracer("
     - `go.opentelemetry.io/otel` and related
     - `github.com/puzpuzpuz/xsync`
     - anything under `golang.org/x`
+    - `github.com/jackc/pgx/v5` (only `internal/pgstore`, `internal/metastore/pg`, `internal/catalog/pg`, `internal/leader`; enforced by `TestStorageDriverImportBoundary`)
+    - `github.com/aws/aws-sdk-go-v2` core, `config`, `credentials`, `service/s3` (only `internal/objstore/s3`; same test)
 - **Follow existing conventions.** Don't introduce new patterns when the codebase already has one for code style, error handling, or logging.
 - **Comments explain why, not what.** Exported symbols and packages get a high-level docstring; otherwise comment only when the reasoning isn't obvious from the code.
 - **Never crash, and never corrupt data.** The process is a mission-critical, long-lived server daemon. Add observability in the case of incorrect/adversarial user input, but don't crash.

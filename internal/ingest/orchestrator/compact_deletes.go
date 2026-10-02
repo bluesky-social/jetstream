@@ -4,19 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble/vfs"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -42,6 +40,12 @@ const defaultCompactionBloomNarrowMaxDIDs = 100_000
 // event and this floor keeps the compactor from spinning full passes.
 const minCompactionTriggerSpacing = 30 * time.Second
 
+// tombstoneRebuildConcurrency bounds the block reads the session-start
+// tombstone rebuild keeps in flight. Live ingest waits for the rebuild, and
+// in disaggregated mode each read is an object GET: one at a time, a 4h
+// backlog takes minutes (design §22.4).
+const tombstoneRebuildConcurrency = 16
+
 type sealedCompactionSegment struct {
 	ingest.SegmentFile
 	header segment.Header
@@ -50,7 +54,11 @@ type sealedCompactionSegment struct {
 type compactionRewriteResult struct {
 	file            sealedCompactionSegment
 	result          segment.RewriteResult
+	size            int64 // rewritten file size, when result.Rewritten
 	droppedByReason map[string]uint64
+	// blocks and blocksFetched are the segment's block count and the blocks
+	// a sparse rewrite fetched (disaggregated mode only).
+	blocks, blocksFetched int
 }
 
 // runDeleteCompaction executes one compaction pass. liveWriter is the
@@ -65,11 +73,6 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 	}
 
 	start := time.Now()
-	if mode == compactionSteady && o.cfg.CompactionSchedule != nil {
-		// The active pass replaces the scheduled timestamp so newly issued
-		// responses receive only the configured grace period while rewrites run.
-		o.cfg.CompactionSchedule.beginPass(start)
-	}
 	var finalWatermark uint64
 	defer func() {
 		o.cfg.Metrics.observeCompactionPass(start, retErr)
@@ -77,18 +80,23 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			o.cfg.OnCompactionPass(CompactionPassResult{Watermark: finalWatermark, Err: retErr})
 		}
 	}()
+	if mode == compactionSteady {
+		// The active pass replaces the scheduled timestamp so newly issued
+		// responses receive only the configured grace period while rewrites
+		// run. It must be durable before the first publish.
+		if err := o.setCompactionSchedule(ctx, start); err != nil {
+			return err
+		}
+	}
 
 	return obs.Span(ctx, func(ctx context.Context) error {
-		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
-		// Cleanup must hold the rewrite lock: a timestamp-import Phase C in
-		// flight has a live seg_*.jss.tmp open (segment.Patch), and unlinking
-		// it here would make the import's rename fail spuriously. Under the
-		// lock, any *.jss.tmp we see is genuinely stale — no rewrite is in
-		// flight while we hold it.
-		if err := o.withRewriteLock(func() error {
-			return removeStaleCompactionTempsFS(o.cfg.FS, segmentsDir)
-		}); err != nil {
-			return err
+		cat := o.compactionCatalog()
+		if o.cfg.Disaggregated == nil {
+			// Compaction is the only segment rewriter and passes never
+			// overlap, so any *.jss.tmp seen here is genuinely stale.
+			if err := o.segments().RemoveStaleTemps(catalog.Main); err != nil {
+				return fmt.Errorf("orchestrator: compaction: %w", err)
+			}
 		}
 
 		// Seal the active segment first so this pass covers rows deleted
@@ -106,18 +114,22 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				return fmt.Errorf("orchestrator: compaction: force rotate active segment: %w", err)
 			}
 		}
+		// The writers publish their seals, but a data dir opened with no
+		// writer attached has sealed segments only the directory knows. In
+		// disaggregated mode the seal has committed when ForceRotate
+		// returns, and the follower sees it after a refresh.
+		if err := cat.Refresh(ctx); err != nil {
+			return fmt.Errorf("orchestrator: compaction: refresh segment catalog: %w", err)
+		}
 
-		watermark, _, err := loadCompactionWatermark(o.cfg.Store)
+		watermark, watermarkOK, err := loadCompactionWatermark(o.cfg.Store)
 		if err != nil {
 			return err
 		}
 		finalWatermark = watermark
 
-		sealed, targetWatermark, err := o.listSealedCompactionSegments(segmentsDir)
-		if err != nil {
-			return err
-		}
-		if mode == compactionSteady {
+		sealed, targetWatermark := o.listSealedCompactionSegments(cat.Snapshot())
+		if mode == compactionSteady && o.cfg.Disaggregated == nil {
 			// Heals the rewrite-succeeded/refresh-failed crash window
 			// (spec §5 step 2). Cheap: compares each manifest entry's
 			// resident checksum against the header the sweep above
@@ -162,15 +174,7 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 			}
 
 			if !snap.Empty() {
-				// Hold the rewrite lock for the segment-mutating chunk so a
-				// concurrent timestamp-import pass cannot race this on any
-				// segment's tmp+rename (design §3.3, §6 H). Scoped to the chunk
-				// (not the whole pass) so an import may interleave between
-				// chunks; that is safe because delete-rewrite preserves
-				// IndexedAt and both passes are per-segment atomic + idempotent.
-				if err := o.withRewriteLock(func() error {
-					return o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode)
-				}); err != nil {
+				if err := o.applyCompactionChunk(ctx, sealed, snap, chunkEnd, mode); err != nil {
 					return err
 				}
 			}
@@ -189,9 +193,10 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 				return err
 			}
 
-			if err := saveCompactionWatermark(o.cfg.Store, chunkEnd); err != nil {
+			if err := o.advanceCompactionWatermark(ctx, current, watermarkOK, chunkEnd); err != nil {
 				return err
 			}
+			watermarkOK = true
 			o.cfg.Metrics.setCompactionWatermark(chunkEnd)
 			finalWatermark = chunkEnd
 			o.cfg.Metrics.setCompactionWatermarkLag(compactionWatermarkLagSeconds(sealed, chunkEnd))
@@ -211,37 +216,30 @@ func (o *Orchestrator) runDeleteCompaction(ctx context.Context, mode compactionM
 	})
 }
 
-// listSealedCompactionSegments sweeps segmentsDir, returning every
-// sealed segment with its parsed header plus the pass's target
-// watermark: the max seq across sealed segments with events. Active
-// segments are skipped; the watermark never advances past them (spec
-// §4 — their tombstones stay in the live set, which evicts only ≤ the
-// committed watermark, and re-apply after seal). Steady passes
-// force-rotate the live writer before this sweep, so the only active
-// segment left holds events appended after the pass began.
-func (o *Orchestrator) listSealedCompactionSegments(segmentsDir string) ([]sealedCompactionSegment, uint64, error) {
-	files, err := ingest.SegmentFilesFS(o.cfg.FS, segmentsDir)
-	if err != nil {
-		return nil, 0, fmt.Errorf("orchestrator: compaction: list segments: %w", err)
-	}
-	sealed := make([]sealedCompactionSegment, 0, len(files))
+// listSealedCompactionSegments returns every sealed main segment in view
+// with its header, plus the pass's target watermark: the max seq across
+// sealed segments with events. Active segments are skipped; the watermark
+// never advances past them (spec §4 — their tombstones stay in the live
+// set, which evicts only ≤ the committed watermark, and re-apply after
+// seal). Steady passes force-rotate the live writer before taking view,
+// so the only active segment left holds events appended after the pass
+// began.
+func (o *Orchestrator) listSealedCompactionSegments(view catalog.CatalogView) ([]sealedCompactionSegment, uint64) {
+	segs := view.Segments(catalog.Main)
+	sealed := make([]sealedCompactionSegment, 0, len(segs))
 	var targetWatermark uint64
-	for _, f := range files {
-		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, FS: o.cfg.FS, SkipChecksum: true})
-		if err != nil {
-			if errors.Is(err, segment.ErrActiveSegment) {
-				continue
-			}
-			return nil, 0, fmt.Errorf("orchestrator: compaction: open %s: %w", f.Path, err)
+	for _, v := range segs {
+		if v.State != catalog.Sealed {
+			continue
 		}
-		h := r.Header()
-		_ = r.Close()
+		h := v.Header
+		f := ingest.SegmentFile{Idx: v.Index, Path: o.compactionSegmentName(v.Index)}
 		sealed = append(sealed, sealedCompactionSegment{SegmentFile: f, header: h})
 		if h.EventCount > 0 && h.MaxSeq > targetWatermark {
 			targetWatermark = h.MaxSeq
 		}
 	}
-	return sealed, targetWatermark, nil
+	return sealed, targetWatermark
 }
 
 // reconcileCompactionManifest re-fires the manifest refresh path for
@@ -275,11 +273,12 @@ func (o *Orchestrator) reconcileCompactionManifest(sealed []sealedCompactionSegm
 // merge→steady transition (spec §7): the merge-tail pass is manifest-
 // oblivious, so serving must not ungate until every manifest entry
 // matches its on-disk header.
-func (o *Orchestrator) reconcileCompactionManifestFromDisk(segmentsDir string) error {
-	sealed, _, err := o.listSealedCompactionSegments(segmentsDir)
-	if err != nil {
-		return err
+func (o *Orchestrator) reconcileCompactionManifestFromDisk(ctx context.Context) error {
+	segs := o.segments()
+	if err := segs.Refresh(ctx); err != nil {
+		return fmt.Errorf("orchestrator: compaction: refresh segment catalog: %w", err)
 	}
+	sealed, _ := o.listSealedCompactionSegments(segs.Snapshot())
 	return o.reconcileCompactionManifest(sealed)
 }
 
@@ -287,6 +286,15 @@ func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed [
 	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]tombstone.DIDTombstone)}
 	chunkEnd := targetWatermark
 	capEntries := o.cfg.CompactionTombstoneCap
+	// A fresh view per chunk: earlier chunks' rewrites changed the
+	// generations the pass-start view named.
+	cat := o.compactionCatalog()
+	view := cat.Snapshot()
+	fetcher := cat.Fetcher()
+	current := make(map[uint64]catalog.SegmentView)
+	for _, v := range view.Segments(catalog.Main) {
+		current[v.Index] = v
+	}
 	for _, f := range sealed {
 		if f.header.MaxSeq <= watermark || f.header.MinSeq > targetWatermark {
 			continue
@@ -294,31 +302,27 @@ func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed [
 		if err := ctx.Err(); err != nil {
 			return tombstone.Snapshot{}, 0, err
 		}
-		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, FS: o.cfg.FS, SkipChecksum: true})
-		if err != nil {
-			return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: open source %s: %w", f.Path, err)
+		v, ok := current[f.Idx]
+		if !ok || v.State != catalog.Sealed {
+			return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: sealed segment %s left the catalog mid-pass", f.Path)
 		}
-		blocks := r.Blocks()
-		for i := range blocks {
+		for ref := range segmentRefs(view, v) {
 			// Block-index bounds survive rewrites as historical
 			// supersets (spec §6), so skipping on them can only skip
 			// blocks with no rows inside the window.
-			if blocks[i].MaxSeq <= watermark || blocks[i].MinSeq > targetWatermark {
+			if ref.MaxSeq <= watermark || ref.MinSeq > targetWatermark {
 				continue
 			}
-			events, err := r.DecodeBlock(i)
+			events, err := catalog.DecodeRef(ctx, fetcher, ref)
 			if err != nil {
-				_ = r.Close()
-				return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, i, err)
+				return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, ref.Block, err)
 			}
 			part, err := tombstone.FoldRange(events, watermark, targetWatermark)
 			if err != nil {
-				_ = r.Close()
-				return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: fold %s block %d: %w", f.Path, i, err)
+				return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: fold %s block %d: %w", f.Path, ref.Block, err)
 			}
 			snap.Merge(part)
 		}
-		_ = r.Close()
 		if capEntries > 0 && len(snap.Records)+len(snap.DIDs) >= capEntries {
 			chunkEnd = min(f.header.MaxSeq, targetWatermark)
 			break
@@ -351,6 +355,10 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 		results []compactionRewriteResult
 	)
 	g, gctx := errgroup.WithContext(ctx)
+	rewrite := o.localCompactionRewriter(chunkEnd, snap, candidateDIDs)
+	if o.cfg.Disaggregated != nil {
+		rewrite = o.disaggCompactionRewriter(ctx, gctx, chunkEnd, snap)
+	}
 	for range workers {
 		g.Go(func() error {
 			for f := range jobs {
@@ -358,28 +366,12 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 					return err
 				}
 				o.cfg.Metrics.incCompactionSegmentsExamined()
-				droppedByReason := map[string]uint64{}
-				res, err := segment.Rewrite(f.Path, func(ev *segment.Event) segment.RowDecision {
-					if ev.Seq > chunkEnd {
-						return segment.RowKeep
-					}
-					if drop, reason := snap.ShouldDrop(ev); drop {
-						droppedByReason[reason]++
-						return segment.RowDrop
-					}
-					return segment.RowKeep
-				}, segment.RewriteOptions{
-					FS:              o.cfg.FS,
-					CrashInjector:   crashpoint.ForSegment(o.cfg.CrashInjector),
-					IOFaultInjector: o.cfg.SegmentIOFaultInjector,
-					CandidateDIDs:   candidateDIDs,
-				})
+				res, err := rewrite(f)
 				if err != nil {
-					return ingest.WrapDiskFull(o.cfg.DataDir, "rewriting segment during compaction",
-						fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err))
+					return err
 				}
 				mu.Lock()
-				results = append(results, compactionRewriteResult{file: f, result: res, droppedByReason: droppedByReason})
+				results = append(results, res)
 				mu.Unlock()
 			}
 			return nil
@@ -411,15 +403,16 @@ sendLoop:
 		return results[i].file.Idx < results[j].file.Idx
 	})
 
+	published := false
 	for _, r := range results {
+		o.cfg.Metrics.addCompactionBlocks(r.blocks, r.blocksFetched)
 		if r.result.Rewritten {
+			published = true
 			o.cfg.Metrics.incCompactionSegmentsRewritten()
 			for reason, n := range r.droppedByReason {
 				o.cfg.Metrics.addCompactionRowsDropped(reason, n)
 			}
-			if info, err := statStorageFS(o.cfg.FS, r.file.Path); err == nil {
-				o.cfg.Metrics.addCompactionBytesRewritten(info.Size())
-			}
+			o.cfg.Metrics.addCompactionBytesRewritten(r.size)
 			o.logger.Info("compaction rewrote segment",
 				"segment", r.file.Path,
 				"rows_dropped", r.result.RowsDropped,
@@ -435,7 +428,63 @@ sendLoop:
 			o.cfg.Metrics.incCompactionSegmentsClean()
 		}
 	}
+	if published && o.cfg.Disaggregated != nil {
+		// The next chunk's view must name the generations this one
+		// published: a rewrite of a replaced source generation is refused
+		// as corruption.
+		if err := o.cfg.Disaggregated.Catalog.Refresh(ctx); err != nil {
+			return fmt.Errorf("orchestrator: compaction: refresh after publish: %w", err)
+		}
+	}
 	return nil
+}
+
+// compactionRewriter rewrites one sealed segment for a chunk.
+type compactionRewriter func(f sealedCompactionSegment) (compactionRewriteResult, error)
+
+// localCompactionRewriter rewrites the segment's file in place.
+func (o *Orchestrator) localCompactionRewriter(chunkEnd uint64, snap tombstone.Snapshot, candidateDIDs []string) compactionRewriter {
+	segs := o.segments()
+	return func(f sealedCompactionSegment) (compactionRewriteResult, error) {
+		droppedByReason := map[string]uint64{}
+		res, rewritten, err := segs.RewriteSegment(catalog.Main, f.Idx, func(ev *segment.Event) segment.RowDecision {
+			if ev.Seq > chunkEnd {
+				return segment.RowKeep
+			}
+			if drop, reason := snap.ShouldDrop(ev); drop {
+				droppedByReason[reason]++
+				return segment.RowDrop
+			}
+			return segment.RowKeep
+		}, segment.RewriteOptions{
+			CrashInjector:   crashpoint.ForSegment(o.cfg.CrashInjector),
+			IOFaultInjector: o.cfg.SegmentIOFaultInjector,
+			CandidateDIDs:   candidateDIDs,
+		})
+		if err != nil {
+			return compactionRewriteResult{}, ingest.WrapDiskFull(o.cfg.DataDir, "rewriting segment during compaction",
+				fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err))
+		}
+		return compactionRewriteResult{file: f, result: res, size: rewritten.Size, droppedByReason: droppedByReason}, nil
+	}
+}
+
+// disaggCompactionRewriter publishes a sparse rewrite of the segment's
+// current generation. ctx is the pass's context and gctx the chunk's
+// worker group's; see rewriteSegmentDisaggregated. Every worker shares one
+// memory budget.
+func (o *Orchestrator) disaggCompactionRewriter(ctx, gctx context.Context, chunkEnd uint64, snap tombstone.Snapshot) compactionRewriter {
+	rule := snap.Compile(chunkEnd)
+	reserve := compactionReserve(gctx, o.cfg.Disaggregated.CompactionMemoryBytes)
+	// No row at or above the chunk's highest tombstone seq, or above
+	// chunkEnd, can drop, so a segment starting there needs no footer read.
+	floor := min(maxTombstoneSeq(snap), chunkEnd+1)
+	return func(f sealedCompactionSegment) (compactionRewriteResult, error) {
+		if f.header.EventCount == 0 || f.header.MinSeq >= floor {
+			return compactionRewriteResult{file: f, blocks: int(f.header.BlockCount)}, nil
+		}
+		return o.rewriteSegmentDisaggregated(ctx, gctx, f, snap, rule, reserve)
+	}
 }
 
 // compactionCandidateDIDs returns the distinct DIDs across both
@@ -473,15 +522,15 @@ func defaultCompactionRewriteWorkers() int {
 
 func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *ingest.Writer) error {
 	if o.cfg.CompactionInterval == 0 {
-		if o.cfg.CompactionSchedule != nil {
-			o.cfg.CompactionSchedule.disable()
+		if err := o.setCompactionSchedule(ctx, time.Time{}); err != nil {
+			return err
 		}
 		<-ctx.Done()
 		return ctx.Err()
 	}
 
-	if o.cfg.CompactionSchedule != nil {
-		o.cfg.CompactionSchedule.completePass(time.Now().Add(o.cfg.CompactionInterval))
+	if err := o.setCompactionSchedule(ctx, time.Now().Add(o.cfg.CompactionInterval)); err != nil {
+		return err
 	}
 
 	// Spec §5 failure policy: a failed pass aborts without advancing
@@ -489,24 +538,35 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *inges
 	// is the operator's paging signal. A pass error must never tear
 	// down the daemon (it would cancel the live consumer and turn a
 	// transient IO error into an ingestion outage / crash loop).
+	//
+	// Disaggregated mode is the exception for the errors a retry cannot
+	// fix: an ended session refuses every later transaction, and
+	// corruption is fatal to every leader. Both return, so the election
+	// loop restarts the session or exits.
 	var lastPass time.Time
-	runPass := func() {
+	runPass := func() error {
 		err := o.runDeleteCompaction(ctx, compactionSteady, liveWriter)
 		completed := time.Now()
-		if o.cfg.CompactionSchedule != nil {
-			if err != nil {
-				// A failed pass may have rewritten some files before the
-				// durable watermark failed. Keep the schedule unknown until
-				// the next pass starts rather than advertise freshness.
-				o.cfg.CompactionSchedule.failPass()
-			} else {
-				o.cfg.CompactionSchedule.completePass(completed.Add(o.cfg.CompactionInterval))
-			}
+		if o.cfg.Disaggregated != nil && compactionPassFatal(err) {
+			return err
+		}
+		var serr error
+		if err != nil {
+			// A failed pass may have rewritten some files before the
+			// durable watermark failed. Keep the schedule unknown until
+			// the next pass starts rather than advertise freshness.
+			serr = o.setCompactionSchedule(ctx, time.Time{})
+		} else {
+			serr = o.setCompactionSchedule(ctx, completed.Add(o.cfg.CompactionInterval))
+		}
+		if serr != nil {
+			return serr
 		}
 		if err != nil && ctx.Err() == nil {
 			o.logger.ErrorContext(ctx, "steady compaction pass failed; will retry", "err", err)
 		}
 		lastPass = completed
+		return nil
 	}
 
 	timer := time.NewTimer(o.cfg.CompactionInterval)
@@ -521,7 +581,9 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *inges
 				continue
 			}
 
-			runPass()
+			if err := runPass(); err != nil {
+				return err
+			}
 
 			o.cfg.Metrics.incCompactionEarlyPass()
 			if !timer.Stop() {
@@ -532,10 +594,20 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *inges
 			}
 			timer.Reset(o.cfg.CompactionInterval)
 		case <-timer.C:
-			runPass()
+			if err := runPass(); err != nil {
+				return err
+			}
 			timer.Reset(o.cfg.CompactionInterval)
 		}
 	}
+}
+
+// compactionPassFatal reports whether a failed pass must stop the compactor
+// rather than wait for the next pass: the leader session ended, or the
+// catalog is corrupt.
+func compactionPassFatal(err error) bool {
+	_, corrupt := catalog.IsCorruption(err)
+	return corrupt || errors.Is(err, catalog.ErrSessionEnded)
 }
 
 func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
@@ -543,66 +615,50 @@ func (o *Orchestrator) rebuildLiveTombstones(ctx context.Context) error {
 		return nil
 	}
 
-	segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 	watermark, _, err := loadCompactionWatermark(o.cfg.Store)
 	if err != nil {
 		return err
 	}
-
-	files, err := ingest.SegmentFilesFS(o.cfg.FS, segmentsDir)
-	if err != nil {
-		return fmt.Errorf("orchestrator: compaction: rebuild tombstones list: %w", err)
+	cat := o.compactionCatalog()
+	if err := cat.Refresh(ctx); err != nil {
+		return fmt.Errorf("orchestrator: compaction: rebuild tombstones refresh: %w", err)
 	}
+	view, fetcher := cat.Snapshot(), cat.Fetcher()
 
+	// Blocks entirely at or below the watermark are already physically
+	// compacted; their tombstones can contribute nothing (rebuild cost must
+	// scale with the watermark backlog, not the archive — spec §3.4), so
+	// start past them. The refs run through the active tail's durable
+	// blocks too.
+	// Merge keeps each key's highest seq, so blocks can fold in any order.
 	snap := tombstone.Snapshot{Records: make(map[tombstone.RecordKey]uint64), DIDs: make(map[string]tombstone.DIDTombstone)}
-	for _, f := range files {
-		if err := ctx.Err(); err != nil {
-			return err
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(tombstoneRebuildConcurrency)
+	for ref := range view.RefsFrom(catalog.Main, watermark+1) {
+		if gctx.Err() != nil {
+			break
 		}
-		r, err := segment.Open(segment.ReaderConfig{Path: f.Path, FS: o.cfg.FS, SkipChecksum: true})
-		if err == nil {
-			// Segments and blocks entirely at or below the watermark
-			// are already physically compacted; their tombstones can
-			// contribute nothing (rebuild cost must scale with the
-			// watermark backlog, not the archive — spec §3.4).
-			h := r.Header()
-			if h.MaxSeq <= watermark {
-				_ = r.Close()
-				continue
+		g.Go(func() error {
+			events, err := catalog.DecodeRef(gctx, fetcher, ref)
+			if err != nil {
+				return fmt.Errorf("orchestrator: compaction: rebuild decode segment %d block %d: %w", ref.Segment, ref.Block, err)
 			}
-			blocks := r.Blocks()
-			for i := range blocks {
-				if blocks[i].MaxSeq <= watermark {
-					continue
-				}
-				events, err := r.DecodeBlock(i)
-				if err != nil {
-					_ = r.Close()
-					return fmt.Errorf("orchestrator: compaction: rebuild decode %s block %d: %w", f.Path, i, err)
-				}
-				part, err := tombstone.Fold(events, watermark)
-				if err != nil {
-					_ = r.Close()
-					return fmt.Errorf("orchestrator: compaction: rebuild fold %s block %d: %w", f.Path, i, err)
-				}
-				snap.Merge(part)
-			}
-			_ = r.Close()
-			continue
-		}
-		if !errors.Is(err, segment.ErrActiveSegment) {
-			return fmt.Errorf("orchestrator: compaction: rebuild open %s: %w", f.Path, err)
-		}
-		if err := segment.WalkActiveFS(o.cfg.FS, f.Path, func(events []segment.Event) error {
 			part, err := tombstone.Fold(events, watermark)
 			if err != nil {
-				return err
+				return fmt.Errorf("orchestrator: compaction: rebuild fold segment %d block %d: %w", ref.Segment, ref.Block, err)
 			}
+			mu.Lock()
 			snap.Merge(part)
+			mu.Unlock()
 			return nil
-		}); err != nil {
-			return fmt.Errorf("orchestrator: compaction: rebuild walk active %s: %w", f.Path, err)
-		}
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	o.cfg.Tombstones.Replace(snap)
@@ -647,38 +703,4 @@ func compactionWatermarkLagSeconds(sealed []sealedCompactionSegment, watermark u
 	}
 
 	return float64(tipWitnessedAt-watermarkWitnessedAt) / 1_000_000
-}
-
-// removeStaleCompactionTempsFS deletes leftover *.jss.tmp files from a
-// crashed rewrite. Runs at process startup (Orchestrator.Run) and at
-// the start of every pass. A missing directory is fine — bootstrap has
-// not created it yet.
-func removeStaleCompactionTempsFS(fs vfs.FS, dir string) error {
-	sfs := storageFS(fs)
-	entries, err := sfs.List(dir)
-	if err != nil {
-		if isStorageNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("orchestrator: compaction: readdir tmp cleanup: %w", err)
-	}
-
-	for _, name := range entries {
-		path := sfs.PathJoin(dir, name)
-		info, statErr := sfs.Stat(path)
-		if statErr != nil {
-			if isStorageNotExist(statErr) {
-				continue
-			}
-			return fmt.Errorf("orchestrator: compaction: stat tmp %s: %w", name, statErr)
-		}
-		if info.IsDir() || !strings.HasSuffix(name, ".jss.tmp") {
-			continue
-		}
-		if err := sfs.Remove(path); err != nil && !isStorageNotExist(err) {
-			return fmt.Errorf("orchestrator: compaction: remove tmp %s: %w", name, err)
-		}
-	}
-
-	return nil
 }

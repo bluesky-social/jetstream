@@ -12,8 +12,15 @@ expected-tier: seqlease
 tiers: seqlease
 
 diff --git a/internal/ingest/writer.go b/internal/ingest/writer.go
+index e81ceba..f5ca77d 100644
 --- a/internal/ingest/writer.go
 +++ b/internal/ingest/writer.go
-@@ -584 +584 @@ func (w *Writer) drainSync(ctx context.Context) error {
+@@ -597,7 +597,7 @@ func (w *Writer) drainSync(ctx context.Context) error {
+ 			return err
+ 		}
+ 	}
 -	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, false, w.sampleDurableBatchPrepareValueLocked())
 +	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, true, w.sampleDurableBatchPrepareValueLocked())
+ }
+ 
+ // DrainDurability forces pending event-backed metadata to its block durability

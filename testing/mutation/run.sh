@@ -91,7 +91,7 @@ revert_current() {
     if [[ -z "$CURRENT_PATCH" ]]; then
         return 0
     fi
-    if ! git apply --unidiff-zero -R "$CURRENT_PATCH"; then
+    if ! git apply -R "$CURRENT_PATCH"; then
         echo "FATAL: failed to revert $CURRENT_PATCH; working tree is DIRTY — aborting" >&2
         CURRENT_PATCH=""
         exit 2
@@ -152,12 +152,16 @@ for patch in "$MUTANTS_DIR"/*.patch; do
     tiers="${tiers:-default,stress}"
     echo "=== $id (tiers: $tiers) ==="
 
-    if ! git apply --unidiff-zero --check "$patch" 2>"$LOG_ROOT/$id.apply.log"; then
+    # Plain git apply, not --unidiff-zero: a patch must carry context lines so
+    # both directions are anchored by content. A zero-context hunk drifts onto
+    # an identical line elsewhere as the file changes (specs/gotchas.md), so
+    # it reports STALE here instead of silently mutating the wrong code.
+    if ! git apply --check "$patch" 2>"$LOG_ROOT/$id.apply.log"; then
         echo "    STALE (patch no longer applies — refresh needed)"
         record_result "$id" "STALE" "STALE" "patch no longer applies — refresh needed"
         continue
     fi
-    git apply --unidiff-zero "$patch"
+    git apply "$patch"
     CURRENT_PATCH="$patch"
 
     if ! go build ./... >"$LOG_ROOT/$id.build.log" 2>&1; then
@@ -258,15 +262,14 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     #     rewrite. TestOracle_RestartTornActiveSegmentTail*
                     #     covers post-crash truncate/corrupt-at-offset recovery.
                     #   - orchestrator unit level: TestRunDeleteCompaction_ENOSPC*
-                    #     and TestRunImport_*SegmentIOFault*/ENOSPC* pin the
-                    #     fail-loud + disk-full operator-message contract
-                    #     directly on runDeleteCompaction / RunImport.
+                    #     pins the fail-loud + disk-full operator-message
+                    #     contract directly on runDeleteCompaction.
                     #   - segment unit level: TestFlushReturnsENOSPC* and the
-                    #     Patch/Rewrite (op, ordinal) fault sweeps pin every seam
+                    #     Rewrite (op, ordinal) fault sweep pin every seam
                     #     consult, so a dropped/reordered consult is a fast kill.
                     cmd=(go test "${RACE_FLAG[@]}"
                          ./internal/oracle ./internal/ingest/orchestrator ./segment
-                         -run 'TestOracle_RestartSegmentFault|TestOracle_RestartTornActiveSegmentTail|TestRunDeleteCompaction_ENOSPC|TestRunImport_ENOSPC|TestRunImport_SegmentIOFaultSweep|TestFlushReturnsENOSPC|TestPatchIOFaultSweep|TestRewriteIOFaultSweep|TestNewRemovesEmptyFileWhenInitFails'
+                         -run 'TestOracle_RestartSegmentFault|TestOracle_RestartTornActiveSegmentTail|TestRunDeleteCompaction_ENOSPC|TestFlushReturnsENOSPC|TestRewriteIOFaultSweep|TestNewRemovesEmptyFileWhenInitFails'
                          -count=1 -timeout "$segmentfault_timeout") ;;
 				powerloss)
                     # Power-loss tier (#264): strict in-memory storage and
@@ -386,6 +389,24 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     cmd=(go test "${RACE_FLAG[@]}"
                          ./internal/oracle ./internal/ingest/live
                          -run 'TestOracle_RelaySeq|TestProcessBatch_ReplayedAccountEvent'
+                         -count=1 -timeout "$default_timeout") ;;
+                disagg)
+                    # Disaggregated-storage tier (Stage 2 S2.19, extended in
+                    # S3.5 and S4.5): kills mutants in the catalog scripts,
+                    # the hot and direct writers, merge, the follower, live
+                    # ingest's durable batch state, sparse compaction and
+                    # object GC (m062-m077). Layers in one `go test`: the
+                    # layer 3 oracle (eight full seeds, each a whole
+                    # lifecycle from an empty catalog with leader kills in
+                    # bootstrap, merge, steady state and compaction, a held
+                    # reader over replaced generations, and GC; fake time,
+                    # one child process per seed, no containers), the
+                    # catalog script and follower contract tests, the
+                    # sparse rewrite and GC collector tests, and the
+                    # live/syncstate regressions.
+                    cmd=(env JETSTREAM_ORACLE_DISAGG_SEEDS=1,2,3,4,5,6,7,8 go test "${RACE_FLAG[@]}"
+                         ./internal/oracle ./internal/catalog ./internal/catalog/follower ./internal/ingest/live ./internal/ingest/syncstate ./segment ./internal/objstore/protocol
+                         -run '^TestDisagg_Oracle$|^TestScripts_|^TestFollower_|^TestServe_|^TestConsumer_Hot_|^TestStateStore_|^TestSparseRewrite|^TestGC'
                          -count=1 -timeout "$default_timeout") ;;
                 *)
                     echo "error: unknown tier '$tier' in $id" >&2

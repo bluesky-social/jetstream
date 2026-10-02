@@ -5,15 +5,18 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 53 active mutants on disk
-(m001–m061; m007, m010, m013, m014, m020, m021, m023, m025 retired). Current
-union baseline after issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
+**Current catalog (keep this line current): 68 active mutants on disk
+(m001–m077; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
+union baseline after disaggregated-storage compaction and GC coverage (Stage 4
+S4.5, m073–m077), disaggregated-storage lifecycle coverage (Stage 3 S3.5,
+m070–m072), disaggregated-storage coverage (Stage 2 S2.19, m062–m069),
+issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **53 killed, 0 survived,
+coverage: **68 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
-m046-m050 cover fsync omission/reordering and Linux SyncWrites downgrades.
+m046-m050 cover fsync omission/reordering and Linux SyncWrites downgrades (m048 since retired with `segment/patch.go`).
 m051 covers the merge-cleanup data-dir fsync ordering (the powerloss tier now
 also runs `./internal/ingest/orchestrator`'s `TestRunMerge_StrictMemPowerLoss*`
 to catch it and the restart-after-cleanup guard sibling).
@@ -22,6 +25,14 @@ relay-gap/direct routing, and discovery-time PDS attribution.
 m056–m061 cover abandoned-lease recovery, renewal, durable gap registration,
 cross-segment and same-segment unregistered replay holes, and non-terminal
 drain semantics.
+m062–m069 cover disaggregated storage: fencing, fold, the hot-batch relay
+cursor, follower serving, seal order, the commit scripts' seq and reference
+checks, and verifier state durability (the `disagg` tier).
+m070–m072 cover the disaggregated lifecycle: the direct-mode block seq check,
+merge's final transaction, and the per-DID pending sync-state queue.
+m073–m077 cover disaggregated compaction and GC: GC's claim re-check, the
+sparse rewrite's vanished-DID count and collection counts, the compaction
+refresh after a publish, and GC_DELAY.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -72,6 +83,131 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Campaign 2026-09-26 — S4.5 compaction and GC; m073–m077, m024/m028/m045 refresh
+
+A full-catalog campaign in the disposable clean worktree at `51d744b`, after
+the layer 3 oracle grew compaction, GC and a held reader that follows every
+sealed segment's generations (plan S4.4 and S4.5). Each `expected-tier` was
+written before the first run. 65 mutants were killed; m024, m028 and m045
+were STALE. S4.2 split the compaction rewrite into a local and a
+disaggregated rewriter behind `applyCompactionChunk`, and moved the local
+watermark save behind `advanceCompactionWatermark`, so `64c8d90` refreshed
+all three patches to the same bugs in the local rewriter. Single runs at
+`64c8d90` killed all three at their original tiers.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m073_gc_claim_recheck_skipped | KILLED@disagg | unit only: `TestScripts_GCClaimReferenced` |
+| m074_sparse_vanished_did_miscount | KILLED@disagg | oracle: held reader, `segment verify: header unique_did_count mismatch` (seeds 1 and 5 of 8); unit: `TestSparseRewriteMatchesRewrite` |
+| m075_sparse_collection_count_stale | KILLED@disagg | oracle: held reader, collection count mismatch (all 8 seeds); unit: `TestSparseRewriteMatchesRewrite` |
+| m076_compaction_skips_refresh_after_publish | KILLED@disagg | oracle: the leader exits on corruption, main segment not sealed at the source generation (seeds 2, 7 and 8) |
+| m077_gc_ignores_delay | KILLED@disagg | oracle: held reader's late read, object no longer available (all 8 seeds); unit: `TestGC` |
+| m024_compaction_over_drop_survivors (refreshed) | KILLED@default | unchanged from its last banked result |
+| m028_compaction_watermark_save_error_swallowed (refreshed) | KILLED@storefault | unchanged from its last banked result |
+| m045_compaction_rewrite_error_swallowed (refreshed) | KILLED@segmentfault | unchanged from its last banked result |
+
+Notes:
+
+- **m073 is unit-only by design**, like m067 and m070. Every reference
+  clears `unreferenced_at` (§7.4), so the re-check never fires in a correct
+  run and no oracle path reaches it.
+- **m076 models the bug the source check guards, not the check.** Removing
+  `PublishGeneration`'s source-generation check alone is an equivalent
+  mutant: a source that a later generation replaced has already been
+  deleted from the catalog, so the missing-generation check fires first.
+  The mutant instead drops the leader's refresh after a publishing chunk,
+  so the next chunk of the same pass rewrites a replaced generation. It
+  only fires when one pass spans more than one chunk (cap 4) and rewrites a
+  segment in two of them, hence three of eight seeds.
+- **The held reader is new** in the layer 3 oracle. It runs
+  `segment.VerifySealedMetadata` on each generation while it is current,
+  which is what kills m074 and m075 end to end: both leave every row
+  correct, so a row comparison alone cannot see them. m074 needs a DID whose rows span a
+  fetched and an unfetched block, which two of eight seeds produce.
+- The auto-extracted notes for m073–m077 quoted fault-injection log lines
+  and were rewritten by hand in `baseline.json`. Unchanged mutants keep
+  their previously banked notes.
+- The baseline now records 68 mutants: 68 killed, 0 survived, 0 STALE or
+  build-broken. The gate passes against the campaign result with the three
+  refreshed single runs merged in.
+
+## Campaign 2026-09-26 — S3.5 lifecycle; m070–m072, m003/m006 refresh
+
+A full-catalog campaign in the disposable clean worktree at `f39304d`, after
+the layer 3 oracle grew to cover bootstrap, merge and steady state (plan
+S3.5). The `disagg` tier now runs the lifecycle harness. Each `expected-tier`
+was written before the first run. 61 mutants were killed; m003 and m006 were
+STALE. S3.3 renamed the merge runner's source field and moved the source
+commit call, so `9635bde` refreshed both patches to the same bugs, and single
+runs at `9635bde` killed both at their original tiers.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m070_direct_block_seq_check_skipped | KILLED@disagg | unit only: `TestScripts_DirectSeqMismatch` |
+| m071_merge_leaves_bootstrap_live_seq | KILLED@disagg | oracle: catalog invariant 2 (a seq key for `bootstrap_live`, which has no segments) at the revision of merge's final transaction |
+| m072_sync_state_newest_pending_only | KILLED@disagg | unit: `TestStateStore_PipelinedSavesPromoteEach` |
+| m003_merge_cursor_no_advance (refreshed) | KILLED@restart-multisource | unchanged from its last banked result |
+| m006_merge_commit_error_swallowed (refreshed) | KILLED@storefault | unchanged from its last banked result |
+
+Notes:
+
+- **m070 is unit-only by design**, like m067. Every direct-mode session
+  reloads its seq from the catalog, including after a commit that applied but
+  reported failure, so no oracle path reaches a block at the wrong seq.
+- **m071 prediction miss (in the kill path, not the tier).** Its first header
+  predicted the after-merge wait (`mergePending`) would catch the leftover
+  key. The per-revision invariant check fires first; `f39304d`
+  rewrote the header to say so. The auto-extracted note quoted a fault
+  injection log line and was rewritten by hand in `baseline.json`.
+- **m072 models the production bug the lifecycle oracle found**
+  (`specs/oracle/2026-09-26-disagg-pipelined-chain-state-hidden.md`). The
+  oracle hit it in about 4% of runs, too rare for eight seeds, so the unit
+  test is the executioner.
+- The baseline now records 63 mutants: 63 killed, 0 survived, 0 STALE or
+  build-broken.
+
+## Campaign 2026-09-25 — `disagg` tier; m062–m069 (Stage 2 S2.19)
+
+Targeted campaign, then a full-catalog baseline, both in the disposable clean
+worktree at `87b0384`. The new `disagg` tier runs the layer 3 disaggregated
+oracle (`TestDisagg_Oracle`, full mode, seeds 1–8, every scheduled fault) and
+the catalog, follower, hot-writer and syncstate unit suites that pin the same
+contracts. It takes about 2s. Each `expected-tier` was written before the
+first run. The full baseline killed all 60 active mutants, with zero
+survivors, stale patches, or build-broken mutants.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m062_stale_leader_fence_ignored | KILLED@disagg | oracle 8/8 seeds: per-revision catalog invariants and seq corruption from the deposed leader's interleaved writes; `TestScripts_FenceLost` |
+| m063_fold_leaves_first_hot_batch | KILLED@disagg | oracle 8/8: a folded batch left in `hot_batches` overlaps its block, and the fold fails loud; `TestScripts_HappyPath` and others |
+| m064_relay_cursor_per_block | KILLED@disagg | oracle 8/8: events archived twice after failover (relay/cursor lagged the committed rows); `TestConsumer_Hot_ChainStateCommitsWithLastRow`, `TestConsumer_Hot_SplitCommitRelayCursor` |
+| m065_follower_hides_newest_hot_batch | KILLED@disagg | oracle 8/8 after the serve bound below; `TestFollower_*` |
+| m066_seal_reverses_block_order | KILLED@disagg | oracle 8/8: the follower reports corruption at first catalog load; `TestServe_*` |
+| m067_hot_batch_seq_check_skipped | KILLED@disagg | unit only: `TestScripts_SeqMismatch`, `TestScripts_SeqKeyCorrupt` |
+| m068_reference_check_skipped | KILLED@disagg | unit only: `TestScripts_MissingReference` |
+| m069_sync_state_promoted_after_append | KILLED@disagg | oracle 8/8: a whole event archived twice after a leader crash; `TestConsumer_Hot_ChainStateCommitsWithLastRow` |
+
+Notes:
+
+- **m065 prediction miss.** It was predicted as an oracle kill, but the first
+  run survived the oracle: the hidden newest hot batch reappeared when the 30s
+  `BlockMaxAge` fold turned it into a block, well inside the 2-minute converge
+  wait. The oracle now bounds serving (`disaggServeTimeout`, 10s of fake
+  time). Once the catalog holds every model row and stops changing, pods must
+  serve them within the bound, or the run fails. That kills m065 on every
+  seed. Production code was not changed.
+- **m067 and m068 are unit-only by design.** The oracle's leaders never send
+  a hot batch at the wrong seq or reference a missing object, so the checks
+  those mutants remove never fire there. The script tests drive those inputs
+  directly.
+- **m062** was predicted as a `staleWrites` `ErrFenced` kill. The oracle
+  kills it earlier: the deposed leader's writes break the per-revision catalog
+  invariants and the seq chain before the stale-write check runs.
+- The auto-extracted notes for m062–m069 quoted the first `oracle:` line,
+  which is a fault-injection log line, not the failure. They were rewritten
+  by hand in `baseline.json`, and so were the curated m011 and m056–m061
+  notes, which the regeneration had reset to "see log".
 
 ## Campaign 2026-08-25 (issue #345 client-visible seq leases)
 
@@ -136,6 +272,7 @@ remain below so the reasoning is not lost.
 | m021_overlay_record_seq_base_zero | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m023_overlay_drop_record_tombstones | 2026-06-29 | Same — `internal/overlay` deleted in #177. |
 | m025_compaction_overdrop_above_watermark | 2026-06-29 | Mutated `Set.SnapshotRange` (unbounded in-memory snapshot), deleted in #178. The on-disk windowed fold cannot reproduce it: `targetWatermark` is the last sealed segment's MaxSeq, so no decoded event exceeds the fold window. The above-watermark over-drop is unreachable post-#178. #183's re-derivation analysis (2026-07-04 section below) concluded no single-edit replacement exists: the recorder is a regression assertion without a gated mutant. |
+| m048_patch_parent_dir_fsync_deleted | 2026-09-25 | Targets `segment/patch.go`, deleted with timestamp import (disaggregated storage v2 S0.1; re-adding import is #354). `segment.Rewrite` is now the only rewriter; its parent-dir fsync stays covered by m047. |
 
 ## Campaign 2026-07-07 (#264 — power-loss durability boundary)
 
@@ -1686,3 +1823,34 @@ executioner from "pending #262" to "active".
 Full-campaign re-run deferred to Jim on a clean tree per the mutation-gate
 dirty-tree guard; the scoped m044/m045 re-runs above cover the tier this change
 touches.
+
+## Refresh 2026-09-29 — last zero-context patches converted; two had drifted
+
+A check with plain `git apply --check` reported 12 mutants as stale. They were
+not: the driver applied patches with `--unidiff-zero`, and those 12, plus m050,
+were the catalog's remaining zero-context patches, which plain `git apply`
+always rejects. Every one still applied under the driver's flags. But each
+zero-context patch was re-derived as a 3-line context diff at its authoring
+commit and re-applied at HEAD. That showed two had drifted onto an identical
+line in a sibling function, the failure `specs/gotchas.md` describes for m044:
+
+- **m027** mutated `maybeGetRepoResponseFault` instead of
+  `maybeGetRepoHTTPFault`, so it no longer modeled the fault it documents.
+- **m060** mutated `drainAsync` instead of `drainSync`, the other branch of
+  `DrainDurability`.
+
+Both kept reporting KILLED, so the gate could not see it. m058's context moved
+in the metastore refactor (`cfg.Store.Commit` became `b.Commit`), but its hunk
+still landed correctly.
+
+Changes: all 13 patches (m015, m026, m027, m043, m050, m052–m058, m060) are
+now 3-line context diffs pinned to the site their header describes, each
+verified to round-trip with a clean tree. `run.sh` applies and reverts without
+`--unidiff-zero`, so a zero-context patch reports STALE instead of drifting,
+and `TestCatalogPatchesCarryContext` (`testing/mutation/gate`) fails the
+default `just` run on one.
+
+Re-run through the driver: all 13 KILLED at their baseline tiers (m015, m026,
+m027, m043 @default; m050 @powerloss; m052–m055 @pdsbackfill; m056–m058, m060
+@seqlease). m027 now dies on "configured getRepo HTTP faults must fire", as its
+`expected-detection` predicts. No baseline change.

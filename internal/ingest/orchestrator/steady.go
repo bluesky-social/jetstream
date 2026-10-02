@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/obs"
@@ -53,7 +54,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			tombstoneCap = 0
 		}
 
-		c, err := live.Open(live.Config{
+		cfg := live.Config{
 			DataDir:                  o.cfg.DataDir,
 			SegmentsDir:              segmentsDir,
 			FS:                       o.cfg.FS,
@@ -74,15 +75,29 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			CompactionTrigger:     o.compactionTrigger,
 			SegmentMetrics:        o.cfg.SegmentMetrics,
 			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
+			MaxEventsPerBlock:     o.cfg.SteadyMaxEventsPerBlock,
 			OnEvent:               o.cfg.OnEvent,
 			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
-			OnAfterSeal:           o.cfg.IngestOnAfterSeal,
-			TimestampStamper:      o.cfg.TimestampStamper,
+			Namespace:             catalog.Main,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,
 
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
+		}
+		if d := o.cfg.Disaggregated; d != nil {
+			// Hot batches commit seq/next with their rows, so there is no
+			// seq lease, local directory, or local catalog.
+			hot, err := d.Hot(ctx)
+			if err != nil {
+				return fmt.Errorf("orchestrator: open hot mode: %w", err)
+			}
+			cfg.Hot = hot
+			cfg.DataDir, cfg.SegmentsDir, cfg.FS = "", "", nil
+			cfg.ReserveClientVisibleSeqs = false
+		} else {
+			cfg.Catalog = o.segments()
+		}
+		c, err := live.Open(cfg)
 		if err != nil {
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)
 		}
@@ -90,10 +105,8 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			if cerr := c.Close(); cerr != nil {
 				o.logger.ErrorContext(ctx, "close steady-state live consumer", "err", cerr)
 			}
-			o.steadyWriter.Store(nil)
 		}()
 
-		o.steadyWriter.Store(c.Writer())
 		if o.cfg.OnSteadyStateWriter != nil {
 			o.cfg.OnSteadyStateWriter(c.Writer())
 		}

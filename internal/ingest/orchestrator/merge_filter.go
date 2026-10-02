@@ -7,11 +7,12 @@
 package orchestrator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -59,7 +60,7 @@ func shouldKeep(ev *segment.Event, st *backfill.RepoStatus) bool {
 // merge run. Pebble I/O failures (other than ErrNotFound) latch a
 // sticky error on the cache; subsequent lookups return it.
 type repoStatusLookup struct {
-	store     *store.Store
+	store     metastore.Store
 	cache     map[string]*backfill.RepoStatus
 	stickyErr error
 	onLookup  func() // called on first-time-seen DIDs (for metrics); nil-safe
@@ -67,7 +68,7 @@ type repoStatusLookup struct {
 
 // newRepoStatusLookup builds an empty cache. onLookup is invoked once
 // per first-time-seen DID so callers can wire a metric.
-func newRepoStatusLookup(s *store.Store, onLookup func()) *repoStatusLookup {
+func newRepoStatusLookup(s metastore.Store, onLookup func()) *repoStatusLookup {
 	return &repoStatusLookup{
 		store:    s,
 		cache:    make(map[string]*backfill.RepoStatus),
@@ -95,8 +96,8 @@ func (l *repoStatusLookup) get(did string) (*backfill.RepoStatus, error) {
 		l.onLookup()
 	}
 
-	val, closer, err := l.store.Get(backfill.RepoKey(did))
-	if errors.Is(err, store.ErrNotFound) {
+	val, err := l.store.Get(context.Background(), backfill.RepoKey(did))
+	if errors.Is(err, metastore.ErrNotFound) {
 		l.cache[did] = nil
 		return nil, nil
 	}
@@ -104,7 +105,6 @@ func (l *repoStatusLookup) get(did string) (*backfill.RepoStatus, error) {
 		l.stickyErr = fmt.Errorf("orchestrator: merge: lookup repo/%s: %w", did, err)
 		return nil, l.stickyErr
 	}
-	defer func() { _ = closer.Close() }()
 
 	rs, err := backfill.DecodeRepoStatus(val)
 	if err != nil {

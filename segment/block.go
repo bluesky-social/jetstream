@@ -16,6 +16,12 @@ import (
 // durable writer. Append still validates internally because segment
 // is the final invariant boundary for on-disk data.
 func ValidateEvent(ev Event) error {
+	return validateEvent(&ev)
+}
+
+// validateEvent is ValidateEvent by pointer, so the per-event append
+// path does not copy the Event again just to validate it.
+func validateEvent(ev *Event) error {
 	if !ev.Kind.Valid() {
 		return fmt.Errorf("%w: %d", ErrInvalidKind, ev.Kind)
 	}

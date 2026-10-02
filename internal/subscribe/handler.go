@@ -5,23 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/objstore"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble/vfs"
 	"github.com/coder/websocket"
 )
 
@@ -40,18 +45,31 @@ const (
 // wired exactly once at process startup, so a panic at construction
 // time is the right granularity.
 type Subscription struct {
-	Tail     *Tail
-	Store    *store.Store
+	Tail *Tail
+	// Ready gates every request with a 503 until the archive is safe to
+	// expose. Nil means lifecycle.SteadyState(Store), so one of the two
+	// is required.
+	Ready    lifecycle.Readiness
+	Store    metastore.Store
 	Manifest *manifest.Manifest // optional; required for cursor replay
 	Writer   *ingest.Writer     // optional; required for cursor replay
-	FS       vfs.FS
+	// Catalog and Fetcher resolve timestamp cursors to a seq inside the
+	// manifest's candidate segment. Optional; without them a timestamp
+	// cursor starts at its candidate segment's first seq.
+	Catalog catalog.Catalog
+	Fetcher catalog.Fetcher
 	// WriterRef, when non-nil, supersedes Writer. Resolved at request
 	// time; supports cmd/jetstream's deferred-writer-publication
 	// pattern where the orchestrator publishes the writer pointer
 	// after steady-state begins.
 	WriterRef *atomic.Pointer[ingest.Writer]
-	Logger    *slog.Logger
-	Metrics   *Metrics
+	// Seqs, when non-nil, supersedes Writer and WriterRef as the seq state
+	// cursor resolution reads. A disaggregated pod sets it to its catalog
+	// follower, which has no writer; if Seqs is also a SeqSyncer, a seq
+	// cursor past its view syncs before it is resolved (design §11.6).
+	Seqs    SeqSource
+	Logger  *slog.Logger
+	Metrics *Metrics
 
 	// Lookback is the cursor-replay clamp duration. Zero disables
 	// cursor replay entirely (cursors are silently dropped to live).
@@ -61,7 +79,8 @@ type Subscription struct {
 	// subprotocol, kinds/dids/collections filters, XRPC errors, and
 	// server-push only. It emits sync and resync replacement rows,
 	// rejects below-floor seqs with CursorTooOld, and announces timestamp
-	// clamping with OutdatedCursor. These policies must stay together.
+	// clamping with OutdatedCursor and future seq cursors with
+	// FutureCursor. These policies must stay together.
 	// False preserves the legacy /subscribe contract. See doc.go.
 	V2 bool
 }
@@ -73,11 +92,36 @@ type eventFilter interface {
 	MaxMessageSizeBytes() uint32
 }
 
+// SeqSource is the seq state cursor resolution reads. *ingest.Writer
+// implements it in local mode, the catalog follower in disaggregated mode.
+type SeqSource interface {
+	NextSeq() uint64
+	SeqGaps() *seqspace.Gaps
+	ActiveTimeFloorSeq(timeUS int64) uint64
+}
+
+// SeqSyncer brings a SeqSource's view up to seq, so a client that saw seq
+// on a fresher pod is not told its cursor is in the future.
+type SeqSyncer interface {
+	SyncSeq(ctx context.Context, seq uint64) error
+}
+
 func (d Subscription) writer() *ingest.Writer {
 	if d.WriterRef != nil {
 		return d.WriterRef.Load()
 	}
 	return d.Writer
+}
+
+// seqs returns the request's SeqSource, or nil before one is available.
+func (d Subscription) seqs() SeqSource {
+	if d.Seqs != nil {
+		return d.Seqs
+	}
+	if w := d.writer(); w != nil {
+		return w
+	}
+	return nil
 }
 
 func NewHandler(deps Subscription) http.Handler {
@@ -87,8 +131,11 @@ func NewHandler(deps Subscription) http.Handler {
 	if deps.Tail == nil {
 		panic("subscribe: HandlerDeps.Tail is required")
 	}
-	if deps.Store == nil {
-		panic("subscribe: HandlerDeps.Store is required")
+	if deps.Ready == nil {
+		if deps.Store == nil {
+			panic("subscribe: HandlerDeps.Ready or HandlerDeps.Store is required")
+		}
+		deps.Ready = lifecycle.SteadyState(deps.Store)
 	}
 	logger := deps.Logger.With(slog.String("component", "subscribe/handler"))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -142,8 +189,8 @@ func negotiateSubprotocol(r *http.Request) []string {
 }
 
 func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *slog.Logger) {
-	if !lifecycle.IsSteadyState(deps.Store) {
-		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: bootstrap in progress")
+	if err := deps.Ready.Ready(r.Context()); err != nil {
+		httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: "+err.Error())
 		return
 	}
 
@@ -226,10 +273,10 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		// cursor parameter and serve live tip; a documented operator
 		// choice, not a silent gap.
 		cursorPlan = CursorPlan{Mode: ModeLive}
-	case deps.Manifest == nil || deps.writer() == nil:
+	case deps.Manifest == nil || deps.seqs() == nil:
 		// Cursor lookback is enabled but the replay dependencies aren't
 		// available. The dominant case is the steady-state warmup window:
-		// the phase marker is durable (we passed IsSteadyState above) but
+		// the phase marker is durable (we passed the Ready gate above) but
 		// the live consumer hasn't published its writer pointer yet, so
 		// the Tail's live tip is not yet meaningful — Tip() reports 0.
 		// Serving ANY subscriber now is wrong:
@@ -259,16 +306,26 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 			httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", fmt.Sprintf("service not ready: manifest warming up: %s", err.Error()))
 			return
 		}
-		writer := deps.writer()
+		seqs := deps.seqs()
+		if syncer, ok := seqs.(SeqSyncer); ok {
+			if n, err := strconv.ParseUint(rawCursor, 10, 64); err == nil && n < CursorSeqMaxThreshold {
+				if err := syncer.SyncSeq(r.Context(), n); err != nil {
+					deps.Metrics.incCursorRequests("unavailable")
+					httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: archive view is behind the cursor")
+					return
+				}
+			}
+		}
 		resolveStart := time.Now()
 		plan, err := ResolveCursor(rawCursor, CursorEnv{
 			Manifest:         deps.Manifest,
-			FS:               deps.FS,
-			NextSeq:          writer.NextSeq(),
-			Gaps:             writer.SeqGaps(),
+			Catalog:          deps.Catalog,
+			Fetcher:          deps.Fetcher,
+			NextSeq:          seqs.NextSeq(),
+			Gaps:             seqs.SeqGaps(),
 			Lookback:         deps.Lookback,
 			RejectBelowFloor: deps.V2,
-			ActiveTimeFloor:  writer.ActiveTimeFloorSeq,
+			ActiveTimeFloor:  seqs.ActiveTimeFloorSeq,
 		})
 		deps.Metrics.observeCursorResolveSeconds(time.Since(resolveStart).Seconds())
 		if err != nil {
@@ -430,16 +487,12 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		startSeq = deps.Tail.Tip()
 	}
 
-	// A clamped v2 timestamp cursor starts at the retention floor, not
-	// where the client asked; say so in-band before the first event
-	// (subscribeRepos's OutdatedCursor precedent) instead of silently
-	// clamping. Seq-mode below-floor was already rejected pre-upgrade,
-	// and a future cursor clamping to the live tip is the defined
-	// semantics of "start at tip", not a degradation — Mode filters both
-	// out here.
-	if deps.V2 && cursorPlan.Clamped && cursorPlan.Mode == ModeReplayTimeUS {
-		info, ierr := EncodeV2Info("OutdatedCursor",
-			fmt.Sprintf("requested timestamp cursor below retention floor; starting at seq %d", startSeq))
+	// A v2 stream that cannot start where the client asked says so in-band
+	// before the first event (subscribeRepos's OutdatedCursor precedent)
+	// instead of moving the cursor silently. Seq-mode below-floor was
+	// already rejected pre-upgrade.
+	if name, msg := cursorNoticeInfo(cursorPlan, startSeq); deps.V2 && name != "" {
+		info, ierr := EncodeV2Info(name, msg)
 		if ierr != nil {
 			logger.Error("encode info frame", "err", ierr)
 		} else if !writeFrame(ctx, conn, wantZstd, info) {
@@ -452,6 +505,21 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		timeFloorUS = cursorPlan.Requested
 	}
 	runSubscriberLoop(ctx, conn, deps, loadFilter, startSeq, timeFloorUS, scheme, logger)
+}
+
+// cursorNoticeInfo returns the #info name and message for plan's notice, or
+// "" for none. A replay notice names the seq actually resumed from; a live
+// start has none until the first event arrives.
+func cursorNoticeInfo(plan CursorPlan, startSeq uint64) (name, message string) {
+	switch plan.Notice {
+	case NoticeBelowRetention:
+		return "OutdatedCursor", fmt.Sprintf("requested timestamp cursor below retention floor; starting at seq %d", startSeq)
+	case NoticeBeforeArchive:
+		return "OutdatedCursor", fmt.Sprintf("requested timestamp cursor precedes the oldest archived event; starting at seq %d", startSeq)
+	case NoticeFutureSeq:
+		return "FutureCursor", fmt.Sprintf("requested seq cursor %d is beyond this archive's next seq; starting at the live tip", plan.Requested)
+	}
+	return "", ""
 }
 
 // writeFrame writes one already-encoded v2 frame, compressing it for
@@ -563,6 +631,19 @@ func runSubscriberLoop(
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
+	// An unencodable row is skipped for every subscriber that reaches it,
+	// so replaying a range full of them would log once per subscriber per
+	// row. Log the first on each connection; the counter has the rest.
+	encodeErrLogged := false
+
+	writeFailed := func(err error) {
+		if reason := writeFailureReason(ctx, err); reason == "" {
+			deps.Metrics.incCleanDisconnects()
+		} else {
+			deps.Metrics.incDisconnect(reason)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -573,6 +654,11 @@ func runSubscriberLoop(
 			perr := conn.Ping(pingCtx)
 			pcancel()
 			if perr != nil {
+				if writeFailureReason(ctx, perr) == "" {
+					deps.Metrics.incCleanDisconnects()
+				} else {
+					deps.Metrics.incDisconnect(disconnectPingFailed)
+				}
 				return
 			}
 		default:
@@ -592,9 +678,19 @@ func runSubscriberLoop(
 				continue // idle at tip: loop to send a keepalive ping
 			}
 			if errors.Is(err, errColdUnavailable) {
+				deps.Metrics.incDisconnect(disconnectStoreUnavailable)
 				sendError("InternalError", "archive replay unavailable; reconnect")
 				return
 			}
+			if errors.Is(err, objstore.ErrUnavailable) {
+				// An object store outage hits every cold reader at once;
+				// the S3 metrics already count it, so do not log per
+				// connection.
+				deps.Metrics.incDisconnect(disconnectStoreUnavailable)
+				sendError("InternalError", "archive storage unavailable; reconnect later")
+				return
+			}
+			deps.Metrics.incDisconnect(disconnectReadError)
 			logger.Warn("read error", "err", err)
 			sendError("InternalError", "stream read failed; reconnect")
 			return
@@ -609,6 +705,7 @@ func runSubscriberLoop(
 		if next <= cursor {
 			logger.Error("tail ReadFrom returned non-advancing cursor",
 				"cursor", cursor, "next", next, "batch", len(batch))
+			deps.Metrics.incDisconnect(disconnectStalledCursor)
 			sendError("InternalError", "stream read failed; reconnect")
 			return
 		}
@@ -652,7 +749,11 @@ func runSubscriberLoop(
 			}
 			if eerr != nil {
 				deps.Metrics.incEncodeErrors()
-				logger.Warn("encode error", "err", eerr, "kind", int(e.Event.Kind), "did", e.Event.DID)
+				if !encodeErrLogged {
+					encodeErrLogged = true
+					logger.Warn("encode error; further encode errors on this connection are counted only",
+						"err", eerr, "seq", e.Event.Seq, "kind", int(e.Event.Kind), "did", e.Event.DID)
+				}
 				continue
 			}
 
@@ -687,6 +788,7 @@ func runSubscriberLoop(
 			werr := conn.Write(writeCtx, msgType, payload)
 			wcancel()
 			if werr != nil {
+				writeFailed(werr)
 				return
 			}
 
@@ -704,11 +806,32 @@ func runSubscriberLoop(
 		}
 		if slowDetector.observe(cursor, lag) {
 			deps.Metrics.incAdversarialDrops()
+			deps.Metrics.incDisconnect(disconnectConsumerTooSlow)
 			logger.Warn("dropped adversarially slow subscriber", "cursor", cursor, "lag", lag)
 			sendError("ConsumerTooSlow",
 				fmt.Sprintf("reading below the floor rate %d events behind the tip; reconnect with cursor=%d", lag, cursor))
 			return
 		}
+	}
+}
+
+// writeFailureReason returns the disconnects_total reason for a failed frame
+// write, or "" when the client went away. The reader cancels ctx on a client
+// close, but a client that closes and drops its socket can reset the
+// connection before the reader sees the close, so the write fails first with
+// ECONNRESET or EPIPE and ctx is still live.
+func writeFailureReason(ctx context.Context, err error) string {
+	switch {
+	case ctx.Err() != nil,
+		errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.EPIPE),
+		errors.Is(err, net.ErrClosed),
+		errors.Is(err, io.EOF):
+		return ""
+	case errors.Is(err, context.DeadlineExceeded):
+		return disconnectWriteTimeout
+	default:
+		return disconnectWriteError
 	}
 }
 

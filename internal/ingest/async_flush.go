@@ -3,7 +3,6 @@ package ingest
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 
@@ -102,7 +101,6 @@ func (p *asyncFlushPipeline) finish(result asyncFlushResult) {
 }
 
 func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
-	prepareValue := w.sampleDurableBatchPrepareValueLocked()
 	prepared, err := w.active.PrepareFlush()
 	if err != nil {
 		return nil, fmt.Errorf("ingest: prepare async flush: %w", err)
@@ -110,6 +108,9 @@ func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
 	if prepared == nil {
 		return nil, nil
 	}
+	// Sampled only once there is a batch to carry it: a sample may take
+	// state that no later sample repeats (syncstate snapshots are deltas).
+	prepareValue := w.sampleDurableBatchPrepareValueLocked()
 	job := &asyncFlushJob{
 		id:           w.nextAsyncFlushID,
 		prepared:     prepared,
@@ -165,7 +166,7 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		}
 
 		path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))
-		info, statErr := os.Stat(path)
+		info, statErr := statFS(w.cfg.FS, path)
 		if statErr != nil {
 			return fmt.Errorf("ingest: stat active segment: %w", statErr)
 		}
@@ -264,7 +265,7 @@ func (w *Writer) closeAsync() error {
 	if w.active == nil {
 		return flushErr
 	}
-	closeErr := w.active.Close()
+	closeErr := w.closeActiveLocked()
 	if flushErr != nil {
 		return flushErr
 	}
@@ -295,7 +296,8 @@ func (w *Writer) sealActiveAndCloseAsync() error {
 	if w.active == nil {
 		return nil
 	}
-	if _, err := w.active.Seal(); err != nil {
+	res, err := w.active.Seal()
+	if err != nil {
 		if cerr := w.active.Close(); cerr != nil {
 			w.cfg.Logger.Warn("close after failed seal", "err", cerr)
 		}
@@ -304,10 +306,5 @@ func (w *Writer) sealActiveAndCloseAsync() error {
 	if err := w.commitTerminalDurableBatchLocked(); err != nil {
 		return err
 	}
-	sealedIdx := w.activeIdx
-	sealedPath := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(sealedIdx))
-	if err := w.onAfterSealLocked(sealedIdx, sealedPath); err != nil {
-		return err
-	}
-	return nil
+	return w.commit.sealed(w.activeIdx, res)
 }

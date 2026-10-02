@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,20 +17,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	mathrand "math/rand/v2"
 )
 
 // newTestStore opens a fresh metadata pebble db rooted at t.TempDir.
-func newTestStore(t *testing.T) *store.Store {
+func newTestStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return st
@@ -67,9 +67,6 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	if overrides.SegmentIOFaultInjector != nil {
 		cfg.SegmentIOFaultInjector = overrides.SegmentIOFaultInjector
 	}
-	if overrides.TimestampStamper != nil {
-		cfg.TimestampStamper = overrides.TimestampStamper
-	}
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -77,29 +74,32 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	return w
 }
 
-func TestActiveFlushedRangeExcludesPendingAndAdvancesByBlock(t *testing.T) {
+func TestActiveSegmentExcludesPendingAndAdvancesByBlock(t *testing.T) {
 	t.Parallel()
 	w := newTestWriter(t, Config{MaxEventsPerBlock: 2, MaxSegmentBytes: 1 << 30})
+	blocks := func() []segment.BlockInfo {
+		v, ok := w.ActiveSegment()
+		require.True(t, ok)
+		require.Equal(t, uint64(0), v.Index)
+		return v.Blocks
+	}
 
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	_, ok := w.ActiveFlushedRange(1)
-	require.False(t, ok, "pending memory must not be cold-readable")
+	require.Empty(t, blocks(), "pending memory must not be cold-readable")
 
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	r1, ok := w.ActiveFlushedRange(1)
-	require.True(t, ok)
-	require.Equal(t, uint64(0), r1.Index)
-	require.Equal(t, uint64(segment.ReservedHeaderBytes), r1.StartOffset)
-	require.Greater(t, r1.EndOffset, r1.StartOffset)
+	b1 := blocks()
+	require.Len(t, b1, 1)
+	require.Equal(t, uint64(segment.ReservedHeaderBytes), b1[0].Offset)
+	require.Equal(t, [2]uint64{1, 2}, [2]uint64{b1[0].MinSeq, b1[0].MaxSeq})
 
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	_, ok = w.ActiveFlushedRange(3)
-	require.False(t, ok, "the next pending block must remain excluded")
+	require.Len(t, blocks(), 1, "the next pending block must remain excluded")
 	require.NoError(t, w.Append(t.Context(), &segment.Event{Kind: segment.KindCreate, DID: "did:plc:range"}))
-	r2, ok := w.ActiveFlushedRange(3)
-	require.True(t, ok)
-	require.Equal(t, r1.EndOffset, r2.StartOffset)
-	require.Greater(t, r2.EndOffset, r2.StartOffset)
+	b2 := blocks()
+	require.Len(t, b2, 2)
+	require.Equal(t, b1[0].Offset+8+uint64(b1[0].CompressedSize), b2[1].Offset)
+	require.Equal(t, [2]uint64{3, 4}, [2]uint64{b2[1].MinSeq, b2[1].MaxSeq})
 }
 
 func TestActiveTimeFloorSeq_FlushedPendingAndLiveEdge(t *testing.T) {
@@ -119,20 +119,6 @@ func TestActiveTimeFloorSeq_FlushedPendingAndLiveEdge(t *testing.T) {
 
 	seq = w.ActiveTimeFloorSeq(301)
 	require.Equal(t, uint64(4), seq, "a miss parks at the live edge")
-}
-
-type fakeTimestampStamper struct {
-	indexedAt int64
-	err       error
-	seenSeq   uint64
-}
-
-func (s *fakeTimestampStamper) Stamp(_ context.Context, ev *segment.Event) error {
-	s.seenSeq = ev.Seq
-	if s.indexedAt != 0 {
-		ev.IndexedAt = s.indexedAt
-	}
-	return s.err
 }
 
 type durableOrderRecorder struct {
@@ -156,8 +142,8 @@ type seqCommitRecorder struct {
 	rec *durableOrderRecorder
 }
 
-func (r seqCommitRecorder) BeforeWrite(op store.WriteOp, keys [][]byte) error {
-	if op != store.WriteOpBatchCommit {
+func (r seqCommitRecorder) BeforeWrite(op metastore.WriteOp, keys [][]byte) error {
+	if op != metastore.WriteOpBatchCommit {
 		return nil
 	}
 	for _, key := range keys {
@@ -253,12 +239,11 @@ func TestWriterFlushOrdersSegmentSyncBeforeStoreCommit(t *testing.T) {
 		}
 	})
 
-	st, err := store.Open(dataDir, nil,
-		store.WithFS(fs),
-		store.WithFaultInjector(seqCommitRecorder{rec: rec}),
-	)
+	stRaw, err := pebblestore.Open(dataDir, nil,
+		pebblestore.WithFS(fs))
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	t.Cleanup(func() { require.NoError(t, stRaw.Close()) })
+	st := metastore.WithFaults(stRaw, seqCommitRecorder{rec: rec})
 
 	w, err := Open(Config{
 		DataDir:           dataDir,
@@ -292,7 +277,7 @@ func TestWriterStrictMemPowerLossDropsUnsyncedSegmentAndStoreState(t *testing.T)
 	require.NoError(t, fs.MkdirAll(dataDir, 0o755))
 	syncStrictTestDir(t, fs, "/")
 
-	st, err := store.Open(dataDir, nil, store.WithFS(fs))
+	st, err := pebblestore.Open(dataDir, nil, pebblestore.WithFS(fs))
 	require.NoError(t, err)
 	w, err := Open(Config{
 		DataDir:           dataDir,
@@ -320,7 +305,7 @@ func TestWriterStrictMemPowerLossDropsUnsyncedSegmentAndStoreState(t *testing.T)
 	fs.SetIgnoreSyncs(false)
 	require.Equal(t, []uint64{1}, collectActiveSeqs(t, fs, filepath.Join(segmentsDir, SegmentFilename(0))))
 
-	st, err = store.Open(dataDir, nil, store.WithFS(fs))
+	st, err = pebblestore.Open(dataDir, nil, pebblestore.WithFS(fs))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	w, err = Open(Config{
@@ -379,7 +364,7 @@ func TestWriter_ENOSPCSyncFlushReturnsFatalOperatorMessage(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -413,7 +398,7 @@ func TestWriter_ENOSPCAsyncFlushReturnsFatalOperatorMessage(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -462,8 +447,8 @@ func TestOpen_FreshDir(t *testing.T) {
 
 	// seq/next must not be set yet — Open never writes pebble for
 	// a fresh dir (defaults read as 0).
-	_, _, err = w.cfg.Store.Get([]byte(seqNextKey))
-	require.ErrorIs(t, err, pebble.ErrNotFound)
+	_, err = w.cfg.Store.Get(context.Background(), []byte(seqNextKey))
+	require.ErrorIs(t, err, metastore.ErrNotFound)
 }
 
 // TestOpen_FloorsPersistedZeroSeq pins the nextSeq-never-0 invariant
@@ -787,65 +772,6 @@ func TestAppend_LeavesSeqUntouchedOnError(t *testing.T) {
 		"failed Append must not mutate ev.Seq")
 }
 
-func TestAppend_TimestampStamperRunsBeforeAdmission(t *testing.T) {
-	t.Parallel()
-
-	stamper := &fakeTimestampStamper{indexedAt: 1_640_000_000_000_000}
-	w := newTestWriter(t, Config{
-		MaxEventsPerBlock: 64,
-		TimestampStamper:  stamper,
-	})
-
-	ev := segment.Event{
-		WitnessedAt: 1_700_000_000_000_000,
-		Kind:        segment.KindCreate,
-		DID:         "did:plc:a",
-		Collection:  "app.bsky.feed.post",
-		Rkey:        "r1",
-		Payload:     []byte{0xa0},
-	}
-	require.NoError(t, w.Append(t.Context(), &ev))
-	require.Equal(t, uint64(1), stamper.seenSeq, "stamper sees the assigned seq")
-	require.EqualValues(t, 1_640_000_000_000_000, ev.IndexedAt, "caller sees the stamped display time")
-
-	entries, _, ok, atTip := w.ReadLog().ReadFrom(ev.Seq, 1)
-	require.True(t, ok)
-	require.False(t, atTip)
-	require.Len(t, entries, 1)
-	require.EqualValues(t, 1_640_000_000_000_000, entries[0].Event().IndexedAt,
-		"read log must contain the stamped event, not the pre-stamp input")
-}
-
-func TestAppend_TimestampStamperErrorLeavesEventUnadmitted(t *testing.T) {
-	t.Parallel()
-
-	sentinel := errors.New("rule store unavailable")
-	stamper := &fakeTimestampStamper{indexedAt: 1_640_000_000_000_000, err: sentinel}
-	w := newTestWriter(t, Config{
-		MaxEventsPerBlock: 64,
-		TimestampStamper:  stamper,
-	})
-
-	ev := segment.Event{
-		Seq:         0xCAFE,
-		WitnessedAt: 1_700_000_000_000_000,
-		Kind:        segment.KindCreate,
-		DID:         "did:plc:a",
-		Collection:  "app.bsky.feed.post",
-		Rkey:        "r1",
-		Payload:     []byte{0xa0},
-	}
-	err := w.Append(t.Context(), &ev)
-	require.ErrorIs(t, err, sentinel)
-	require.Equal(t, uint64(0xCAFE), ev.Seq, "failed stamp must not publish a phantom seq")
-	require.Zero(t, ev.IndexedAt, "candidate stamp must not leak back to caller on error")
-	require.Equal(t, uint64(1), w.NextSeq(), "failed stamp must not consume a seq")
-
-	_, _, ok, atTip := w.ReadLog().ReadFrom(1, 1)
-	require.False(t, ok)
-	require.True(t, atTip, "failed stamp must not append to the read log")
-}
-
 // TestClose_PersistsNextSeq pins the contract that Close commits
 // the latest in-memory nextSeq to pebble, so a Close → crash →
 // Reopen sequence does not regress nextSeq even when the last
@@ -879,9 +805,8 @@ func TestBlockFlush_AdvancesPebbleSeq(t *testing.T) {
 		require.NoError(t, w.Append(t.Context(), &ev))
 	}
 
-	val, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
+	val, err := w.cfg.Store.Get(context.Background(), []byte(seqNextKey))
 	require.NoError(t, err)
-	defer func() { _ = closer.Close() }()
 	require.Equal(t, uint64(blockSize+1), binary.LittleEndian.Uint64(val))
 	require.Equal(t, uint64(blockSize+1), w.NextSeq())
 }
@@ -1245,7 +1170,7 @@ func TestFlush_InvokesDurableBatchHook(t *testing.T) {
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
 		MaxEventsPerBlock: 2,
-		OnDurableBatch: func(_ context.Context, _ *pebble.Batch, _ uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, _ metastore.Batch, _ uint64, force bool, _ any) (func(), func(error), error) {
 			if force {
 				return nil, nil, nil
 			}
@@ -1284,7 +1209,7 @@ func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1295,7 +1220,7 @@ func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
 		Store:             st,
 		MaxEventsPerBlock: 1, // every append fills a block -> durable commit
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(ctx context.Context, b metastore.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
 			hookCalls++
 			// Mirror the completion batcher's leading guard: a cancelled
 			// context here would abort the post-fsync durable commit.
@@ -1303,7 +1228,8 @@ func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
 				hookCtxErr = err
 				return nil, nil, err
 			}
-			return nil, nil, b.Set([]byte("durable/ok"), []byte("yes"), nil)
+			b.Set([]byte("durable/ok"), []byte("yes"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1319,10 +1245,9 @@ func TestAppendBatch_DurableCommitNotAbortedByCanceledContext(t *testing.T) {
 	require.NoError(t, hookCtxErr, "OnDurableBatch must not observe a cancelled context")
 	require.Equal(t, 1, hookCalls)
 
-	got, closer, err := st.Get([]byte("durable/ok"))
+	got, err := st.Get(context.Background(), []byte("durable/ok"))
 	require.NoError(t, err)
 	require.Equal(t, "yes", string(got))
-	require.NoError(t, closer.Close())
 
 	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
 	require.NoError(t, err)
@@ -1333,7 +1258,7 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1343,12 +1268,13 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 		Store:             st,
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(ctx context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			if force {
 				return nil, nil, nil
 			}
 			hookSeq = nextSeq
-			return nil, nil, b.Set([]byte("hook/ran"), []byte("yes"), nil)
+			b.Set([]byte("hook/ran"), []byte("yes"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1360,10 +1286,9 @@ func TestFlush_StagesDurableBatchHookWithSeq(t *testing.T) {
 	}))
 
 	require.Equal(t, uint64(3), hookSeq)
-	got, closer, err := st.Get([]byte("hook/ran"))
+	got, err := st.Get(context.Background(), []byte("hook/ran"))
 	require.NoError(t, err)
 	require.Equal(t, "yes", string(got))
-	require.NoError(t, closer.Close())
 	persisted, err := loadNextSeq(st, w.cfg.SeqKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), persisted)
@@ -1382,7 +1307,7 @@ func TestFlush_OnDurableBatchErrorPropagates(t *testing.T) {
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
 		MaxEventsPerBlock: 1,
-		OnDurableBatch: func(_ context.Context, _ *pebble.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, _ metastore.Batch, _ uint64, _ bool, _ any) (func(), func(error), error) {
 			return nil, nil, want
 		},
 	})
@@ -1428,9 +1353,8 @@ func TestSealActiveAndClose_SealsAndCloses(t *testing.T) {
 	// directly (rather than reopening the Writer, which would mask a
 	// bug via ScanMaxSeq reconciliation) is what locks in that
 	// SealActiveAndClose actually called saveNextSeq.
-	persisted, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
+	persisted, err := w.cfg.Store.Get(context.Background(), []byte(seqNextKey))
 	require.NoError(t, err)
-	defer func() { _ = closer.Close() }()
 	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted))
 }
 
@@ -1484,7 +1408,7 @@ func TestSealActiveAndClose_OnAfterSealFiresOnce(t *testing.T) {
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			calls++
 			gotIdx = idx
 			gotPath = path
@@ -1494,7 +1418,7 @@ func TestSealActiveAndClose_OnAfterSealFiresOnce(t *testing.T) {
 			require.True(t, ins.Sealed, "callback must observe a sealed segment")
 			require.Equal(t, uint64(1), ins.TotalEvents)
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -1525,10 +1449,10 @@ func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testin
 		MaxEventsPerBlock: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(uint64, string) error {
+		Catalog: SealedPathFunc(segDir, func(uint64, string) error {
 			calls++
 			return wantErr
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -1552,9 +1476,8 @@ func TestSealActiveAndClose_OnAfterSealErrorPropagatesAfterDurableSeal(t *testin
 	require.True(t, ins.Sealed, "hook failure happens after the segment is sealed")
 	require.Equal(t, uint64(3), ins.TotalEvents)
 
-	persisted, closer, getErr := st.Get([]byte(seqNextKey))
+	persisted, getErr := st.Get(context.Background(), []byte(seqNextKey))
 	require.NoError(t, getErr)
-	defer func() { _ = closer.Close() }()
 	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted),
 		"hook failure happens after seq/next is persisted")
 	require.ErrorIs(t, w.Append(t.Context(), &segment.Event{WitnessedAt: 4, Kind: segment.KindCreate, DID: "did:plc:a"}), ErrClosed)
@@ -1583,9 +1506,8 @@ func TestForceRotate_SealsAndOpensNext(t *testing.T) {
 
 	// seq/next was persisted before the seal (same ordering as the
 	// size-based rotation path).
-	persisted, closer, err := w.cfg.Store.Get([]byte(seqNextKey))
+	persisted, err := w.cfg.Store.Get(context.Background(), []byte(seqNextKey))
 	require.NoError(t, err)
-	defer func() { _ = closer.Close() }()
 	require.Equal(t, uint64(4), binary.LittleEndian.Uint64(persisted))
 
 	// The writer remains usable on the next segment.
@@ -1615,7 +1537,7 @@ func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1626,10 +1548,11 @@ func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
 		SegmentsDir: filepath.Join(dir, "segments"),
 		Store:       st,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			gotForce = force
 			gotNextSeq = nextSeq
-			return nil, func(err error) { afterDone <- err }, b.Set([]byte("metadata/only"), []byte("ok"), nil)
+			b.Set([]byte("metadata/only"), []byte("ok"))
+			return nil, func(err error) { afterDone <- err }, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1645,17 +1568,16 @@ func TestDrainDurability_CommitsHookWithoutPendingEvents(t *testing.T) {
 		require.Fail(t, "afterDone did not run")
 	}
 
-	got, closer, err := st.Get([]byte("metadata/only"))
+	got, err := st.Get(context.Background(), []byte("metadata/only"))
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(got))
-	require.NoError(t, closer.Close())
 }
 
 func TestDrainDurability_AsyncCommitsHookWithoutPendingEvents(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1669,9 +1591,10 @@ func TestDrainDurability_AsyncCommitsHookWithoutPendingEvents(t *testing.T) {
 		Store:             st,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
-			return nil, nil, b.Set([]byte("metadata/async-only"), []byte("ok"), nil)
+			b.Set([]byte("metadata/async-only"), []byte("ok"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1688,17 +1611,16 @@ func TestDrainDurability_AsyncCommitsHookWithoutPendingEvents(t *testing.T) {
 	}
 	require.Empty(t, calls)
 
-	got, closer, err := st.Get([]byte("metadata/async-only"))
+	got, err := st.Get(context.Background(), []byte("metadata/async-only"))
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(got))
-	require.NoError(t, closer.Close())
 }
 
 func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1713,10 +1635,11 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 		MaxEventsPerBlock: 64,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			key := fmt.Sprintf("metadata/async-pending/%t", force)
-			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
+			b.Set([]byte(key), []byte("ok"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1735,10 +1658,9 @@ func TestDrainDurability_AsyncFlushesPendingEventsBeforeForcedHook(t *testing.T)
 	require.Empty(t, calls)
 
 	for _, key := range []string{"metadata/async-pending/false", "metadata/async-pending/true"} {
-		got, closer, err := st.Get([]byte(key))
+		got, err := st.Get(context.Background(), []byte(key))
 		require.NoError(t, err)
 		require.Equal(t, "ok", string(got))
-		require.NoError(t, closer.Close())
 	}
 	persisted, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
@@ -1758,7 +1680,7 @@ func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1772,9 +1694,10 @@ func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
 		Store:             st,
 		MaxEventsPerBlock: 64,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
-			return nil, nil, b.Set([]byte("metadata/close"), []byte("ok"), nil)
+			b.Set([]byte("metadata/close"), []byte("ok"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1784,10 +1707,9 @@ func TestDurableBatchClose_RunsAfterPendingEvents(t *testing.T) {
 	require.NoError(t, w.Close())
 
 	require.Equal(t, durableCall{nextSeq: 2, force: true}, requireDurableCall(t, calls))
-	got, closer, err := st.Get([]byte("metadata/close"))
+	got, err := st.Get(context.Background(), []byte("metadata/close"))
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(got))
-	require.NoError(t, closer.Close())
 	persisted, err := loadNextSeq(st, seqNextKey)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), persisted)
@@ -1797,7 +1719,7 @@ func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T)
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1811,9 +1733,10 @@ func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T)
 		Store:             st,
 		MaxEventsPerBlock: 64,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
-			return nil, nil, b.Set([]byte("metadata/seal-close"), []byte("ok"), nil)
+			b.Set([]byte("metadata/seal-close"), []byte("ok"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1823,10 +1746,9 @@ func TestSealActiveAndClose_RunsDurableBatchHookAfterPendingEvents(t *testing.T)
 	require.NoError(t, w.SealActiveAndClose())
 
 	require.Equal(t, durableCall{nextSeq: 2, force: true}, requireDurableCall(t, calls))
-	got, closer, err := st.Get([]byte("metadata/seal-close"))
+	got, err := st.Get(context.Background(), []byte("metadata/seal-close"))
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(got))
-	require.NoError(t, closer.Close())
 	ins, err := segment.Inspect(filepath.Join(dir, "segments", SegmentFilename(0)))
 	require.NoError(t, err)
 	require.True(t, ins.Sealed)
@@ -1837,7 +1759,7 @@ func TestWriter_DurableBatchAsyncCloseRunsAfterPendingEvents(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1852,10 +1774,11 @@ func TestWriter_DurableBatchAsyncCloseRunsAfterPendingEvents(t *testing.T) {
 		MaxEventsPerBlock: 64,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			key := fmt.Sprintf("metadata/async-close/%t", force)
-			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
+			b.Set([]byte(key), []byte("ok"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1870,10 +1793,9 @@ func TestWriter_DurableBatchAsyncCloseRunsAfterPendingEvents(t *testing.T) {
 		{nextSeq: 2, force: true},
 	}, gotCalls)
 	for _, key := range []string{"metadata/async-close/false", "metadata/async-close/true"} {
-		got, closer, err := st.Get([]byte(key))
+		got, err := st.Get(context.Background(), []byte(key))
 		require.NoError(t, err)
 		require.Equal(t, "ok", string(got))
-		require.NoError(t, closer.Close())
 	}
 }
 
@@ -1881,7 +1803,7 @@ func TestWriter_AsyncSealActiveAndCloseRunsDurableBatchHookAfterPendingEvents(t 
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -1896,10 +1818,11 @@ func TestWriter_AsyncSealActiveAndCloseRunsDurableBatchHookAfterPendingEvents(t 
 		MaxEventsPerBlock: 64,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			calls <- durableCall{nextSeq: nextSeq, force: force}
 			key := fmt.Sprintf("metadata/async-seal-close/%t", force)
-			return nil, nil, b.Set([]byte(key), []byte("ok"), nil)
+			b.Set([]byte(key), []byte("ok"))
+			return nil, nil, nil
 		},
 	})
 	require.NoError(t, err)
@@ -1968,11 +1891,11 @@ func TestForceRotate_FiresOnAfterSeal(t *testing.T) {
 		MaxEventsPerBlock: 64,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			calls++
 			gotIdx = idx
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2102,12 +2025,12 @@ func TestWriter_OnAfterSeal_FiresOnRotation(t *testing.T) {
 		MaxEventsPerBlock: 1,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			gotMu.Lock()
 			defer gotMu.Unlock()
 			got = append(got, sealedEvent{idx: idx, path: path})
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2146,7 +2069,7 @@ func TestWriter_OnAfterSeal_ErrorPropagates(t *testing.T) {
 		MaxEventsPerBlock: 1,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:           NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal:       func(idx uint64, path string) error { return wantErr },
+		Catalog:           SealedPathFunc(segDir, func(idx uint64, path string) error { return wantErr }),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2196,10 +2119,10 @@ func TestAppend_OnAppendFiresBeforeSealVisibility(t *testing.T) {
 			observed = append(observed, ev.Seq)
 			return nil
 		},
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			observedAtSeal = append([]uint64(nil), observed...)
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
@@ -2292,7 +2215,7 @@ func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -2303,29 +2226,22 @@ func TestAppendBatch_AsyncFlushRunsDurableBatchHook(t *testing.T) {
 		MaxEventsPerBlock: 2,
 		AsyncFlushWorkers: 2,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnDurableBatch: func(_ context.Context, b *pebble.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+		OnDurableBatch: func(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
 			if force {
 				return nil, nil, fmt.Errorf("force = true")
 			}
 			if nextSeq != 3 {
 				return nil, nil, fmt.Errorf("nextSeq = %d, want 3", nextSeq)
 			}
-			if err := b.Set([]byte("async/hook"), []byte("ok"), nil); err != nil {
-				return nil, nil, fmt.Errorf("stage async/hook: %w", err)
-			}
+			b.Set([]byte("async/hook"), []byte("ok"))
 			return func() {
-				got, closer, err := st.Get([]byte("async/hook"))
+				got, err := st.Get(context.Background(), []byte("async/hook"))
 				if err != nil {
 					afterCommit <- err
 					return
 				}
 				if string(got) != "ok" {
 					afterCommit <- fmt.Errorf("async/hook = %q, want ok", got)
-					_ = closer.Close()
-					return
-				}
-				if err := closer.Close(); err != nil {
-					afterCommit <- err
 					return
 				}
 				afterCommit <- nil
@@ -2602,10 +2518,10 @@ func TestAppendBatch_OnAppendFiresBeforeSealVisibility(t *testing.T) {
 			observed = append(observed, ev.Seq)
 			return nil
 		},
-		OnAfterSeal: func(idx uint64, path string) error {
+		Catalog: SealedPathFunc(segDir, func(idx uint64, path string) error {
 			observedAtSeal = append([]uint64(nil), observed...)
 			return nil
-		},
+		}),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })

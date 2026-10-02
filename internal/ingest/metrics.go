@@ -1,6 +1,8 @@
 package ingest
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -17,6 +19,7 @@ type Metrics struct {
 	BlocksFlushed             prometheus.Counter
 	SegmentsRotated           prometheus.Counter
 	AppendErrors              prometheus.Counter
+	WitnessedClamped          prometheus.Counter
 	ActiveSegBytes            prometheus.Gauge
 	NextSeq                   prometheus.Gauge
 	ReadLogBytes              prometheus.Gauge
@@ -30,6 +33,18 @@ type Metrics struct {
 	SeqGapWidth               prometheus.Gauge
 	SeqGapsRegistered         prometheus.Counter
 	SeqGapValuesRegistered    prometheus.Counter
+	// HotBatches and HotBatchEvents are hot mode's committed batches (design
+	// §23), labelled by admission class and inline or pointer storage.
+	HotBatches     *prometheus.CounterVec
+	HotBatchEvents prometheus.Histogram
+	// HotCommitBatches is the hot batches per commit transaction (group
+	// commit, design §10.5).
+	HotCommitBatches prometheus.Histogram
+	// Hot mode admission control (design §10.5, §23).
+	HotUnfoldedEvents prometheus.Gauge
+	HotPendingBytes   *prometheus.GaugeVec
+	HotInlineTokens   prometheus.Gauge
+	AdmissionWait     *prometheus.HistogramVec
 }
 
 // NewMetrics registers the ingest counters/gauges against reg.
@@ -56,6 +71,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "append_errors_total",
 			Help: "Number of Writer.Append calls that returned a non-nil error.",
+		}),
+		WitnessedClamped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "witnessed_clamped_total",
+			Help: "Number of appended events whose witnessed_at was raised to the previous event's, keeping it monotonic with seq.",
 		}),
 		ActiveSegBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -122,15 +142,55 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "seq_gap_values_registered_total",
 			Help: "Number of sequence values newly registered as vacant by this process at startup.",
 		}),
+		HotBatches: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "batches_total",
+			Help: "Number of hot batches committed, by admission class and storage (inline or pointer).",
+		}, []string{"class", "storage"}),
+		HotBatchEvents: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name:    "batch_events",
+			Help:    "Events per committed hot batch.",
+			Buckets: []float64{1, 4, 16, 64, 128, 256, 512, 1024, 4096},
+		}),
+		HotCommitBatches: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name:    "commit_batches",
+			Help:    "Hot batches committed per transaction.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32},
+		}),
+		HotUnfoldedEvents: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "unfolded_events",
+			Help: "Events in committed hot batches not yet folded into an active block.",
+		}),
+		HotPendingBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "pending_bytes",
+			Help: "Raw event bytes in frozen hot batches not yet committed, by admission class.",
+		}, []string{"class"}),
+		HotInlineTokens: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: "hot",
+			Name: "inline_tokens",
+			Help: "Frame bytes the live inline token bucket can pay for now. Negative after a frame outgrew its estimate.",
+		}),
+		AdmissionWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "admission_wait_seconds",
+			Help:      "Time a hot mode append (live) or bulk chunk waited on admission caps and permits, by class.",
+			Buckets:   []float64{0, .001, .005, .02, .1, .5, 2, 10, 60},
+		}, []string{"class"}),
 	}
 	reg.MustRegister(
 		m.EventsAppended, m.BlocksFlushed, m.SegmentsRotated,
-		m.AppendErrors, m.ActiveSegBytes, m.NextSeq,
+		m.AppendErrors, m.WitnessedClamped, m.ActiveSegBytes, m.NextSeq,
 		m.ReadLogBytes, m.ReadLogPinnedBytes, m.ReadLogPinnedOverrunBytes,
 		m.ReadLogFloorSeq, m.ReadLogDurableSeq,
 		m.SeqReservedEnd, m.SeqReservationHeadroom,
 		m.SeqGapCount, m.SeqGapWidth,
 		m.SeqGapsRegistered, m.SeqGapValuesRegistered,
+		m.HotBatches, m.HotBatchEvents, m.HotCommitBatches,
+		m.HotUnfoldedEvents, m.HotPendingBytes, m.HotInlineTokens, m.AdmissionWait,
 	)
 	return m
 }
@@ -194,6 +254,12 @@ func (m *Metrics) incAppendErrors() {
 	}
 }
 
+func (m *Metrics) incWitnessedClamped() {
+	if m != nil {
+		m.WitnessedClamped.Inc()
+	}
+}
+
 func (m *Metrics) setActiveSegBytes(v int64) {
 	if m != nil {
 		m.ActiveSegBytes.Set(float64(v))
@@ -233,5 +299,61 @@ func (m *Metrics) setReadLogFloorSeq(v uint64) {
 func (m *Metrics) setReadLogDurableSeq(v uint64) {
 	if m != nil {
 		m.ReadLogDurableSeq.Set(float64(v))
+	}
+}
+
+func (m *Metrics) observeHotBatch(class Class, pointer bool, events int) {
+	if m == nil {
+		return
+	}
+	storage := "inline"
+	if pointer {
+		storage = "pointer"
+	}
+	m.HotBatches.WithLabelValues(class.String(), storage).Inc()
+	m.HotBatchEvents.Observe(float64(events))
+}
+
+func (m *Metrics) observeHotCommit(batches int) {
+	if m != nil {
+		m.HotCommitBatches.Observe(float64(batches))
+	}
+}
+
+func (m *Metrics) setHotUnfolded(v uint64) {
+	if m != nil {
+		m.HotUnfoldedEvents.Set(float64(v))
+	}
+}
+
+func (m *Metrics) setHotPending(c Class, v int64) {
+	if m != nil {
+		m.HotPendingBytes.WithLabelValues(c.String()).Set(float64(v))
+	}
+}
+
+func (m *Metrics) setHotInlineTokens(v float64) {
+	if m != nil {
+		m.HotInlineTokens.Set(v)
+	}
+}
+
+// resetHot zeroes the hot writer's state gauges when it closes. The process
+// keeps its registry across leader sessions, so a follower would otherwise
+// report its last session's backlog forever.
+func (m *Metrics) resetHot() {
+	if m == nil {
+		return
+	}
+	m.HotUnfoldedEvents.Set(0)
+	m.HotInlineTokens.Set(0)
+	for _, c := range []Class{ClassLive, ClassBulk} {
+		m.HotPendingBytes.WithLabelValues(c.String()).Set(0)
+	}
+}
+
+func (m *Metrics) observeAdmissionWait(c Class, d time.Duration) {
+	if m != nil {
+		m.AdmissionWait.WithLabelValues(c.String()).Observe(d.Seconds())
 	}
 }

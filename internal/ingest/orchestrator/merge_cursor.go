@@ -6,11 +6,12 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 )
 
 const (
@@ -20,8 +21,8 @@ const (
 
 // loadMergeCursor returns the persisted next-source index, or 0 if
 // absent.
-func loadMergeCursor(s *store.Store) (uint64, error) {
-	v, _, err := s.GetVersionedUint64LE(mergeNextSourceIdxKey, mergeCursorV1)
+func loadMergeCursor(s metastore.Store) (uint64, error) {
+	v, _, err := metastore.GetVersionedUint64LE(context.Background(), s, mergeNextSourceIdxKey, mergeCursorV1)
 	if err != nil {
 		return 0, fmt.Errorf("orchestrator: merge: load cursor: %w", err)
 	}
@@ -31,8 +32,8 @@ func loadMergeCursor(s *store.Store) (uint64, error) {
 // deleteMergeCursor removes the merge cursor key. Called from the
 // terminal cleanup of runMerge once all source segments are drained
 // and the live_segments tree has been removed.
-func deleteMergeCursor(s *store.Store) error {
-	if err := s.Delete([]byte(mergeNextSourceIdxKey), store.SyncWrites); err != nil {
+func deleteMergeCursor(s metastore.Store) error {
+	if err := s.Delete(context.Background(), []byte(mergeNextSourceIdxKey)); err != nil {
 		return fmt.Errorf("orchestrator: merge: delete cursor: %w", err)
 	}
 	return nil
@@ -51,19 +52,16 @@ func deleteMergeCursor(s *store.Store) error {
 // now is parameterized for deterministic tests; production callers
 // should pass time.Now().UTC().
 func commitSourceComplete(
-	s *store.Store,
+	s metastore.Store,
 	cache *repoStatusLookup,
 	nextIdx uint64,
 	perDIDLastRev map[string]string,
 	now time.Time,
 ) error {
 	batch := s.NewBatch()
-	defer func() { _ = batch.Close() }()
 
-	cursorVal := store.EncodeVersionedUint64LE(mergeCursorV1, nextIdx)
-	if err := batch.Set([]byte(mergeNextSourceIdxKey), cursorVal, nil); err != nil {
-		return fmt.Errorf("orchestrator: merge: stage cursor: %w", err)
-	}
+	cursorVal := metastore.EncodeVersionedUint64LE(mergeCursorV1, nextIdx)
+	batch.Set([]byte(mergeNextSourceIdxKey), cursorVal)
 
 	// Build the updated RepoStatus rows in-memory first so we can
 	// mirror them into the cache atomically with the commit.
@@ -94,14 +92,12 @@ func commitSourceComplete(
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: encode repo/%s: %w", did, err)
 		}
-		if err := batch.Set(backfill.RepoKey(did), enc, nil); err != nil {
-			return fmt.Errorf("orchestrator: merge: stage repo/%s: %w", did, err)
-		}
+		batch.Set(backfill.RepoKey(did), enc)
 		updated := next
 		pendingCacheUpdates[did] = &updated
 	}
 
-	if err := s.Commit(batch, store.SyncWrites); err != nil {
+	if err := batch.Commit(context.Background()); err != nil {
 		return fmt.Errorf("orchestrator: merge: commit batch: %w", err)
 	}
 	for did, rs := range pendingCacheUpdates {

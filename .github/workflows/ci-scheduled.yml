@@ -74,26 +74,32 @@ jobs:
         include:
           - { package: ".", target: FuzzDecodeLiveFrame }
           - { package: ".", target: FuzzDecodeRecordMapEquivalence }
+          - { package: ".", target: FuzzDecodeRecordMatchesIngestGate }
+          - { package: "./internal/catalog", target: FuzzDecodeHotBatch }
+          - { package: "./internal/datamodel", target: FuzzCheckRecordServable }
           - { package: "./internal/ingest/live", target: FuzzLoadUpstreamCursor }
           - { package: "./internal/ingest/live", target: FuzzUpstreamCursorRoundTrip }
           - { package: "./internal/ingest/syncstate", target: FuzzChainStateRoundTrip }
           - { package: "./internal/ingest/syncstate", target: FuzzDecodeChainState }
           - { package: "./internal/ingest/syncstate", target: FuzzDecodeHostingState }
           - { package: "./internal/ingest/syncstate", target: FuzzHostingStateRoundTrip }
+          - { package: "./internal/metastore/pebblestore", target: FuzzBatchSemanticsAgree }
+          - { package: "./internal/pgstore", target: FuzzRedactURL }
           - { package: "./internal/subscribe", target: FuzzEncode }
           - { package: "./internal/subscribe", target: FuzzEncodeV2 }
           - { package: "./internal/subscribe", target: FuzzParseQuery }
           - { package: "./internal/subscribe", target: FuzzParseUpdatePayload }
           - { package: "./internal/subscribe", target: FuzzResolveCursor }
-          - { package: "./internal/timestamp", target: FuzzParseRoundTrip }
           - { package: "./internal/xrpcapi", target: FuzzValidatePlanCollections }
+          - { package: "./segment", target: FuzzBuildSealed }
           - { package: "./segment", target: FuzzDecodeBlock }
           - { package: "./segment", target: FuzzDecodeBlockFromCompressed }
-          - { package: "./segment", target: FuzzPatch }
+          - { package: "./segment", target: FuzzOpenReaderParts }
           - { package: "./segment", target: FuzzReadBlockIndex }
           - { package: "./segment", target: FuzzReadCollectionIndex }
           - { package: "./segment", target: FuzzReadHeader }
           - { package: "./segment", target: FuzzRewrite }
+          - { package: "./segment", target: FuzzSparseRewrite }
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2

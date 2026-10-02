@@ -92,26 +92,65 @@ const (
 	// receiving an error at this checkpoint.
 	AfterSegmentRewriteDirSynced Point = Point(segment.CrashPointRewriteDirSynced)
 
-	// The four segment-patch seams mirror the rewrite seams above but fire in
-	// segment.Patch (mutate-mode indexed_at rewrite for timestamp import).
-	// Derived from segment's strings for the same compile-time-link reason.
+	// The disaggregated leader's seams (design §10). A crash at any of them
+	// may leave an uploaded object no catalog row references, or a committed
+	// row whose acks never ran; the next leader must neither lose nor repeat
+	// an event.
 
-	// AfterSegmentPatchTempWritten fires after a segment patch has written all
-	// bytes to the temporary replacement file but before fsyncing it.
-	AfterSegmentPatchTempWritten Point = Point(segment.CrashPointPatchTempWritten)
+	// AfterHotBatchCutBeforeUpload fires after a pointer batch is encoded
+	// but before its upload starts.
+	AfterHotBatchCutBeforeUpload Point = "after-hot-batch-cut-before-upload"
 
-	// AfterSegmentPatchTempSynced fires after a segment patch has fsynced the
-	// temporary replacement file but before renaming it over the original.
-	AfterSegmentPatchTempSynced Point = Point(segment.CrashPointPatchTempSynced)
+	// AfterHotBatchUploadBeforeCommit fires after a pointer batch's object
+	// is uploaded but before the hot batch transaction.
+	AfterHotBatchUploadBeforeCommit Point = "after-hot-batch-upload-before-commit"
 
-	// AfterSegmentPatchRenamed fires after a segment patch has renamed the
-	// replacement file over the original but before fsyncing the parent dir.
-	AfterSegmentPatchRenamed Point = Point(segment.CrashPointPatchRenamed)
+	// AfterHotBatchCommitBeforeAck fires after a hot batch commits but
+	// before the writer releases its acks and advances the relay cursor it
+	// reports upstream.
+	AfterHotBatchCommitBeforeAck Point = "after-hot-batch-commit-before-ack"
 
-	// AfterSegmentPatchDirSynced fires after a segment patch has fsynced the
-	// parent dir. The replacement is durable; callers must still tolerate
-	// receiving an error at this checkpoint.
-	AfterSegmentPatchDirSynced Point = Point(segment.CrashPointPatchDirSynced)
+	// AfterFoldUploadBeforeCommit fires after a folded block is uploaded but
+	// before the fold transaction replaces its hot batches.
+	AfterFoldUploadBeforeCommit Point = "after-fold-upload-before-commit"
+
+	// AfterSealFooterUploadBeforeCommit fires after a seal's footer is
+	// uploaded but before the seal transaction.
+	AfterSealFooterUploadBeforeCommit Point = "after-seal-footer-upload-before-commit"
+
+	// AfterDirectBlockCutBeforeUpload fires after a direct-mode block is
+	// frozen and encoded but before its upload starts.
+	AfterDirectBlockCutBeforeUpload Point = "after-direct-block-cut-before-upload"
+
+	// AfterDirectBlockUploadBeforeCommit fires after a direct-mode block's
+	// object is uploaded but before its block transaction.
+	AfterDirectBlockUploadBeforeCommit Point = "after-direct-block-upload-before-commit"
+
+	// AfterDirectBlockCommitBeforeAck fires after a direct-mode block
+	// commits, with its metadata batch, but before the writer releases the
+	// block's acks and durable-batch callbacks.
+	AfterDirectBlockCommitBeforeAck Point = "after-direct-block-commit-before-ack"
+
+	// AfterCompactionUploadBeforePublish fires after a disaggregated segment
+	// rewrite's blocks and footer are uploaded but before the publish
+	// transaction. The uploads stay unreferenced; the next pass rewrites the
+	// segment again and GC collects the orphans.
+	AfterCompactionUploadBeforePublish Point = "after-compaction-upload-before-publish"
+
+	// AfterGCMarkBeforeClaim fires after a GC run's mark pages commit but
+	// before its first claim. The marks stay; the next run's claim honors
+	// them once GC_DELAY has passed.
+	AfterGCMarkBeforeClaim Point = "after-gc-mark-before-claim"
+
+	// AfterGCClaimBeforeDelete fires after a GC claim commits its objects as
+	// deleting but before any key is deleted. The next run resumes the
+	// deleting rows first.
+	AfterGCClaimBeforeDelete Point = "after-gc-claim-before-delete"
+
+	// AfterGCDeleteBeforeForget fires after a GC claim's keys are deleted
+	// but before the forget transaction. The next run deletes the missing
+	// keys again, which succeeds, and forgets the rows.
+	AfterGCDeleteBeforeForget Point = "after-gc-delete-before-forget"
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -132,10 +171,18 @@ var AllPoints = []Point{
 	AfterSegmentRewriteTempSynced,
 	AfterSegmentRewriteRenamed,
 	AfterSegmentRewriteDirSynced,
-	AfterSegmentPatchTempWritten,
-	AfterSegmentPatchTempSynced,
-	AfterSegmentPatchRenamed,
-	AfterSegmentPatchDirSynced,
+	AfterHotBatchCutBeforeUpload,
+	AfterHotBatchUploadBeforeCommit,
+	AfterHotBatchCommitBeforeAck,
+	AfterFoldUploadBeforeCommit,
+	AfterSealFooterUploadBeforeCommit,
+	AfterDirectBlockCutBeforeUpload,
+	AfterDirectBlockUploadBeforeCommit,
+	AfterDirectBlockCommitBeforeAck,
+	AfterCompactionUploadBeforePublish,
+	AfterGCMarkBeforeClaim,
+	AfterGCClaimBeforeDelete,
+	AfterGCDeleteBeforeForget,
 }
 
 var knownPoints = func() map[Point]struct{} {

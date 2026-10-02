@@ -37,30 +37,9 @@ The retained background download path is only for repos discovered by authoritat
 
 Area: `internal/ingest/backfill/retry.go`, `internal/ingest/orchestrator/steady.go`, `docs/README.md` §4.3, issue #247.
 
-### Timestamp-import ReadRow can accept a suffix behind a quoted newline
-
-Phase C of timestamp import re-reads and validates CSV rows by byte offset. `ReadRow` checks that the preceding byte is a newline, but cannot distinguish a record boundary from a newline inside a quoted field. A stale offset could therefore parse a valid suffix row. Detecting this would require a full quote-aware scan or binding the CSV to the job by size and hash. This limitation is accepted: only the operator can replace the CSV, and the operator already controls imported timestamps. See `internal/timestamp/apply.go` (`ReadRow`).
-
 ### A spec-valid rkey longer than 255 bytes is dropped by design
 
 atproto record keys can be up to ~1023 bytes, but our segment format caps the rkey column at 255 bytes. A record with a legal-but-longer rkey is dropped at the ingest gate under `ErrFieldTooLong` with its own metric reason — distinct from "the network sent garbage" — so operators can tell a representation limit from actual bad input. This is a deliberate format trade-off, not a validation bug. Area: `internal/ingest` validation gate, `segment/block.go` column limits, `docs/README.md` §4.4.
-
-### A failed timestamp import can leave a partial rule set active — operator re-submits
-
-Rule-map ingestion (`ruleSSTBuilder.Ingest` in `internal/timestamp/rules.go`) installs the sorted chunk SSTs one `pebble.Ingest` at a time; each call is individually atomic and immediately durable. A crash or error partway through the loop therefore leaves a committed *prefix* of the CSV resident, with no marker distinguishing it from a complete import — and since every chunk carries its collections' activation markers, `Stamp` runs against that partial keyspace after the next boot. Consequences in the window: events whose rules landed are stamped, later ones are not, and a path whose CSV last-write-wins winner lives in a not-yet-ingested chunk can carry a *stale* stamp into segment bytes and the live wire.
-
-Accepted by Jim on 2026-07-08. Recovery depends on completing the import:
-
-- A **crash** mid-ingest leaves the job non-terminal; the next boot auto-resumes (`ResumeIncomplete`) and re-runs rule ingestion from the CSV.
-- A **terminal failure** (e.g. ENOSPC) does not auto-resume — by design, since re-running a deterministically-failing job would loop. The operator re-submits the same CSV via the import XRPC once the cause is fixed. The importer never modifies or deletes the staged CSV (it opens it read-only; terminal cleanup removes the *scratch* dir under `import-scratch/<job>`, not the import dir), so the exact same file is re-submittable. Re-ingest is last-write-wins over the full CSV, which heals both missing entries and the stale cross-chunk duplicate edge; the bucket+patch phases were already idempotent.
-
-Alternatives considered and rejected as not worth the cost against this remediation story: k-way-merging chunks into one atomic multi-file `db.Ingest` (~2x scratch write amp on a ~200GB entry stream), and deferring collection markers to a post-ingest commit batch (still leaves the window for re-imports into an already-active collection). Area: `internal/timestamp/rules.go` (`Ingest` — comment there), `internal/importer/importer.go`, `docs/README.md` §8.
-
-### A shutdown racing the import preamble can terminally fail the job instead of pausing it
-
-`RunImport`'s steady-state preamble calls `Writer.ForceRotate` after rule ingestion (`internal/ingest/orchestrator/import_pass.go`). On graceful shutdown the orchestrator closes the steady writer concurrently with cancelling the import context; if the close wins the race, `ForceRotate` returns `ingest.ErrClosed`, which `IsCancellationOnly` correctly refuses to classify as a pause — so the importer marks the job terminally **failed** rather than leaving it resumable. The window is narrow (cancellation usually surfaces first), and the failure is loud: the job lands in `failed` state on `/status` with the rotate error recorded.
-
-Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for any other terminal failure — see the previous entry for why re-submission is safe and complete. Do not teach `IsCancellationOnly` about `ingest.ErrClosed` (it would couple the shared classifier, also used by import metrics, to an ingest sentinel) and do not translate the error at the call site without revisiting this decision. Area: `internal/ingest/orchestrator/import_pass.go` (comment at the `ForceRotate` call), `internal/ingest/orchestrator/import_metrics.go` (`IsCancellationOnly`), `internal/importer/importer.go` (`run`).
 
 ### `just run-prod` inherits the dev-speed flags from `.env`
 
@@ -72,19 +51,66 @@ Accepted (Jim, 2026-07-08): the operator re-submits the same CSV, exactly as for
 
 Under the client's `CursorTime` mode, a resume on a different host uses `witnessedAt - rewind`. Each instance stamps `witnessed_at` with its own clock when it sees an event, so the same event has slightly different times on different hosts. The rewind (default 5s) is a skew allowance, not a guarantee: skew larger than the rewind can skip events, and everything inside the rewind is re-delivered with no way to dedup across seq namespaces. Callers in this mode must be idempotent. The client identifies a seq namespace by the configured hostname alone: a reconnect to the same name always resumes by seq. So each hostname given to `WithHost`/`WithFailoverHosts` must address exactly one instance; a name that load-balances across instances (or is repointed at a different instance) gets a foreign seq and can skip or replay events. Area: `live.go` (`planSession`, `adoptNamespace`).
 
+---
+
+### The local catalog sees only the newest unsealed file in a namespace
+
+`catalog/local` treats the highest-index unsealed file as the namespace's active segment and skips any unsealed file below it. The writer cannot produce such a file: `rotateLocked` finishes the seal before it creates the next file, and `ingest.Open` resumes the highest index. A stranded older unsealed file therefore means external damage. Cold replay then fails loud on the unregistered hole rather than skipping it. The oracle's catalog observer cross-checks against the path walk, so a quiescent directory with such a file fails the observation (`TestObserveSegments_CrossCheckCatchesStrandedActive`). Area: `internal/catalog/local`, `internal/oracle/catalog_observer.go`.
+
+### Compaction reads every live-history block, every pass
+
+Compaction selects blocks by DID (segment and per-block DID blooms). A backfill block holds a few repos, so it narrows well. A live block holds about 3,700 distinct DIDs, so at any pass's tombstone volume nearly every live block has a tombstoned DID and a matching collection, and the rewrite reads it even when it drops nothing. A pass therefore reads the whole live-shaped archive, and that cost grows with the archive's age. Local mode does the same from disk. In disaggregated mode it is object GETs: about 650GiB per pass after 30 days of 3,000 events/s. Measured in S4.6 (design §22.4). A record-level filter or a tiered schedule is open as plan S5.7. Don't read a high `jetstream_compaction_blocks_fetched_total` ratio as a bug. Area: `segment/sparse.go` (`candidates`), `internal/ingest/orchestrator/compact_disagg.go`.
+
 ## Lessons
-
-### There are several copies of the "is this just cancellation?" classifier — grep them all
-
-`IsCancellationOnly` in the import path requires every error leaf to be cancellation. `errors.Is(err, context.Canceled)` would also match `errors.Join(context.Canceled, realFailure)` and incorrectly make a failed import resumable. Other callers in `orchestrator/steady.go`, `backfill/retry.go`, `jetstreamd/runtime.go`, and the simulator only need to know whether cancellation occurred. Search all callers before changing this logic; their predicates serve different purposes. Area: `internal/ingest/orchestrator/import_metrics.go`.
 
 ### A restart-tier recovery child hangs if the relay is quiet — generate traffic between children
 
 The oracle restart child's cutover delivery gate (`cutoverDeliveryGate` in the restart harness) deliberately treats zero observations as "the bootstrap-live consumer hasn't delivered yet — keep waiting," because a fresh child always replays from seq 1. But a *recovery* child whose predecessor already archived every firehose frame and persisted cursor == relay tip resumes at the tip, observes nothing, and the gate waits forever — the test fails as an opaque 30s child timeout. The fix is not to weaken the gate (the zero-observations rule is what catches real delivery loss): generate a couple of fresh live events between the first child's exit and the recovery child's start (`liveEventsBetweenChildren` in the segment-fault scenarios), which mirrors reality — the relay doesn't stop when jetstream restarts. If you write a new fault/crash scenario whose first child runs long enough to fully drain the firehose, you need this too. Area: `internal/oracle/restart_harness_test.go` (gate), `restart_segmentfault_test.go` (the pattern).
 
+### `drain()` is not "the consumer processed frame X"
+
+`drain()` is `synctest.Wait`, which returns when every bubble goroutine is durably blocked, and a goroutine asleep on a timer counts. A live consumer in reconnect backoff after a scheduled subscribeRepos disconnect looks quiescent with frames still undelivered. For anything with no ack-visible row, such as a whole-event drop, wait on a positive signal or poll the observable under fake time up to a deadline. Area: `internal/oracle/adversarial_harness_test.go`, `specs/oracle/2026-09-25-adversarial-drop-scrape-races-reconnect.md`.
+
+### Replay-guard state must enter the durable batch with its rows
+
+The live consumer's replay guards (verifier chain and hosting state, the applied `#identity`/`#account` seqs) drop a redelivered event whose state is already durable. That state has to become durable in exactly the batch that holds the event's last row. If it becomes durable earlier, a crash loses the row: its replay is dropped. If it becomes durable later, a crash archives the whole event twice. So promotion and seq ratchets run in the writer's `OnAppend` hook, under the writer mutex, and each durable batch stages the snapshot taken when it was cut (`durablePrepare`), not whatever was promoted by the time it committed. Code that promotes after `Append` returns, or stages at commit time, reintroduces both bugs. Only the layer 3 oracle checks duplicates exactly, so do not count on the single-node crash oracle to catch them.
+
+The atmos verifier runs ahead of the appends: it can save a DID's state for a later event before the earlier event's last row lands. So `syncstate.StateStore` keeps an ordered queue of pending entries per DID, and promotion takes the newest entry at or below the appended event's rev or seq. A single pending slot per DID lets the later save hide the earlier event's state, and after a crash the successor either resyncs needlessly or archives the event twice. Area: `internal/ingest/live/consumer.go` (`promoteSyncState`, `prepareDurable`), `internal/ingest/syncstate`, `specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md`, `specs/oracle/2026-09-26-disagg-pipelined-chain-state-hidden.md`.
+
+### A forced durable batch must cover every appended event
+
+`DrainDurability` ends in a forced durable batch, and the backfill completion batcher stages every queued completion into it. The batcher fails the writer if a completion was appended below the batch's nextSeq but left out ("forced durable batch … excludes appended completion"). So a writer's drain must hold appends from the moment it fixes nextSeq until the forced batch commits: local mode does it with `drainMu`, and direct mode queues the checkpoint behind earlier blocks and holds appends until it runs. Direct mode's first version let appends continue, and only a 60s benchmark caught it, because backfill's periodic drain fires every 30s and no oracle run lasts that long. A new writer mode needs the same hold, and a test that drains beside concurrent appends. Area: `internal/ingest/direct.go`, `internal/ingest/backfill/completion_batcher.go`, `internal/ingest/maintainer/direct_test.go` (`TestDirect_DrainHoldsAppends`).
+
+### A storage call under a third-party mutex wedges the layer 3 scheduler
+
+`storagefake.Seeded` admits a parked call only after `synctest.Wait`, and synctest does not count a goroutine waiting on a `sync.Mutex` as durably blocked. If one goroutine parks at a yield point while holding a mutex that another goroutine wants, the bubble hangs until the child times out. It looks like a hang, not a failure. Jetstream code must not hold a mutex across a storage or blob call. The atmos verifier holds a per-DID lock across syncstate loads, which is why the fake's meta reads take no scheduler turn. If you add a yield point, check who can call it while holding a lock. Area: `internal/storagefake/sched.go`, `meta.go`, `specs/oracle/2026-09-25-disagg-scheduler-wedged-by-verifier-mutex.md`.
+
+The same rule applies to locks held across a write. The backfill `Store`'s `countsMu` and `rosterMu` span catalog commits, so they are channel-based (`chanMutex`), which synctest counts as durably blocked. atmos backfill holds a per-DID-shard `sync.Mutex` across the Store's discovery write, which Jetstream cannot change, so the layer 3 oracle runs with `BackfillMaxActiveHosts = 1`. Only one reconcile runs at a time, so none waits on that shard. With one active host, atmos lists a host fully before dispatching its downloads. A fault that must fire mid-bootstrap needs the listing held elsewhere, which is what the lifecycle harness's host gate (`disaggListGate`) does. Area: `internal/ingest/backfill/store.go`, `internal/oracle/disagg_oracle_test.go`, `internal/oracle/disagg_lifecycle_test.go`.
+
+### A deposed leader still reaches crash seams
+
+A killed or deposed leader keeps running until its context and client die, and it can reach an armed crashpoint after its successor has started. If the old session takes the seam, the kill lands on a process that is already dead, the fault never exercises the new leader, and the harness waits for a crash that doesn't come. The layer 3 injector only fires for the pod that started the newest session (`newestSession`). Any new harness that arms seams across leader changes needs the same check. Area: `internal/oracle/disagg_oracle_test.go` (`disaggCrashInjector`).
+
+### Sealed blocks have holes; hot batches and active blocks don't
+
+Compaction keeps each block's [MinSeq, MaxSeq] envelope and drops rows inside it, so a sealed block can skip seqs. A follower whose last tick predates a seal and a compaction pass reads the missing seqs from the compacted block, not from hot batches. Anything that walks refs seq by seq must allow holes inside a sealed ref's envelope (`BlockRef.Generation != 0`) and still demand density from hot batches and active blocks, where a hole really is corruption. The follower's readable log leaves those seqs vacant (nil entries) and every reader skips them. The first version treated the hole as corruption and stopped the follower. Only the layer 3 oracle's held reader, which refreshes rarely, caught it. Area: `internal/catalog/follower/tick.go` (`feed`), `internal/ingest/readlog.go`, `specs/oracle/2026-09-26-disagg-follower-compaction-hole.md`.
+
+### A v1 subscriber sees a projection of the stream, not the stream
+
+A v1 subscriber gets no sync rows, receives resync replacements as ordinary creates, and sees a rev only on commits. Comparing a v1 observer to the model row for row fails as soon as a resync happens. The layer 3 oracle compares v1 observers against `disaggV1Project`, not against the raw model. Area: `internal/oracle/disagg_oracle_test.go`.
+
 ### Package-global zstd encoders and testing/synctest bubbles don't mix — warm them first
 
 klauspost/compress encoders create an internal worker channel lazily on the first `EncodeAll`. A channel created inside a `testing/synctest` bubble fatals the whole test binary ("receive on synctest channel from outside bubble") when the encoder is later used outside it — and vice versa. `segment.WarmEncoder` and `subscribe.WarmEncoder` exist to force that creation at `TestMain`, outside any bubble; the oracle calls both. This is also why `subscribe`'s encoder pools (`encoderpool.go`, #295) are channel free lists and NOT `sync.Pool`: `WarmEncoder` pre-creates every pooled encoder to the cap so in-bubble compressions only ever draw bubble-safe encoders, whereas `sync.Pool`'s GC eviction would drop warmed encoders and lazily rebuild them in-bubble. Residual edge: more than pool-cap concurrent in-bubble compressions would build a fresh in-bubble encoder; no current test approaches that. If you add a new package-global encoder (or another lazily-channel-creating global), give it a warm hook and call it from the oracle's `TestMain`. Area: `internal/subscribe/encoderpool.go`, `internal/subscribe/compress.go` (`WarmEncoder`), `segment/zstd.go`, `internal/oracle/main_test.go`.
+
+### Per-process readers must survive a writer-session change
+
+The subscribe tail, cold reader, status, and cursor resolution outlive writer sessions (`internal/jetstreamd/session.go`). Two mistakes here are easy to make and hard to spot:
+
+- Do not clear the published writer when a session ends. A subscriber that already passed the handler's writer check would anchor at `Tip()` 0 and replay the whole archive. Keep the closed writer until the next session publishes; the seq lease keeps the new writer's seqs above the old tip.
+- A reader parked at the tip waits on the old log's notify channel, and that log never grows again. Replacing the source with `Tail.SetReadLogSource` must wake it, which is why the park also selects on the tail's own notify channel (`TestTail_SetReadLogSourceWakesReaderParkedOnOldLog`).
+
+Anything per-session that a per-process component reads (tombstone gauges, the compaction deadline) goes through an indirection that the session swaps in and out. Area: `internal/jetstreamd`, `internal/subscribe/tail.go`.
 
 ### The mutation campaign needs a clean git working tree
 
@@ -92,4 +118,8 @@ klauspost/compress encoders create an internal worker channel lazily on the firs
 
 ### Mutant patches must carry context lines — zero-context hunks corrupt the tree on revert
 
-A mutant patch whose hunk has no context lines is anchored only by its line number. When the target file later drifts (code added above the hunk), the *forward* `git apply --unidiff-zero` still lands correctly via git's offset search — the campaign runs, the mutant is KILLED, the gate reports PASS — but the *reverse* apply of a pure deletion is a pure insertion with no content anchor, so git re-inserts the lines at the stale line number, silently corrupting an unrelated spot in the file **after** the PASS (found twice as `merge.go` residue after gate runs; #305). The driver cannot catch this: the revert "succeeds," so `revert_current`'s failure path never fires. Lessons: (1) generate mutant patches as standard context diffs (`git diff`, 3 context lines) — content anchoring makes both directions drift-safe; (2) check `git status` after any campaign/gate run before building on the tree; (3) when refreshing a mutant, verify the round-trip leaves `git status` clean: `git apply --unidiff-zero <p> && git apply --unidiff-zero -R <p>`. Area: `testing/mutation/mutants/*.patch`, `testing/mutation/run.sh`.
+A mutant patch whose hunk has no context lines is anchored only by its line number. When the target file later drifts (code added above the hunk), the *forward* `git apply --unidiff-zero` still lands correctly via git's offset search — the campaign runs, the mutant is KILLED, the gate reports PASS — but the *reverse* apply of a pure deletion is a pure insertion with no content anchor, so git re-inserts the lines at the stale line number, silently corrupting an unrelated spot in the file **after** the PASS (found twice as `merge.go` residue after gate runs; #305). The driver cannot catch this: the revert "succeeds," so `revert_current`'s failure path never fires. The forward apply can go wrong too. If the file has an identical line near the stale line number, the zero-context hunk lands there instead of on its target. The mutant then SURVIVES, which looks like an oracle gap, not a patch problem: m044 did this after S1.7 moved `flushLocked`, landing on the identical fault check in `commitPreparedFlushLocked`. Lessons: (1) generate mutant patches as standard context diffs (`git diff`, 3 context lines) — content anchoring makes both directions drift-safe; (2) check `git status` after any campaign/gate run before building on the tree; (3) when refreshing a mutant, verify the round-trip leaves `git status` clean: `git apply <p> && git apply -R <p>`. On 2026-09-29 the last 13 zero-context patches were refreshed. Two of them, m027 and m060, had drifted onto identical lines in sibling functions and kept reporting KILLED while mutating the wrong code. The driver now applies patches without `--unidiff-zero`, so a zero-context patch reports STALE, and `TestCatalogPatchesCarryContext` rejects one in the default `just` run. A consequence: plain `git apply --check` is now the right staleness check. Before the refresh it flagged every zero-context patch, applicable or not. Area: `testing/mutation/mutants/*.patch`, `testing/mutation/run.sh`, `testing/mutation/gate/catalog_test.go`.
+
+### The mutation driver reports BUILD-BROKEN from a git worktree
+
+Inside a `git worktree`, under some sandboxes, Go's VCS stamping fails with "error obtaining VCS status: exit status 128" even though git itself works. When that happens, every mutant reports BUILD-BROKEN, which says nothing about the mutants. Run the driver with `GOFLAGS=-buildvcs=false` in that case. Area: `testing/mutation/run.sh`.

@@ -85,7 +85,7 @@ func TestOpen_StrictMemDropsUnsyncedWrites(t *testing.T) {
 	require.NoError(t, closer.Close())
 
 	_, _, err = s.Get([]byte("unsynced"))
-	require.ErrorIs(t, err, store.ErrNotFound)
+	require.ErrorIs(t, err, pebble.ErrNotFound)
 }
 
 func syncStrictTestDir(t *testing.T, fs *vfs.MemFS, dir string) {

@@ -1,0 +1,40 @@
+mutant: m073_gc_claim_recheck_skipped
+target: internal/catalog/scripts.go
+failure-mode: |
+  GCClaim trusts ClaimObjects' unreferenced_at filter and skips the §13
+  re-check that no claimed object is still referenced. If a writer ever
+  referenced an object without clearing unreferenced_at (a §7.4 bug, or a
+  backend whose reference and claim race), GC deletes a live object and
+  the archive loses the block for good instead of the leader failing
+  loud.
+expected-detection: |
+  TestScripts_GCClaimReferenced plants a referenced object with a stale
+  unreferenced_at and requires GCClaim to report corruption. The layer 3
+  oracle cannot reach this path: every reference clears unreferenced_at
+  (§7.4), so the re-check never fires in a correct run. The unit test is
+  the executioner.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+index 77b9d77..46b7599 100644
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -858,17 +858,6 @@ func (s *Session) GCClaim(ctx context.Context, gcDelay, orphanAge time.Duration,
+ 		if rows, err = tx.ClaimObjects(ctx, gcDelay, orphanAge, limit); err != nil {
+ 			return err
+ 		}
+-		ids := make([]uint64, len(rows))
+-		for i, r := range rows {
+-			ids[i] = r.ID
+-		}
+-		refs, err := tx.ReferencedObjects(ctx, ids)
+-		if err != nil {
+-			return err
+-		}
+-		if len(refs) > 0 {
+-			return Corruptf(SourceGC, "claimed objects %v are referenced", refs)
+-		}
+ 		out = rows
+ 		return nil
+ 	})

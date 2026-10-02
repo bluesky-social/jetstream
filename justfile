@@ -75,6 +75,104 @@ clean:
     rm -rf bin
     rm -rf data*
 
+# Start the local dev dependencies (PostgreSQL, SeaweedFS, MinIO; see
+# compose.yaml) and wait until they are healthy and provisioned. Idempotent.
+# All state lives in tmpfs, so `just down` discards it; `just down up` resets.
+up:
+    docker compose up --detach --wait --wait-timeout 120 --remove-orphans --quiet-pull postgres seaweedfs minio
+    @# One-shot provisioning runs via `run` so its exit status gates this
+    @# recipe; `up --wait` does not wait for or check one-shot containers.
+    docker compose run --rm --quiet-pull s3-init
+    @echo
+    @echo "postgres   postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable"
+    @echo "           read-only: postgres://jetstream_reader:jetstream_reader@127.0.0.1:15432/jetstream?sslmode=disable"
+    @echo "seaweedfs  http://127.0.0.1:18333 (path-style)"
+    @echo "minio      http://127.0.0.1:19000 (path-style); console http://127.0.0.1:19001 (admin / admin-dev-secret)"
+    @echo "s3         bucket=jetstream AWS_ACCESS_KEY_ID=jetstream AWS_SECRET_ACCESS_KEY=jetstream-dev-secret AWS_REGION=us-east-1"
+
+# Stop the local dev dependencies and delete their containers, networks, and
+# volumes. Fails if anything from the compose project survives.
+down:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Every data dir is a tmpfs, so there is nothing to shut down gracefully.
+    docker compose down --volumes --remove-orphans --timeout 1
+    # Must match `name:` in compose.yaml.
+    filter="label=com.docker.compose.project=jetstream-dev"
+    leftover="$(docker ps -aq --filter "${filter}"; docker volume ls -q --filter "${filter}"; docker network ls -q --filter "${filter}")"
+    if [[ -n "${leftover}" ]]; then
+        echo "down: resources survived docker compose down:" >&2
+        echo "${leftover}" >&2
+        exit 1
+    fi
+
+# Open psql on the dev database as the application role (`just up` first).
+# Arguments pass through, e.g. `just psql -c 'select 1'`.
+[positional-arguments]
+psql *ARGS:
+    docker compose exec postgres psql -U jetstream -d jetstream "$@"
+
+# Run the storage contract and fault suites (design §20 layer 4) against the
+# `just up` environment: every package whose tests use pgtest or s3test, with
+# SeaweedFS as the object store, then the object-store packages again with
+# MinIO. It needs `just up` running and does not start or stop it, so a
+# failed run leaves the environment up to inspect. Arguments pass through
+# to go test, e.g. `just test-storage -run TestReaderRole`.
+test-storage *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    running="$(docker compose ps --status running --services)"
+    for svc in postgres seaweedfs minio; do
+        if ! grep -qx "${svc}" <<<"${running}"; then
+            echo "test-storage: ${svc} is not running; run \`just up\` first" >&2
+            exit 1
+        fi
+    done
+    # Discovered, not listed, so a new storage suite cannot be left out.
+    storage_pkgs() {
+        go list -f '{{{{.ImportPath}} {{{{join .TestImports " "}} {{{{join .XTestImports " "}}' ./... \
+            | grep -E "$1" | cut -d' ' -f1
+    }
+    mapfile -t all < <(storage_pkgs '/internal/(pgstore/pgtest|objstore/s3/s3test)( |$)')
+    mapfile -t s3 < <(storage_pkgs '/internal/objstore/s3/s3test( |$)')
+    # Dev credentials from compose.yaml, never real secrets.
+    export JETSTREAM_TEST_STORAGE_REQUIRED=1
+    export JETSTREAM_TEST_PG_URL='postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable'
+    export JETSTREAM_TEST_S3_REGION=us-east-1
+    export JETSTREAM_TEST_S3_BUCKET=jetstream
+    export JETSTREAM_TEST_S3_ACCESS_KEY_ID=jetstream
+    export JETSTREAM_TEST_S3_SECRET_ACCESS_KEY=jetstream-dev-secret
+    echo "test-storage: PostgreSQL + SeaweedFS"
+    JETSTREAM_TEST_S3_ENDPOINT=http://127.0.0.1:18333 \
+        gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 {{ARGS}} "${all[@]}"
+    echo "test-storage: PostgreSQL + MinIO"
+    JETSTREAM_TEST_S3_ENDPOINT=http://127.0.0.1:19000 \
+        gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 {{ARGS}} "${s3[@]}"
+
+# Measure disaggregated storage against the `just up` services (design
+# §22), e.g. `just storagebench write` or `just storagebench footers`. S3 is
+# SeaweedFS; STORAGEBENCH_S3_ENDPOINT=http://127.0.0.1:19000 selects MinIO,
+# which has more room. Objects are left behind (the dev credentials cannot
+# list), so `just down && just up` between large runs.
+storagebench *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    running="$(docker compose ps --status running --services)"
+    for svc in postgres seaweedfs minio; do
+        if ! grep -qx "${svc}" <<<"${running}"; then
+            echo "storagebench: ${svc} is not running; run \`just up\` first" >&2
+            exit 1
+        fi
+    done
+    # Dev credentials from compose.yaml, never real secrets.
+    export JETSTREAM_BENCH_PG_URL="${STORAGEBENCH_PG_URL:-postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable}"
+    export JETSTREAM_S3_ENDPOINT="${STORAGEBENCH_S3_ENDPOINT:-http://127.0.0.1:18333}"
+    export JETSTREAM_S3_REGION=us-east-1
+    export JETSTREAM_S3_BUCKET=jetstream
+    export AWS_ACCESS_KEY_ID=jetstream
+    export AWS_SECRET_ACCESS_KEY=jetstream-dev-secret
+    go run ./cmd/storagebench {{ARGS}}
+
 # Run jetstream against the local simulator (default).
 # Picks up JETSTREAM_RELAY_URL and JETSTREAM_PLC_URL from .env.
 run *ARGS:
@@ -84,19 +182,58 @@ run *ARGS:
 run-race *ARGS:
     go run -race ./cmd/jetstream {{ARGS}}
 
-# Run jetstream against real production services.
-run-prod *ARGS:
-    JETSTREAM_RELAY_URL=https://bsky.network \
-    JETSTREAM_PLC_URL=https://plc.directory \
-    JETSTREAM_DATA_DIR=./data-prod \
-    go run ./cmd/jetstream {{ARGS}}
+# Run jetstream against real production services. Arguments are the
+# subcommand and its flags, e.g. `just run-prod serve`. Storage is local
+# (./data-prod) unless JETSTREAM_STORAGE=disaggregated is set, which targets
+# the `just up` services; see _run-prod.
+run-prod *ARGS: (_run-prod "" ARGS)
 
 # Run jetstream against real production services with the race detector enabled.
-run-prod-race *ARGS:
-    JETSTREAM_RELAY_URL=https://bsky.network \
-    JETSTREAM_PLC_URL=https://plc.directory \
-    JETSTREAM_DATA_DIR=./data-prod \
-    go run -race ./cmd/jetstream {{ARGS}}
+run-prod-race *ARGS: (_run-prod "-race" ARGS)
+
+# Shared body of run-prod and run-prod-race. In disaggregated mode, `just up`
+# must be running and `JETSTREAM_STORAGE=disaggregated just run-prod storage
+# init` must have run once since the last `just down`. Every connection
+# setting defaults to the dev services in compose.yaml and can be overridden
+# from the environment, e.g. JETSTREAM_S3_ENDPOINT=http://127.0.0.1:19000 for
+# MinIO.
+[private]
+_run-prod GOFLAGS *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export JETSTREAM_RELAY_URL=https://bsky.network
+    export JETSTREAM_PLC_URL=https://plc.directory
+    case "${JETSTREAM_STORAGE:-local}" in
+    local)
+        export JETSTREAM_DATA_DIR=./data-prod
+        ;;
+    disaggregated)
+        # .env sets it, and disaggregated mode refuses any data dir.
+        unset JETSTREAM_DATA_DIR
+        # Dev credentials from compose.yaml, never real secrets.
+        export JETSTREAM_PG_URL="${JETSTREAM_PG_URL:-postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable}"
+        export JETSTREAM_S3_ENDPOINT="${JETSTREAM_S3_ENDPOINT:-http://127.0.0.1:18333}"
+        export JETSTREAM_S3_PATH_STYLE="${JETSTREAM_S3_PATH_STYLE:-true}"
+        export JETSTREAM_S3_REGION="${JETSTREAM_S3_REGION:-us-east-1}"
+        export JETSTREAM_S3_BUCKET="${JETSTREAM_S3_BUCKET:-jetstream}"
+        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-jetstream}"
+        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-jetstream-dev-secret}"
+        # Disaggregated mode refuses to start without it (design §17).
+        export GOMEMLIMIT="${GOMEMLIMIT:-8GiB}"
+        # The `just up` stores live in 4GB tmpfs mounts, far short of a
+        # full-network backfill, so cap it unless a backfill limit is
+        # already given. The flags check matters because --backfill-repos
+        # cannot be combined with a cap.
+        if [[ -z "${JETSTREAM_MAX_BACKFILL_REPOS:-}${JETSTREAM_BACKFILL_REPOS:-}" && " {{ARGS}} " != *"backfill-repos"* ]]; then
+            export JETSTREAM_MAX_BACKFILL_REPOS=5000
+        fi
+        ;;
+    *)
+        echo "run-prod: JETSTREAM_STORAGE must be local or disaggregated, got ${JETSTREAM_STORAGE}" >&2
+        exit 1
+        ;;
+    esac
+    exec go run {{GOFLAGS}} ./cmd/jetstream {{ARGS}}
 
 # Run the websocket load-test client against a running jetstream server.
 run-client *ARGS:
@@ -253,6 +390,32 @@ oracle-sweep SEEDS="10" RACE="" FIXED_SEED="":
         fi
         echo "::endgroup::"
     done
+
+# Runs the disaggregated-storage oracle (layer 3, specs/oracle.md): leader
+# and reader pods over storagefake + memblob under the seeded scheduler, with
+# the full fault mix. SEEDS is a comma-separated list; each seed is its own
+# child process, and the parent runs them in parallel.
+oracle-disagg SEEDS="1,2,3":
+    JETSTREAM_ORACLE_DISAGG_SEEDS="{{SEEDS}}" gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 ./internal/oracle -run '^TestDisagg_(Oracle|Determinism)$'
+
+# Runs the disaggregated-storage oracle over COUNT fresh random seeds. The
+# seed fixes the fault plan and the traffic; the interleaving is not
+# replayable (the D4 fallback), so rerun a failing seed a few times. RACE
+# enables the race detector.
+oracle-disagg-sweep COUNT="20" RACE="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seeds=()
+    for _ in $(seq 1 "{{COUNT}}"); do
+        seeds+=("$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')")
+    done
+    list="$(IFS=,; echo "${seeds[*]}")"
+    echo "oracle-disagg-sweep: seeds ${list}"
+    race_flag=()
+    if [[ -n "{{RACE}}" ]]; then
+        race_flag=(-race)
+    fi
+    JETSTREAM_ORACLE_DISAGG_SEEDS="${list}" gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -timeout 30m "${race_flag[@]}" ./internal/oracle -run '^TestDisagg_Oracle$'
 
 # Runs the oracle mutation campaign: applies each curated mutant patch in
 # testing/mutation/mutants one at a time and verifies the oracle kills it.

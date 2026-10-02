@@ -7,7 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/stretchr/testify/require"
@@ -179,7 +180,7 @@ func TestHostStatusDecodeInitializesErrorClassCounts(t *testing.T) {
 
 func TestHostStatusLoadNotFoundInitializesErrorClassCounts(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -193,7 +194,7 @@ func TestHostStatusLoadNotFoundInitializesErrorClassCounts(t *testing.T) {
 
 func TestHostStatusRejectsEmptyHost(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -201,13 +202,12 @@ func TestHostStatusRejectsEmptyHost(t *testing.T) {
 	require.Error(t, err)
 
 	batch := st.NewBatch()
-	defer func() { _ = batch.Close() }()
 	require.Error(t, stageHostStatus(batch, &HostStatus{Host: " \t "}))
 }
 
 func TestHostStatusNormalizesPersistenceHost(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -217,8 +217,7 @@ func TestHostStatusNormalizesPersistenceHost(t *testing.T) {
 		Total:            3,
 		ErrorClassCounts: map[ErrorClass]uint64{},
 	}))
-	require.NoError(t, st.Commit(batch, store.SyncWrites))
-	require.NoError(t, batch.Close())
+	require.NoError(t, batch.Commit(context.Background()))
 
 	got, ok, err := loadHostStatus(st, "pds.example.test")
 	require.NoError(t, err)
@@ -231,11 +230,8 @@ func TestHostStatusNormalizesPersistenceHost(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "pds.example.test", got.Host)
 
-	_, closer, err := st.Get([]byte(hostKeyPrefix + "PDS.Example.TEST"))
-	if closer != nil {
-		require.NoError(t, closer.Close())
-	}
-	require.ErrorIs(t, err, store.ErrNotFound)
+	_, err = st.Get(context.Background(), []byte(hostKeyPrefix+"PDS.Example.TEST"))
+	require.ErrorIs(t, err, metastore.ErrNotFound)
 }
 
 func TestTruncateErrorString(t *testing.T) {
@@ -247,7 +243,7 @@ func TestTruncateErrorString(t *testing.T) {
 
 func TestHandleIndexRoundTrip(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -265,23 +261,19 @@ func TestHandleIndexRoundTrip(t *testing.T) {
 
 func TestHandleIndexBlankHandleNoops(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	require.NoError(t, saveHandleIndex(st, "", atmos.DID("did:plc:alice")))
-	_, closer, err := st.Get([]byte(handleKeyPrefix))
-	if closer != nil {
-		require.NoError(t, closer.Close())
-	}
-	require.ErrorIs(t, err, store.ErrNotFound)
+	_, err = st.Get(context.Background(), []byte(handleKeyPrefix))
+	require.ErrorIs(t, err, metastore.ErrNotFound)
 
-	require.NoError(t, st.Set([]byte(handleKeyPrefix), []byte("sentinel"), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte(handleKeyPrefix), []byte("sentinel")))
 	require.NoError(t, saveHandleIndex(st, " \t ", atmos.DID("did:plc:bob")))
-	val, closer, err := st.Get([]byte(handleKeyPrefix))
+	val, err := st.Get(context.Background(), []byte(handleKeyPrefix))
 	require.NoError(t, err)
 	require.Equal(t, "sentinel", string(val))
-	require.NoError(t, closer.Close())
 
 	got, ok, err := lookupDIDByHandle(st, " \t ")
 	require.NoError(t, err)
@@ -289,19 +281,18 @@ func TestHandleIndexBlankHandleNoops(t *testing.T) {
 	require.Empty(t, got)
 
 	require.NoError(t, deleteHandleIndex(st, " \t "))
-	val, closer, err = st.Get([]byte(handleKeyPrefix))
+	val, err = st.Get(context.Background(), []byte(handleKeyPrefix))
 	require.NoError(t, err)
 	require.Equal(t, "sentinel", string(val))
-	require.NoError(t, closer.Close())
 }
 
 func TestHandleIndexLookupInvalidDIDErrors(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	require.NoError(t, st.Set([]byte(handleKeyPrefix+"bad.example"), []byte("not-a-did"), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte(handleKeyPrefix+"bad.example"), []byte("not-a-did")))
 	_, ok, err := lookupDIDByHandle(st, "bad.example")
 	require.Error(t, err)
 	require.False(t, ok)

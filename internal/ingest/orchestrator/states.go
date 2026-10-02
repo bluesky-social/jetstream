@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -13,16 +14,16 @@ import (
 func (o *Orchestrator) writeMergingPhase() error {
 	start := time.Now()
 	completedAt := start.UTC()
-	bootstrapStartedAt, err := lifecycle.ReadPhaseEnteredAt(o.cfg.Store)
+	bootstrapStartedAt, err := lifecycle.ReadPhaseEnteredAt(context.Background(), o.cfg.Store)
 	if err != nil {
 		return fmt.Errorf("orchestrator: read bootstrap phase entered_at: %w", err)
 	}
 	if bootstrapStartedAt.IsZero() {
-		if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseMerging, completedAt); err != nil {
+		if err := lifecycle.WritePhase(context.Background(), o.cfg.Store, lifecycle.PhaseMerging, completedAt); err != nil {
 			return fmt.Errorf("orchestrator: write phase=merging: %w", err)
 		}
 	} else {
-		if err := lifecycle.WritePhaseWithBackfillTiming(o.cfg.Store, lifecycle.PhaseMerging, completedAt, bootstrapStartedAt, completedAt); err != nil {
+		if err := lifecycle.WritePhaseWithBackfillTiming(context.Background(), o.cfg.Store, lifecycle.PhaseMerging, completedAt, bootstrapStartedAt, completedAt); err != nil {
 			return fmt.Errorf("orchestrator: write phase=merging with backfill timing: %w", err)
 		}
 	}
@@ -33,13 +34,17 @@ func (o *Orchestrator) writeMergingPhase() error {
 }
 
 // writeSteadyStatePhase is commit point #2. After this call returns
-// nil, the data dir is durably in PhaseSteadyState.
+// nil, the data dir is durably in PhaseSteadyState. In disaggregated mode
+// merge's final transaction already wrote the phase, so it only records
+// the transition.
 func (o *Orchestrator) writeSteadyStatePhase() error {
-	start := time.Now()
-	if err := lifecycle.WritePhase(o.cfg.Store, lifecycle.PhaseSteadyState, start.UTC()); err != nil {
-		return fmt.Errorf("orchestrator: write phase=steady_state: %w", err)
+	if o.cfg.Disaggregated == nil {
+		start := time.Now()
+		if err := lifecycle.WritePhase(context.Background(), o.cfg.Store, lifecycle.PhaseSteadyState, start.UTC()); err != nil {
+			return fmt.Errorf("orchestrator: write phase=steady_state: %w", err)
+		}
+		o.cfg.Metrics.observeState("write_phase_steady", time.Since(start).Seconds())
 	}
-	o.cfg.Metrics.observeState("write_phase_steady", time.Since(start).Seconds())
 	o.cfg.Metrics.incTransition(lifecycle.PhaseMerging, lifecycle.PhaseSteadyState)
 	o.cfg.Metrics.setPhase(PhaseGaugeSteadyState)
 	return nil

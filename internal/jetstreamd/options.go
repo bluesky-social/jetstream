@@ -12,7 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
@@ -50,6 +50,9 @@ type Options struct {
 	PublicAddr string
 	DebugAddr  string
 	DataDir    string
+	// Storage selects local or disaggregated storage. The zero value is
+	// local mode.
+	Storage StorageConfig
 	// StorageFS is the filesystem for Jetstream-owned durable storage under
 	// DataDir (segments + Pebble). Nil uses the host OS filesystem.
 	StorageFS          vfs.FS
@@ -72,12 +75,19 @@ type Options struct {
 	BackfillAsyncFlushWorkers      int
 	BootstrapLiveMaxSegmentBytes   int64
 	BootstrapLiveMaxEventsPerBlock int
+	SteadyMaxEventsPerBlock        int   // test-only; zero is the ingest default
+	SteadyMaxSegmentBytes          int64 // test-only, disaggregated mode; zero is the maintainer default
 	BackfillRepos                  []atmos.DID
 	SkipMergeDiscovery             bool
 	FailedRepoRetryInterval        time.Duration
 	FailedRepoRetryWorkers         int
 	FailedRepoRetryHostWorkers     int
 	FailedRepoRetryMaxDelay        time.Duration
+
+	// GCDelayMargin is test-only: the clock-skew allowance JETSTREAM_GC_DELAY
+	// must leave (xrpcapi.CheckGCDelay). Zero is the default. Only pods that
+	// share one clock with the catalog, as in the oracle, may shrink it.
+	GCDelayMargin time.Duration
 
 	// DisableRepoActionRateLimits disables the per-source-IP limiter for
 	// expensive operator-triggered repo actions on the status UI.
@@ -129,17 +139,12 @@ type Options struct {
 	SubscribeReadBatch             int
 	SubscribeSlowWindow            time.Duration
 	SubscribeSlowMinRate           float64
+	SubscribeColdEventsPerSec      float64
 	CursorBlockIndexCacheSize      int
 	CompactionInterval             time.Duration
 	CompactionTombstoneCap         int
 	CompactionRewriteWorkers       int
 
-	// TimestampImportToken is the bearer token gating the timestamp-import
-	// XRPC endpoints. Empty disables import (endpoints return 401).
-	TimestampImportToken string
-	// TimestampImportDir confines the CSV paths the import endpoint may read.
-	// Empty resolves to <DataDir>/imports.
-	TimestampImportDir     string
 	BarrierBeforeCutover   PhaseBarrier
 	BarrierAfterBootstrap  PhaseBarrier
 	BarrierAfterMerge      PhaseBarrier
@@ -148,22 +153,35 @@ type Options struct {
 	AfterRepoComplete      func(context.Context, atmos.DID) error
 	CrashInjector          crashpoint.Injector
 	// StoreFaultInjector is a test-only deterministic metadata-store write
-	// fault seam (store.FaultInjector). nil in production, where it is never
-	// installed on the store, so the fault path is unreachable. Used by the
+	// fault seam (metastore.FaultInjector). nil in production, where the
+	// store is never wrapped, so the fault path is unreachable. Used by the
 	// oracle store-fault tier to fail selected persistence ops by name and
 	// ordinal and assert the system fails loud rather than swallowing the
 	// error. Mirrors CrashInjector's nil-in-prod contract.
-	StoreFaultInjector store.FaultInjector
+	StoreFaultInjector metastore.FaultInjector
+	// StorageBackend, when non-nil, is the shared storage a disaggregated
+	// pod runs on instead of the PostgreSQL and S3 that Storage names.
+	// Tests pass storagefake and memblob; production leaves it nil.
+	StorageBackend *StorageBackend
+	// MemoryLimit, when > 0, stands in for GOMEMLIMIT in disaggregated
+	// mode's budget check (design §17). Production leaves it 0.
+	MemoryLimit int64
 	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
 	// fault seam (segment.IOFaultInjector), forwarded to the orchestrator so
-	// every segment writer plus the compaction-rewrite and import-patch paths
-	// consult it before each write/fsync/rename. nil in production. Used by
-	// the oracle segment-fault tier to fail selected segment I/O ops by op
-	// kind and ordinal and assert the system fails loud rather than
-	// swallowing the error. Mirrors CrashInjector's nil-in-prod contract.
+	// every segment writer plus the compaction-rewrite path consults it
+	// before each write/fsync/rename. nil in production. Used by the oracle
+	// segment-fault tier to fail selected segment I/O ops by op kind and
+	// ordinal and assert the system fails loud rather than swallowing the
+	// error. Mirrors CrashInjector's nil-in-prod contract.
 	SegmentIOFaultInjector segment.IOFaultInjector
 	OnBootstrapLiveEvent   func(*segment.Event)
 	OnSteadyStateEvent     func(*segment.Event)
+	// SessionRestartDelay is how long the leader loop waits between writer
+	// sessions. Zero is leader.DefaultAcquireInterval; tests shorten it.
+	SessionRestartDelay time.Duration
+	// OnSessionStart, if non-nil, is a test hook that fires as each writer
+	// session starts, before its orchestrator runs.
+	OnSessionStart func(epoch uint64)
 }
 
 func (o Options) effectiveBackfillGlobalDownloads() int {

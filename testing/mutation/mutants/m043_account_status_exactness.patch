@@ -25,10 +25,13 @@ expected-tier: default
 tiers: default,tombstone
 
 diff --git a/internal/tombstone/tombstone.go b/internal/tombstone/tombstone.go
-index 4d34cf1..b73d0f7 100644
+index b3678db..5dd7014 100644
 --- a/internal/tombstone/tombstone.go
 +++ b/internal/tombstone/tombstone.go
-@@ -241 +241 @@ func accountDeleted(payload []byte) (bool, error) {
+@@ -258,5 +258,5 @@ func accountDeleted(payload []byte) (bool, error) {
+ 	if err := acc.UnmarshalCBOR(payload); err != nil {
+ 		return false, err
+ 	}
 -	return !acc.Active && acc.Status.HasVal() && acc.Status.Val() == "deleted", nil
 +	return !acc.Active && acc.Status.HasVal(), nil
  }

@@ -5,9 +5,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -53,10 +54,10 @@ type Config struct {
 	// filesystem.
 	FS vfs.FS
 
-	// Store is the shared metadata pebble db.
-	Store *store.Store
+	// Store is the shared metadata store.
+	Store metastore.Store
 
-	// SeqKey is the pebble key used by the underlying ingest.Writer
+	// SeqKey is the metadata key used by the underlying ingest.Writer
 	// for its seq counter. Bootstrap uses "live_segments/seq/next";
 	// steady state uses "seq/next".
 	SeqKey string
@@ -65,7 +66,7 @@ type Config struct {
 	// lease. Bootstrap live_segments leaves it false because serving is gated.
 	ReserveClientVisibleSeqs bool
 
-	// CursorKey is the pebble key for the upstream relay cursor.
+	// CursorKey is the metadata key for the upstream relay cursor.
 	// Both phases use "relay/cursor" (the merge step will hand
 	// cursor ownership over without renaming the key).
 	CursorKey string
@@ -104,7 +105,7 @@ type Config struct {
 	// SyncStateStore is the verifier state store when it supports staged
 	// durability. If set, Consumer commits its staged chain/hosting writes in
 	// the same pebble batch as the relay cursor after a segment block fsyncs.
-	SyncStateStore *syncstate.PebbleStateStore
+	SyncStateStore *syncstate.StateStore
 
 	// Tombstones, when set, is updated after each event is durably appended
 	// and assigned a seq. Steady-state passes use it as their live in-memory
@@ -133,10 +134,6 @@ type Config struct {
 	// SegmentMetrics flows through the consumer's internal *ingest.Writer
 	// to every segment.New it makes. Optional.
 	SegmentMetrics segment.SealObserver
-
-	// TimestampStamper flows through to the consumer's internal ingest.Writer.
-	// Optional; nil means no imported indexed_at rules are active.
-	TimestampStamper ingest.TimestampStamper
 
 	// SegmentIOFaultInjector is a test-only seam forwarded to segment.Writer.
 	// Nil in production.
@@ -169,10 +166,23 @@ type Config struct {
 	// not trigger this hook.
 	OnUpstreamEventSeen func(time.Time)
 
-	// OnAfterSeal is forwarded to the inner ingest.Writer's
-	// Config.OnAfterSeal. See internal/ingest.Config.OnAfterSeal for
-	// the full contract. Optional.
-	OnAfterSeal func(idx uint64, path string) error
+	// Catalog and Namespace are forwarded to the inner ingest.Writer. See
+	// internal/ingest.Config.Catalog for the contract. Optional.
+	Catalog   ingest.SegmentCatalog
+	Namespace catalog.Namespace
+
+	// Hot, when set, runs the inner writer in hot mode (design §10.1): each
+	// hot batch commits in the leader session with the relay cursor sampled
+	// when that batch froze, so the cursor never covers rows in a later
+	// batch (§10.4). SegmentsDir is unused and SeqKey must be "seq/next";
+	// Store only reads the committed cursor at Run.
+	Hot *ingest.HotConfig
+
+	// Direct, when set, runs the inner writer in direct mode (design §10.6):
+	// each block commits in the leader session with the relay cursor sampled
+	// when that block froze. Bootstrap uses it for bootstrap_live.
+	// SegmentsDir is unused and SeqKey must be Namespace's catalog.SeqKey.
+	Direct *ingest.DirectConfig
 
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
@@ -190,7 +200,7 @@ type Config struct {
 }
 
 func (c *Config) validate() error {
-	if c.SegmentsDir == "" {
+	if c.SegmentsDir == "" && c.Hot == nil && c.Direct == nil {
 		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
 	}
 	if c.Store == nil {

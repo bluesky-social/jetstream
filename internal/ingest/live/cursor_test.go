@@ -1,15 +1,16 @@
 package live
 
 import (
+	"context"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/stretchr/testify/require"
 )
 
-func newTestStore(t *testing.T) *store.Store {
+func newTestStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return st
@@ -53,7 +54,7 @@ func TestUpstreamCursor_DistinctKeys(t *testing.T) {
 func TestLoadUpstreamCursor_RejectsCorruptValue(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	require.NoError(t, st.Set([]byte("relay/cursor"), []byte{0x01, 0x02, 0x03}, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("relay/cursor"), []byte{0x01, 0x02, 0x03}))
 
 	_, err := LoadUpstreamCursor(st, "relay/cursor")
 	require.Error(t, err)
@@ -73,7 +74,7 @@ func TestLoadUpstreamCursor_RejectsUnknownVersion(t *testing.T) {
 	// strict check the seven payload bytes after the version would be
 	// silently casted as a uint64.
 	bogus := []byte{0xFF, 0, 0, 0, 0, 0, 0, 0, 0}
-	require.NoError(t, st.Set([]byte("relay/cursor"), bogus, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("relay/cursor"), bogus))
 
 	_, err := LoadUpstreamCursor(st, "relay/cursor")
 	require.Error(t, err)
@@ -97,7 +98,7 @@ func TestLoadUpstreamCursor_RejectsHighBitSet(t *testing.T) {
 	// Valid v1 prefix + maximally-corrupt uint64. Reading the payload
 	// as int64 would silently produce -1.
 	corrupt := []byte{0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
-	require.NoError(t, st.Set([]byte("relay/cursor"), corrupt, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("relay/cursor"), corrupt))
 
 	_, err := LoadUpstreamCursor(st, "relay/cursor")
 	require.Error(t, err)
@@ -114,9 +115,8 @@ func TestSaveUpstreamCursor_WritesV1Format(t *testing.T) {
 	st := newTestStore(t)
 	require.NoError(t, SaveUpstreamCursor(st, "relay/cursor", 0x0102030405060708))
 
-	val, closer, err := st.Get([]byte("relay/cursor"))
+	val, err := st.Get(context.Background(), []byte("relay/cursor"))
 	require.NoError(t, err)
-	defer func() { _ = closer.Close() }()
 
 	want := []byte{0x01, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}
 	require.Equal(t, want, val)

@@ -32,9 +32,30 @@ The live consumer and backfill both write through a shared `ingest.Writer` (`int
 Two places hold state:
 
 - **Segment files** (`segment/`): the columnar, zstd-compressed, append-only logs. An active segment is a file state machine (append → flush → fsync → seal); sealing finalizes it into an immutable file with a footer full of indexes. The `segment` package is pure format code — no goroutines, no timers, no lifecycle — and is intentionally public API. Read `segment/doc.go` and `docs/README.md` §3.1–§3.2.
-- **The metadata store** (`internal/store`, pebble at `data/meta.pebble/`): everything that isn't cheaply re-derivable from segments — the upstream cursor, lifecycle phase, durable seq coverage frontier, write-ahead seq lease and registered vacancies, per-DID backfill/PDS status, durable PDS roster and host-local cursors, account/sync state, compaction watermark. The manifest is deliberately *not* here; it's just a directory scan plus self-describing file headers. Read `docs/README.md` §3.5.
+- **The metadata store** (the `internal/metastore` interface; local mode is `internal/metastore/pebblestore`, pebble at `data/meta.pebble/`): everything that isn't cheaply re-derivable from segments — the upstream cursor, lifecycle phase, durable seq coverage frontier, write-ahead seq lease and registered vacancies, per-DID backfill/PDS status, durable PDS roster and host-local cursors, account/sync state, compaction watermark. The manifest is deliberately *not* here; it's just a directory scan plus self-describing file headers. Read `docs/README.md` §3.5.
 
 The durability ordering between these two is the invariant that keeps a crash safe: segment fsync first, pebble commit second. See `specs/invariants.md`.
+
+#### Storage seams
+
+Core packages (ingest, orchestrator, subscribe, xrpcapi, repoexport, status, manifest) reach storage only through interfaces, so a disaggregated backend (S3 plus PostgreSQL, `specs/notes/2026-09-25-disaggregated-storage-v2-design.md`) can replace the local one without touching call sites. Disaggregated mode (`JETSTREAM_STORAGE=disaggregated`, after `jetstream storage init`) runs bootstrap, merge and steady state over `internal/catalog`, `internal/metastore/pg` and `internal/objstore/s3`. The leader also runs sparse compaction over the catalog (design §12) and object GC (design §13). The table lists the local implementations.
+
+| Interface | Package | Local implementation |
+|---|---|---|
+| `metastore.Store` (keys, batches, iterators) | `internal/metastore` | `metastore/pebblestore`; `metastore/memstore` for tests |
+| `Catalog` / `CatalogView` / `BlockRef` / `Fetcher` | `internal/catalog` | `catalog/local`: the segment directory scan, with writers publishing seals and active-block progress |
+| `HotLog` | `internal/catalog` | the writer's `ingest.ReadableLog` |
+| block committer | `internal/ingest` (`committer.go`) | segment fsync, then the Pebble batch |
+| `Locker` | `internal/leader` | `leader.Local` (always held, epoch 1) |
+| `objstore.Blob` / `objstore.Store` | `internal/objstore` | not used locally; `memblob` for tests |
+
+`TestOnlyPebblestoreImportsStore` stops any package other than `pebblestore` from importing `internal/store`. Read paths address blocks by `BlockRef` and fetch bytes through the catalog's `Fetcher`, never by path. Local-only filesystem work (tmp cleanup, namespace delete, directory fsyncs) lives behind `catalog/local`.
+
+#### Writer sessions
+
+`internal/jetstreamd` splits the runtime into per-process and per-session state (design §6.3, §6.5). `Build` constructs the per-process side once: logger, registries, metastore handle, manifest, catalog, cold reader, subscribe tail, identity, status, web, server, xrpcapi, and metrics. `Run` drives `leader.Run`. Each session acquires the writer lock, then builds a fresh orchestrator (writers, compactor, retry runners), syncstate store, tombstone set, verifier, and compaction schedule from durable state alone. The session tears all of that down before the next one starts or the metastore closes.
+
+A session error that wraps `leader.ErrRestartSession` starts a new session in-process. Any other error is fatal, which keeps the crash-loud rule. The readers follow sessions through `writerSlot`, which holds the current steady writer; the slot keeps the old writer until the next one publishes. `internal/jetstreamd/session.go` explains why.
 
 ### Serve — getting data out
 
@@ -61,7 +82,9 @@ The test rig checks storage and delivery across the full lifecycle.
 | A term I don't recognize | `specs/glossary.md` |
 | Accepted limitations / past mistakes | `specs/gotchas.md` |
 | The on-disk segment format | `segment/doc.go`, `docs/README.md` §3.1–§3.2 |
-| The metadata store keys | `internal/store`, `docs/README.md` §3.5 |
+| The metadata store keys | `internal/metastore`, `docs/README.md` §3.5 |
+| Storage interfaces (metastore, catalog, HotLog, objstore) | `internal/catalog/catalog.go`, `internal/metastore`, `internal/objstore/doc.go` |
+| Writer sessions / leader loop | `internal/leader`, `internal/jetstreamd/session.go` |
 | The ingest lifecycle / cutover | `internal/ingest/orchestrator/doc.go`, `docs/README.md` §4 |
 | Initial backfill | `internal/ingest/backfill/doc.go`, `docs/README.md` §4.1 |
 | The live firehose consumer | `internal/ingest/live/doc.go`, `docs/README.md` §4.1, §4.3 |
@@ -72,7 +95,6 @@ The test rig checks storage and delivery across the full lifecycle.
 | The Go client implementation | module root, `specs/client.md` |
 | Wire compression (dict-zstd, dictionary rotation, retraining) | `specs/client.md`, `internal/subscribe/doc.go` |
 | Compaction / tombstones | `internal/tombstone`, `docs/README.md` §3.3 |
-| Timestamp import | `internal/timestamp`, `docs/README.md` §8 |
 | The oracle / simulator | `specs/oracle.md`, `internal/oracle/doc.go`, `internal/simulator/doc.go` |
 | The mutation campaign (oracle scorecard) | `specs/mutation.md`, `testing/mutation/RESULTS.md` |
 | Coding conventions, workflow, task tracking | `AGENTS.md` |

@@ -91,6 +91,27 @@ func TestCutoverGateFloorsAtLowestObserved(t *testing.T) {
 		"gate must release when the resumed window 7..tip is contiguous (floor at lowest observed)")
 }
 
+// TestCutoverGateInheritsDurableFrames covers a frame the previous session
+// archived above its durable cursor (seq 8 here, cursor 4): the next session
+// never sees it again, so the gate releases only if it inherits it.
+func TestCutoverGateInheritsDurableFrames(t *testing.T) {
+	t.Parallel()
+
+	var tip atomic.Int64
+	tip.Store(10)
+	prev := newCutoverDeliveryGate(tipServer(t, &tip), time.Second)
+	for _, s := range []int64{1, 2, 3, 4, 8} {
+		prev.observe(liveEvent(s))
+	}
+
+	gate := newCutoverDeliveryGate(tipServer(t, &tip), 2*time.Second)
+	gate.inherit(nil, prev)
+	for _, s := range []int64{5, 6, 7, 9, 10} {
+		gate.observe(liveEvent(s))
+	}
+	require.NoError(t, gate.waitDelivered(context.Background()))
+}
+
 // TestCutoverGateNoLiveOps covers the nil-coordinator / no-traffic case: a
 // run that generated no live ops has tip=0, so the gate is a no-op and must
 // not block (there is nothing to deliver).

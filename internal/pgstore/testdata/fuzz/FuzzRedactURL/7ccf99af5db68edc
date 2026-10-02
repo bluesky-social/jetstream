@@ -1,0 +1,4 @@
+go test fuzz v1
+string("3000")
+string("\xc3000")
+string("0")

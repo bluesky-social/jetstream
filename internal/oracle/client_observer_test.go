@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -303,6 +304,14 @@ func assertTypedLikeBackfill(t *testing.T, cfg Config, run *runtimeRun, obsClien
 // tombstone) see the same shape as a direct segment scan.
 func observedEventFromClient(t *testing.T, ev jetstream.Event) ObservedEvent {
 	t.Helper()
+	oe, err := observedEventFromClientErr(ev)
+	require.NoError(t, err)
+	return oe
+}
+
+// observedEventFromClientErr is observedEventFromClient for goroutines that
+// must not call t.FailNow (the disaggregated oracle's observers).
+func observedEventFromClientErr(ev jetstream.Event) (ObservedEvent, error) {
 	oe := ObservedEvent{
 		Seq:         ev.Seq,
 		WitnessedAt: ev.WitnessedAtUS,
@@ -310,7 +319,9 @@ func observedEventFromClient(t *testing.T, ev jetstream.Event) ObservedEvent {
 	}
 	switch ev.Kind {
 	case jetstream.KindCommit:
-		require.NotNilf(t, ev.Commit, "commit event missing commit payload seq=%d", ev.Seq)
+		if ev.Commit == nil {
+			return oe, fmt.Errorf("commit event missing commit payload seq=%d", ev.Seq)
+		}
 		oe.Collection = ev.Commit.Collection
 		oe.Rkey = ev.Commit.Rkey
 		oe.Rev = ev.Commit.Rev
@@ -324,12 +335,14 @@ func observedEventFromClient(t *testing.T, ev jetstream.Event) ObservedEvent {
 		case jetstream.OpDelete:
 			oe.Kind = segment.KindDelete
 		default:
-			t.Fatalf("unknown client commit operation %q seq=%d", ev.Commit.Operation, ev.Seq)
+			return oe, fmt.Errorf("unknown client commit operation %q seq=%d", ev.Commit.Operation, ev.Seq)
 		}
 	case jetstream.KindIdentity:
 		oe.Kind = segment.KindIdentity
 	case jetstream.KindAccount:
-		require.NotNilf(t, ev.Account, "account event missing account payload seq=%d", ev.Seq)
+		if ev.Account == nil {
+			return oe, fmt.Errorf("account event missing account payload seq=%d", ev.Seq)
+		}
 		oe.Kind = segment.KindAccount
 		acc := &comatproto.SyncSubscribeRepos_Account{
 			DID:    ev.Account.DID,
@@ -341,14 +354,18 @@ func observedEventFromClient(t *testing.T, ev jetstream.Event) ObservedEvent {
 			acc.Status = gt.Some(ev.Account.Status)
 		}
 		payload, err := acc.MarshalCBOR()
-		require.NoError(t, err)
+		if err != nil {
+			return oe, err
+		}
 		oe.Payload = payload
 	case jetstream.KindSync:
-		require.NotNilf(t, ev.Sync, "sync event missing sync payload seq=%d", ev.Seq)
+		if ev.Sync == nil {
+			return oe, fmt.Errorf("sync event missing sync payload seq=%d", ev.Seq)
+		}
 		oe.Kind = segment.KindSync
 		oe.Rev = ev.Sync.Rev
 	default:
-		t.Fatalf("unknown client event kind %q seq=%d", ev.Kind, ev.Seq)
+		return oe, fmt.Errorf("unknown client event kind %q seq=%d", ev.Kind, ev.Seq)
 	}
-	return oe
+	return oe, nil
 }

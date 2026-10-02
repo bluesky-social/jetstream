@@ -3,8 +3,8 @@ package ingest
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -14,57 +14,16 @@ import (
 const DefaultReadLogRetentionBytes int64 = 256 << 20
 
 // ReadLogEntry is one stable event handle held by the writer-owned readable
-// log. Subscribe stores its encode-once memo in the opaque slot so ingest stays
-// wire-format agnostic.
-type ReadLogEntry struct {
-	event segment.Event
-	bytes int64
-	memo  atomic.Pointer[any]
-}
-
-// Event returns the resident event. Callers must treat it as immutable.
-func (e *ReadLogEntry) Event() *segment.Event {
-	if e == nil {
-		return nil
-	}
-	return &e.event
-}
-
-// ApproxBytes returns the entry's retention-budget estimate.
-func (e *ReadLogEntry) ApproxBytes() int64 {
-	if e == nil {
-		return 0
-	}
-	return e.bytes
-}
-
-// LoadMemo returns the opaque memo stored by another package.
-func (e *ReadLogEntry) LoadMemo() any {
-	if e == nil {
-		return nil
-	}
-	p := e.memo.Load()
-	if p == nil {
-		return nil
-	}
-	return *p
-}
-
-// LoadOrStoreMemo stores memo exactly once and returns the winning value.
-func (e *ReadLogEntry) LoadOrStoreMemo(memo any) any {
-	if e == nil || memo == nil {
-		return nil
-	}
-	p := &memo
-	if e.memo.CompareAndSwap(nil, p) {
-		return memo
-	}
-	return e.LoadMemo()
-}
+// log.
+type ReadLogEntry = catalog.LogEntry
 
 // ReadableLog is the writer-owned ordered log of appended events. Entries are
 // present from seq allocation until eviction, and eviction never advances the
 // floor beyond the durable watermark.
+//
+// A writer's log is dense. A FollowerLog may also hold vacant seqs (nil
+// entries): seqs compaction removed from a sealed block before the follower
+// read it (design §11.1). Readers skip them.
 type ReadableLog struct {
 	mu       sync.RWMutex
 	entries  []*ReadLogEntry
@@ -105,19 +64,23 @@ func (l *ReadableLog) append(ev *segment.Event) {
 	if l == nil {
 		return
 	}
-	entry := newReadLogEntry(ev)
+	l.appendEntry(catalog.NewLogEntry(ev))
+}
 
+// appendEntry is append for a caller that already copied the event, so hot
+// mode's open block can share the entry's copy instead of making another.
+func (l *ReadableLog) appendEntry(entry *ReadLogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if ev.Seq != l.tipSeq {
-		panic(fmt.Sprintf("ingest: readable log append seq %d, want %d", ev.Seq, l.tipSeq))
+	if seq := entry.Event().Seq; seq != l.tipSeq {
+		panic(fmt.Sprintf("ingest: readable log append seq %d, want %d", seq, l.tipSeq))
 	}
 	l.entries = append(l.entries, entry)
 	l.tipSeq++
-	l.curBytes += entry.bytes
+	l.curBytes += entry.ApproxBytes()
 	// A freshly appended entry has Seq == old tipSeq >= durable, so it is
 	// pinned until a later advanceDurable moves past it.
-	l.pinnedBytes += entry.bytes
+	l.pinnedBytes += entry.ApproxBytes()
 	l.evictLocked()
 	old := l.notify
 	l.notify = make(chan struct{})
@@ -125,11 +88,23 @@ func (l *ReadableLog) append(ev *segment.Event) {
 	close(old)
 }
 
-func newReadLogEntry(ev *segment.Event) *ReadLogEntry {
-	cp := *ev
-	cp.Payload = append([]byte(nil), ev.Payload...)
-	bytes := int64(len(cp.Payload) + len(cp.DID) + len(cp.Collection) + len(cp.Rkey) + len(cp.Rev) + 128)
-	return &ReadLogEntry{event: cp, bytes: bytes}
+// skip advances the tip to nextSeq, leaving the seqs in between vacant.
+func (l *ReadableLog) skip(nextSeq uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if nextSeq < l.tipSeq {
+		panic(fmt.Sprintf("ingest: readable log skip to %d, below tip %d", nextSeq, l.tipSeq))
+	}
+	if nextSeq == l.tipSeq {
+		return
+	}
+	for ; l.tipSeq < nextSeq; l.tipSeq++ {
+		l.entries = append(l.entries, nil)
+	}
+	l.evictLocked()
+	l.publishMetricsLocked()
+	// A reader parked at the old tip must not wait on a vacancy; the next
+	// append wakes it either way, so the notify channel is left alone.
 }
 
 func (l *ReadableLog) advanceDurable(nextSeq uint64) {
@@ -153,7 +128,7 @@ func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 		}
 		idx := seq - l.baseSeq
 		if idx < uint64(len(l.entries)) {
-			l.pinnedBytes -= l.entries[idx].bytes
+			l.pinnedBytes -= l.entries[idx].ApproxBytes()
 		}
 	}
 	l.durable = nextSeq
@@ -162,9 +137,11 @@ func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 }
 
 func (l *ReadableLog) evictLocked() {
-	for len(l.entries) > 0 && l.baseSeq < l.durable && l.curBytes > l.maxBytes {
+	// Vacant entries cost nothing against the budget, but a leading run of
+	// them below durable is dropped regardless so it cannot pin the slice.
+	for len(l.entries) > 0 && l.baseSeq < l.durable && (l.curBytes > l.maxBytes || l.entries[0] == nil) {
 		evicted := l.entries[0]
-		l.curBytes -= evicted.bytes
+		l.curBytes -= evicted.ApproxBytes()
 		l.entries[0] = nil
 		l.entries = l.entries[1:]
 		l.baseSeq++
@@ -195,13 +172,23 @@ func (l *ReadableLog) ReadFrom(cursor uint64, max int) (entries []*ReadLogEntry,
 		if idx >= uint64(len(l.entries)) {
 			panic(fmt.Sprintf("ingest: readable log corrupt index %d len %d base %d tip %d", idx, len(l.entries), l.baseSeq, l.tipSeq))
 		}
-		out := l.entries[idx:]
-		if len(out) > max {
-			out = out[:max]
+		for _, e := range l.entries[idx:] {
+			if e == nil {
+				continue
+			}
+			if entries == nil {
+				entries = make([]*ReadLogEntry, 0, min(max, len(l.entries)-int(idx)))
+			}
+			entries = append(entries, e)
+			if len(entries) == max {
+				break
+			}
 		}
-		entries = make([]*ReadLogEntry, len(out))
-		copy(entries, out)
-		return entries, nil, true, false
+		if len(entries) > 0 {
+			return entries, nil, true, false
+		}
+		// Only vacancies remain up to the tip: wait there.
+		return nil, l.notify, false, true
 	}
 	if cursor >= l.tipSeq {
 		return nil, l.notify, false, true
@@ -245,7 +232,7 @@ func (l *ReadableLog) PendingForDID(did string) []segment.Event {
 	out := make([]segment.Event, 0)
 	for _, entry := range l.entries {
 		ev := entry.Event()
-		if ev.Seq < l.durable || ev.DID != did {
+		if ev == nil || ev.Seq < l.durable || ev.DID != did {
 			continue
 		}
 		cp := *ev
@@ -273,3 +260,5 @@ func maxInt64(a, b int64) int64 {
 	}
 	return b
 }
+
+var _ catalog.HotLog = (*ReadableLog)(nil)

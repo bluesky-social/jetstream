@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
-	metastore "github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	atmosidentity "github.com/jcalabro/atmos/identity"
@@ -65,7 +65,7 @@ func newBackfillAdversitySimulator(t *testing.T, accounts, initialRecords int, f
 	return w, srv
 }
 
-func runBackfillAgainstSimulator(t *testing.T, st *metastore.Store, w *ingest.Writer, srv *httptest.Server, metrics *Metrics) error {
+func runBackfillAgainstSimulator(t *testing.T, st metastore.Store, w *ingest.Writer, srv *httptest.Server, metrics *Metrics) error {
 	t.Helper()
 
 	client := srv.Client()
@@ -174,7 +174,7 @@ func TestRun_MultiPDSFaultIsolationAndExhaustion(t *testing.T) {
 	require.Equal(t, uint64(1), durableCounts.HostsExhausted)
 
 	relayGapArchived := false
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	for idx := range cfg.Accounts {
 		if simWorld.PDSIndexForAccount(idx) == 2 || simWorld.RelayKnowsAccount(idx) {
 			continue
@@ -254,7 +254,7 @@ func TestRun_GetRepoRepoNotFoundCompletesTerminalFromSimulator(t *testing.T) {
 			metrics := NewMetrics(prometheus.NewRegistry())
 			require.NoError(t, runBackfillAgainstSimulator(t, st, writer, srv, metrics))
 
-			bs := NewStore(st, metrics)
+			bs := newSeededStore(t, st, metrics)
 			rs, err := bs.readRepoStatus(acct.DID)
 			require.NoError(t, err)
 			require.Equal(t, StatusComplete, rs.Backfill.Status)
@@ -293,7 +293,7 @@ func TestRetryRunner_FailedRepoNotFoundCompletesTerminalFromSimulator(t *testing
 
 	st, writer, _ := newRetryTestWriter(t)
 	metrics := NewMetrics(prometheus.NewRegistry())
-	bs := NewStore(st, metrics)
+	bs := newSeededStore(t, st, metrics)
 	ctx := context.Background()
 	host := mustURLHost(t, srv.URL)
 	require.NoError(t, bs.OnDiscover(ctx, atmossync.ListReposEntry{DID: acct.DID, Active: true}))
@@ -387,7 +387,7 @@ func TestRetryRunner_RateLimitFromSimulatorParksClampsAndRecovers(t *testing.T) 
 
 			st, writer, _ := newRetryTestWriter(t)
 			metrics := NewMetrics(prometheus.NewRegistry())
-			bs := NewStore(st, metrics)
+			bs := newSeededStore(t, st, metrics)
 			host := mustURLHost(t, srv.URL)
 			for _, did := range []atmos.DID{first.DID, second.DID} {
 				require.NoError(t, bs.OnDiscover(context.Background(), atmossync.ListReposEntry{DID: did, Active: true}))
@@ -465,7 +465,7 @@ func TestRun_GetRepoRedirectRecordsFinalHostFromSimulator(t *testing.T) {
 	metrics := NewMetrics(prometheus.NewRegistry())
 	require.NoError(t, runBackfillAgainstSimulator(t, st, writer, source, metrics))
 
-	bs := NewStore(st, metrics)
+	bs := newSeededStore(t, st, metrics)
 	rs, err := bs.readRepoStatus(acct.DID)
 	require.NoError(t, err)
 	require.Equal(t, StatusComplete, rs.Backfill.Status)
@@ -497,7 +497,7 @@ func TestRun_ListReposDuplicateAndShrinkPagesConvergeFromSimulator(t *testing.T)
 	metrics := NewMetrics(prometheus.NewRegistry())
 	require.NoError(t, runBackfillAgainstSimulator(t, st, writer, srv, metrics))
 
-	bs := NewStore(st, metrics)
+	bs := newSeededStore(t, st, metrics)
 	for i := 0; i < 5; i++ {
 		acct, err := w.LoadAccount(i)
 		require.NoError(t, err)
@@ -528,7 +528,7 @@ func TestRun_ListReposBoundedCursorLoopConvergesFromSimulator(t *testing.T) {
 	metrics := NewMetrics(prometheus.NewRegistry())
 	require.NoError(t, runBackfillAgainstSimulator(t, st, writer, srv, metrics))
 
-	bs := NewStore(st, metrics)
+	bs := newSeededStore(t, st, metrics)
 	for i := 0; i < 4; i++ {
 		acct, err := w.LoadAccount(i)
 		require.NoError(t, err)
@@ -606,7 +606,7 @@ func TestSelectedRepoIdentityMetadataPLCFaultsFromSimulator(t *testing.T) {
 			t.Cleanup(srv.Close)
 
 			st, _, _ := newRetryTestWriter(t)
-			bs := NewStore(st, nil)
+			bs := newSeededStore(t, st, nil)
 			var gotErrors []error
 			r := selectedRunner{cfg: selectedReposConfig{
 				Store: bs,

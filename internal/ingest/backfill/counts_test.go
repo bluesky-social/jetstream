@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -14,12 +15,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newTestStore(t *testing.T) *store.Store {
+func newTestStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+func seededStore(t *testing.T, st metastore.Store) *backfill.Store {
+	t.Helper()
+	bs := backfill.NewStore(st, nil)
+	require.NoError(t, bs.SeedCounts(t.Context()))
+	return bs
 }
 
 func TestCountStatuses_Empty(t *testing.T) {
@@ -33,7 +41,7 @@ func TestCountStatuses_Empty(t *testing.T) {
 func TestCountStatuses_MixedStates(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	bs := backfill.NewStore(st, nil)
+	bs := seededStore(t, st)
 	ctx := context.Background()
 
 	// Three discovered.
@@ -78,7 +86,7 @@ func TestCountStatuses_MixedStates(t *testing.T) {
 func TestCountStatuses_FailedToUnavailableMigration(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	bs := backfill.NewStore(st, nil)
+	bs := seededStore(t, st)
 	ctx := context.Background()
 
 	did := atmos.DID("did:plc:legacy")
@@ -103,7 +111,7 @@ func TestCountStatuses_FailedToUnavailableMigration(t *testing.T) {
 func TestCountStatuses_CorruptRowCountedInTotalOnly(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	bs := backfill.NewStore(st, nil)
+	bs := seededStore(t, st)
 	ctx := context.Background()
 
 	// One valid discovered row.
@@ -114,7 +122,7 @@ func TestCountStatuses_CorruptRowCountedInTotalOnly(t *testing.T) {
 	// tolerate the bad decode: the row contributes to Total but to no
 	// bucket. Total != sum is the operator's signal that the data is
 	// corrupt.
-	require.NoError(t, st.Set([]byte("repo/did:plc:corrupt"), []byte("not json"), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("repo/did:plc:corrupt"), []byte("not json")))
 
 	got, err := backfill.CountStatuses(st)
 	require.NoError(t, err)

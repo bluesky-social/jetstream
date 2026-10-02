@@ -1,0 +1,27 @@
+mutant: m066_seal_reverses_block_order
+target: internal/catalog/scripts.go
+failure-mode: |
+  The seal transaction writes the generation's block rows in reverse
+  ordinal order while the footer lists the blocks in seq order, so the
+  sealed generation maps each footer block to another block's object.
+  Readers of the sealed segment fetch the wrong bytes for a seq range.
+expected-detection: |
+  Every full seed seals at least one segment. The layer 3 oracle downloads
+  each pod's archive and compares it with the model, and it replays the
+  sealed range to its observers; the reordered objects fail a decode check
+  or deliver events out of order.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -536,7 +536,7 @@ func (s *Session) Seal(ctx context.Context, sl Seal) (SealCommit, error) {
+ 		}
+ 		gbs := make([]GenerationBlockRow, len(rows))
+ 		for i, r := range rows {
+-			gbs[i] = GenerationBlockRow{GenerationID: gen, Ordinal: i, ObjectID: r.ObjectID, CompressedLength: r.CompressedLength}
++			gbs[i] = GenerationBlockRow{GenerationID: gen, Ordinal: len(rows) - 1 - i, ObjectID: r.ObjectID, CompressedLength: r.CompressedLength}
+ 		}
+ 		if err := tx.InsertGenerationBlocks(ctx, gbs); err != nil {
+ 			return err

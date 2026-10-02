@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -57,7 +59,7 @@ func TestResolveCursor_SeqGapClampMatrix(t *testing.T) {
 // ErrCursorResolveFailed (5xx-class) rather than ErrInvalidCursor/ErrCursorTooOld
 // (client-error, 400) — so the handler returns a retryable 503 and does not echo
 // the internal segment path. The cursor is in-window and well-formed: the only
-// fault is the missing segment file the manifest still references.
+// fault is the corrupt block frame the catalog still references.
 func TestResolveCursor_TranslateIOFaultIsResolveFailed(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -70,17 +72,23 @@ func TestResolveCursor_TranslateIOFaultIsResolveFailed(t *testing.T) {
 		eventCount:     9,
 	})
 	m := mustOpenManifest(t, dir)
+	cat := mustCatalog(t, dir, nil)
 
-	// Remove the segment file AFTER the manifest cached its bounds, so the
-	// translation's block-scan segment.Open fails on a well-formed in-window
-	// cursor (a stand-in for a corrupt/transiently-unreadable sealed file).
-	require.NoError(t, os.Remove(segPath))
+	// Clobber the block's zstd frame in place, leaving the header (and so
+	// the generation) intact: a stand-in for a corrupt sealed file.
+	f, err := os.OpenFile(segPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt(make([]byte, 16), int64(segment.ReservedHeaderBytes)+8)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
 
 	// A cursor strictly inside the segment's witnessed-at range routes past the
-	// older/newer-than-all short-circuits into the block scan that opens the file.
+	// older/newer-than-all short-circuits into the block decode.
 	cursor := now - int64(5*time.Hour/time.Microsecond)
-	_, err := subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
+	_, err = subscribe.ResolveCursor(strconv.FormatInt(cursor, 10), subscribe.CursorEnv{
 		Manifest: m,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 		NextSeq:  10,
 		Lookback: 36 * time.Hour,
 	})
@@ -89,6 +97,54 @@ func TestResolveCursor_TranslateIOFaultIsResolveFailed(t *testing.T) {
 		"a segment-read fault during translation must be a server resolve failure, not a client error")
 	require.NotErrorIs(t, err, subscribe.ErrInvalidCursor)
 	require.NotErrorIs(t, err, subscribe.ErrCursorTooOld)
+}
+
+// TestResolveCursor_TimeUSResolvesInsideCandidateBlock pins exact
+// translation through the catalog: the manifest picks the segment, the
+// catalog's block index picks the block, and the decoded block yields the
+// first seq witnessed at or after the cursor. Without a catalog the resolver
+// falls back to the segment's MinSeq.
+func TestResolveCursor_TimeUSResolvesInsideCandidateBlock(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	base := time.Now().Add(-10 * time.Hour).UnixMicro()
+	sw, err := segment.New(segment.Config{Path: filepath.Join(dir, "seg_0000000000.jss"), MaxEventsPerBlock: 3})
+	require.NoError(t, err)
+	for seq := uint64(1); seq <= 12; seq++ {
+		full, err := sw.Append(segment.Event{
+			Seq: seq, WitnessedAt: base + int64(seq)*1_000, Kind: segment.KindCreate,
+			DID: "did:plc:fixture", Collection: "app.bsky.feed.post", Rkey: "abc", Rev: "rev", Payload: []byte{0xa0},
+		})
+		require.NoError(t, err)
+		if full {
+			require.NoError(t, sw.Flush())
+		}
+	}
+	_, err = sw.Seal()
+	require.NoError(t, err)
+	require.NoError(t, sw.Close())
+	m := mustOpenManifest(t, dir)
+	cat := mustCatalog(t, dir, nil)
+
+	for _, tc := range []struct {
+		offset int64
+		want   uint64
+	}{
+		{offset: 2_000, want: 2}, // an exact hit in the first block
+		{offset: 7_500, want: 8}, // between rows of the third block
+		{offset: 9_001, want: 10},
+		{offset: 12_000, want: 12},
+	} {
+		p, err := subscribe.ResolveCursor(strconv.FormatInt(base+tc.offset, 10), subscribe.CursorEnv{
+			Manifest: m, Catalog: cat, Fetcher: cat.Fetcher(), NextSeq: 13,
+		})
+		require.NoError(t, err)
+		require.Equal(t, tc.want, p.StartSeq, "offset %d", tc.offset)
+	}
+
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(base+7_500, 10), subscribe.CursorEnv{Manifest: m, NextSeq: 13})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), p.StartSeq, "no catalog: the candidate segment's MinSeq")
 }
 
 func TestResolveCursor_EmptyMeansLive(t *testing.T) {
@@ -115,6 +171,7 @@ func TestResolveCursor_ZeroSeqFloorsToOne(t *testing.T) {
 	require.Equal(t, uint64(1), p.StartSeq,
 		"seq 0 is a sentinel; replay must floor to the first real event (seq 1)")
 	require.True(t, p.Clamped, "flooring 0 up to 1 is a clamp")
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "seq 0 holds no event, so nothing is skipped")
 }
 
 // TestResolveCursor_TimestampEmptyArchiveFloorsToOne is the timestamp-path
@@ -136,6 +193,7 @@ func TestResolveCursor_TimestampEmptyArchiveFloorsToOne(t *testing.T) {
 	require.Equal(t, uint64(1), p.StartSeq,
 		"a timestamp cursor on an empty archive must floor to seq 1, not the seq-0 sentinel")
 	require.True(t, p.Clamped)
+	require.Equal(t, subscribe.NoticeNone, p.Notice)
 }
 
 func TestResolveCursor_TimestampEmptyArchiveClampsAcrossInitialGap(t *testing.T) {
@@ -150,6 +208,7 @@ func TestResolveCursor_TimestampEmptyArchiveClampsAcrossInitialGap(t *testing.T)
 	require.Equal(t, uint64(5), p.StartSeq)
 	require.True(t, p.Clamped)
 	require.Equal(t, "gap", p.ClampReason)
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "a registered gap holds no events")
 }
 
 func TestResolveCursor_NonNumericRejected(t *testing.T) {
@@ -170,6 +229,18 @@ func TestResolveCursor_FutureSeqDropsToLive(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 	require.True(t, p.Clamped, "Clamped is informational here; future-cursor is a special clamp case")
+	require.Equal(t, subscribe.NoticeFutureSeq, p.Notice)
+}
+
+// TestResolveCursor_NextSeqCursorIsNotFuture: a cursor equal to NextSeq is a
+// client resuming just after the newest event, the ordinary reconnect, so it
+// must not be announced as a future cursor.
+func TestResolveCursor_NextSeqCursorIsNotFuture(t *testing.T) {
+	t.Parallel()
+	p, err := subscribe.ResolveCursor("1000", subscribe.CursorEnv{NextSeq: 1000})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeLive, p.Mode)
+	require.Equal(t, subscribe.NoticeNone, p.Notice)
 }
 
 // TestResolveCursor_ZeroNextSeqDropsToLive pins the CursorEnv.NextSeq contract:
@@ -201,6 +272,7 @@ func TestResolveCursor_ZeroNextSeqDropsToLive(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 	require.True(t, p.Clamped, "future-cursor drop-to-live is reported as a clamp")
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "an unstarted writer cannot say the cursor is ahead")
 }
 
 func TestResolveCursor_FutureTimestampDropsToLive(t *testing.T) {
@@ -301,6 +373,7 @@ func TestResolveCursor_SeqGapEndingAtFloorIsNotTooOld(t *testing.T) {
 	require.Equal(t, uint64(200), p.StartSeq)
 	require.True(t, p.Clamped)
 	require.Equal(t, "gap", p.ClampReason)
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "a registered gap holds no events")
 }
 
 func TestResolveCursor_SeqGapEndingBelowFloorIsTooOld(t *testing.T) {
@@ -381,6 +454,7 @@ func TestResolveCursor_TimeUSBelowFloorClampsEvenWhenRejectBelowFloor(t *testing
 	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
 	require.True(t, p.Clamped)
 	require.Equal(t, uint64(100), p.StartSeq)
+	require.Equal(t, subscribe.NoticeBeforeArchive, p.Notice)
 }
 
 func TestResolveCursor_SeqAboveFloorPreserved(t *testing.T) {
@@ -551,7 +625,7 @@ func TestResolveCursor_TimeUSRotationRaceRechecksManifest(t *testing.T) {
 				maxWitnessedAt: now - int64(time.Hour/time.Microsecond),
 				eventCount:     9,
 			})
-			require.NoError(t, m.OnSegmentSealed(0, path))
+			require.NoError(t, manifest.ApplySegmentFile(m, nil, 0, path))
 			// The new active generation also has a candidate, but the
 			// just-sealed generation is earlier and must win.
 			return 10
@@ -587,6 +661,7 @@ func TestResolveCursor_TimeUSTranslationLandingInGapClampsToEnd(t *testing.T) {
 	require.Equal(t, uint64(200), p.StartSeq)
 	require.True(t, p.Clamped)
 	require.Equal(t, "gap", p.ClampReason)
+	require.Equal(t, subscribe.NoticeNone, p.Notice, "a registered gap holds no events")
 }
 
 func TestResolveCursor_TimeUSOlderThanAllSegmentsClampsToFloor(t *testing.T) {
@@ -611,6 +686,36 @@ func TestResolveCursor_TimeUSOlderThanAllSegmentsClampsToFloor(t *testing.T) {
 	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
 	require.True(t, p.Clamped)
 	require.Equal(t, uint64(100), p.StartSeq, "clamped to oldest sealed segment's MinSeq")
+	require.Equal(t, subscribe.NoticeBeforeArchive, p.Notice)
+}
+
+// TestResolveCursor_TimeUSBelowLookbackFloorNotice: a timestamp that lands in
+// a retained segment older than the lookback window is moved up to the floor,
+// skipping retained events, which the notice must say.
+func TestResolveCursor_TimeUSBelowLookbackFloorNotice(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	now := time.Now().UnixMicro()
+	hoursAgo := func(h int) int64 { return now - int64(time.Duration(h)*time.Hour/time.Microsecond) }
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000000.jss"), sealedFixture{
+		minSeq: 1, maxSeq: 99,
+		minWitnessedAt: hoursAgo(72), maxWitnessedAt: hoursAgo(60),
+		eventCount: 10,
+	})
+	mustWriteSealedSegment(t, filepath.Join(dir, "seg_0000000001.jss"), sealedFixture{
+		minSeq: 100, maxSeq: 199,
+		minWitnessedAt: hoursAgo(10), maxWitnessedAt: hoursAgo(5),
+		eventCount: 10,
+	})
+	m := mustOpenManifest(t, dir)
+
+	p, err := subscribe.ResolveCursor(strconv.FormatInt(hoursAgo(65), 10), subscribe.CursorEnv{
+		Manifest: m, NextSeq: 200, Lookback: 36 * time.Hour,
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscribe.ModeReplayTimeUS, p.Mode)
+	require.Equal(t, uint64(100), p.StartSeq)
+	require.Equal(t, subscribe.NoticeBelowRetention, p.Notice)
 }
 
 func TestResolveCursor_TimeUSAtThresholdExactly(t *testing.T) {

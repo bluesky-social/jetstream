@@ -1,0 +1,44 @@
+mutant: m074_sparse_vanished_did_miscount
+target: segment/sparse.go
+failure-mode: |
+  The sparse rewrite's vanished-DID check (design §12.2 step 3) only looks
+  at the blocks it already decoded: a DID that lost rows there counts as
+  vanished even when an unfetched block still holds its rows. The new
+  generation's header under-reports unique_did_count, which the status
+  page, planSnapshot and any consumer sizing a DID set trust.
+expected-detection: |
+  The layer 3 oracle's held reader runs segment.VerifySealedMetadata on
+  every generation it sees while current, which re-derives
+  unique_did_count from the rows. TestSparseRewriteMatchesRewrite and
+  TestSparseRewriteVanishedCheckFetches catch it at unit level.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/segment/sparse.go b/segment/sparse.go
+index c33056b..29a5dec 100644
+--- a/segment/sparse.go
++++ b/segment/sparse.go
+@@ -513,23 +513,6 @@ func (s *sparseRewrite) vanished() (uint32, error) {
+ 		if _, ok := s.present[did]; ok {
+ 			continue
+ 		}
+-		if _, err := s.loadBlooms(); err != nil {
+-			return 0, err
+-		}
+-		for i, b := range s.blocks {
+-			if s.decoded[i] || b.EventCount == 0 || !s.blooms[i].TestString(did) {
+-				continue
+-			}
+-			events, _, _, release, err := s.decode(i)
+-			if err != nil {
+-				return 0, err
+-			}
+-			s.addPresent(events)
+-			release()
+-			if _, ok := s.present[did]; ok {
+-				break
+-			}
+-		}
+ 		if _, ok := s.present[did]; !ok {
+ 			n++
+ 		}

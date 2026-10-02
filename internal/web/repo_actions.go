@@ -9,11 +9,11 @@ import (
 )
 
 type repoExportActions struct {
-	dataDir          string
+	// archive is the segment archive reconstruction reads, including the
+	// selector that prunes which blocks it decodes. Required for
+	// verification to run.
+	archive          repoexport.Archive
 	identityResolver identity.Resolver
-	// selector prunes which segments/blocks reconstruction decodes, backed
-	// by the in-memory manifest. Required for verification to run.
-	selector repoexport.Selector
 	// pendingEvents returns the live writer's not-yet-flushed events for a
 	// DID, folded into reconstruction so a record created moments ago is
 	// reflected in verification before the next compaction flush. nil when
@@ -22,16 +22,15 @@ type repoExportActions struct {
 }
 
 // NewRepoActions builds the production repo action implementation used by the
-// status handler. selector supplies the manifest-backed bloom pruning so
-// verification opens only the segments an account touches. pendingEvents may
+// status handler. archive's selector supplies the bloom pruning so
+// verification decodes only the blocks an account touches. pendingEvents may
 // be nil; when set it supplies the live writer's in-memory pending events so
 // verification does not spuriously report a root mismatch for a just-written
 // record.
-func NewRepoActions(dataDir string, identityResolver identity.Resolver, selector repoexport.Selector, pendingEvents func(did string) []segment.Event) RepoActions {
+func NewRepoActions(archive repoexport.Archive, identityResolver identity.Resolver, pendingEvents func(did string) []segment.Event) RepoActions {
 	return repoExportActions{
-		dataDir:          dataDir,
+		archive:          archive,
 		identityResolver: identityResolver,
-		selector:         selector,
 		pendingEvents:    pendingEvents,
 	}
 }
@@ -46,10 +45,9 @@ func (a repoExportActions) gatherPending(did string) []segment.Event {
 
 func (a repoExportActions) VerifyRepo(ctx context.Context, did string) (repoexport.VerifyReport, error) {
 	return repoexport.Verify(ctx, repoexport.VerifyConfig{
-		DataDir:          a.dataDir,
+		Archive:          a.archive,
 		DID:              did,
 		IdentityResolver: a.identityResolver,
-		Selector:         a.selector,
 		PendingEvents:    a.gatherPending(did),
 	})
 }

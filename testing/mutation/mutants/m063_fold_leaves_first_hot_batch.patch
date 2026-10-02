@@ -1,0 +1,27 @@
+mutant: m063_fold_leaves_first_hot_batch
+target: internal/catalog/scripts.go
+failure-mode: |
+  The fold transaction deletes the hot batches from MinSeq+1 instead of
+  MinSeq, so it deletes one batch too few: the block's first hot batch
+  would stay behind next to the active block that replaces it, and every
+  reader would see its events twice.
+expected-detection: |
+  checkCoverage sees the deleted batches start past the block's first seq
+  and reports corruption, so every fold fails loud and the leader's session
+  ends. The layer 3 oracle fails the run on a pod that exits on its own or
+  on an archive that never converges; TestScripts_HappyPath folds too.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -383,7 +383,7 @@ func (s *Session) Fold(ctx context.Context, b Block) (BlockCommit, error) {
+ 	}
+ 	var out BlockCommit
+ 	rev, err := s.run(ctx, TxFold, func(tx Tx, rev uint64) error {
+-		spans, err := tx.DeleteHotBatches(ctx, b.Info.MinSeq, b.Info.MaxSeq)
++		spans, err := tx.DeleteHotBatches(ctx, b.Info.MinSeq+1, b.Info.MaxSeq)
+ 		if err != nil {
+ 			return err
+ 		}

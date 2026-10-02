@@ -2,15 +2,20 @@ package subscribe
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/stretchr/testify/require"
 )
 
 func noCold(context.Context, uint64, int) ([]*Entry, uint64, error) {
@@ -218,4 +223,87 @@ func TestTail_SetReadLogSourceWakesBlockedReader(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocked reader did not wake when read log was installed")
 	}
+}
+
+// A new writer session replaces the tail's log. A reader parked at the old
+// log's tip must move to the new one, because the old log never appends
+// again.
+func TestTail_SetReadLogSourceWakesReaderParkedOnOldLog(t *testing.T) {
+	t.Parallel()
+	tl, oldW := newReadLogTail(t, 1<<20, noCold)
+	appendToWriter(t, oldW, &segment.Event{Kind: segment.KindCreate, DID: "did:plc:x", Payload: []byte{0xa0}})
+	cursor := oldW.ReadLog().TipSeq()
+
+	done := make(chan error, 1)
+	go func() {
+		entries, _, err := tl.ReadFrom(context.Background(), cursor, 8)
+		if err == nil && (len(entries) == 0 || entries[0].Event.Seq < cursor) {
+			err = fmt.Errorf("got %d entries from cursor %d", len(entries), cursor)
+		}
+		done <- err
+	}()
+	waitTailBlocked(t, tl)
+
+	_, newW := newReadLogTail(t, 1<<20, noCold)
+	for newW.ReadLog().TipSeq() <= cursor {
+		appendToWriter(t, newW, &segment.Event{Kind: segment.KindCreate, DID: "did:plc:y", Payload: []byte{0xa0}})
+	}
+	tl.SetReadLogSource(func() *ingest.ReadableLog { return newW.ReadLog() })
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader parked on the old log did not move to the new one")
+	}
+}
+
+// TestTail_ColdBudget pins finding 7 of the test-bed report: cold reads share
+// one per-process events/sec budget, so replays slow down instead of taking
+// the CPU the live tail needs, and the wait is visible in a metric.
+func TestTail_ColdBudget(t *testing.T) {
+	t.Parallel()
+	const batch, reads = 100, 30
+	cold := func(_ context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
+		out := make([]*Entry, min(max, batch))
+		for i := range out {
+			out[i] = &Entry{Event: &segment.Event{Seq: cursor + uint64(i)}}
+		}
+		return out, cursor + uint64(len(out)), nil
+	}
+	replay := func(t *testing.T, eventsPerSec float64) (time.Duration, *Metrics) {
+		var elapsed time.Duration
+		m := NewMetrics(prometheus.NewRegistry())
+		synctest.Test(t, func(t *testing.T) {
+			tl, err := New(Config{
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: m,
+				ReadBatch: batch, ColdEventsPerSec: eventsPerSec,
+			}, cold, func() uint64 { return 1 << 40 })
+			require.NoError(t, err)
+			start := time.Now()
+			cursor := uint64(1)
+			for range reads {
+				got, next, err := tl.ReadFrom(t.Context(), cursor, batch)
+				require.NoError(t, err)
+				require.Len(t, got, batch)
+				cursor = next
+			}
+			elapsed = time.Since(start)
+		})
+		return elapsed, m
+	}
+
+	elapsed, m := replay(t, 0)
+	require.Zero(t, elapsed, "0 is unlimited")
+	require.Zero(t, testutil.ToFloat64(m.ColdThrottle))
+
+	// A one-second burst (1000 events) is free, then the other 2000 events
+	// cost 2s. The last batch is charged after it is read, so the final
+	// wait is included.
+	elapsed, m = replay(t, 1000)
+	require.Equal(t, 2*time.Second, elapsed)
+	require.InDelta(t, 2.0, testutil.ToFloat64(m.ColdThrottle), 0.01)
+
+	_, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ColdEventsPerSec: -1}, cold, nil)
+	require.ErrorIs(t, err, ErrInvalidConfig)
 }

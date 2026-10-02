@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"strings"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 )
 
@@ -64,7 +66,7 @@ func (c PlanConfig) validate() error {
 	return nil
 }
 
-func newPlanSnapshotHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handler {
+func newPlanSnapshotHandler(src SegmentSource, cfg PlanConfig, syncer SeqSyncer) xrpcserver.Handler {
 	cfg = cfg.withDefaults()
 	// Validate once at construction rather than per request. runtime.Build
 	// already validates these limits at startup, so a non-nil cfgErr only
@@ -78,6 +80,17 @@ func newPlanSnapshotHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handle
 		req, err := planRequestFromInput(input, cfg)
 		if err != nil {
 			return nil, err
+		}
+		if syncer != nil {
+			if seq, ok := planSyncSeq(req); ok {
+				if err := syncer.SyncSeq(ctx, seq); err != nil {
+					return nil, &xrpc.Error{
+						StatusCode: http.StatusServiceUnavailable,
+						Name:       "ServiceUnavailable",
+						Message:    "archive view is behind the requested seq",
+					}
+				}
+			}
 		}
 		plan, err := src.PlanSnapshot(req)
 		if err != nil {
@@ -97,6 +110,20 @@ func newPlanSnapshotHandler(src SegmentSource, cfg PlanConfig) xrpcserver.Handle
 		}
 		return out, nil
 	})
+}
+
+// planSyncSeq returns the highest seq req names: afterSeq, or the last seq
+// before beforeSeq.
+func planSyncSeq(req manifest.PlanSnapshotRequest) (uint64, bool) {
+	var seq uint64
+	ok := false
+	if req.HasAfterSeq {
+		seq, ok = req.AfterSeq, true
+	}
+	if req.HasBeforeSeq && req.BeforeSeq > 0 {
+		seq, ok = max(seq, req.BeforeSeq-1), true
+	}
+	return seq, ok
 }
 
 func planRequestFromInput(input *jetstream.JetstreamPlanSnapshot_Input, cfg PlanConfig) (manifest.PlanSnapshotRequest, error) {

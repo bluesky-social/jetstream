@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
@@ -30,7 +31,7 @@ func TestMetrics_StatusLabels(t *testing.T) {
 
 	var zero time.Time
 	m.ObserveGet(zero, nil)
-	m.ObserveGet(zero, store.ErrNotFound)
+	m.ObserveGet(zero, pebble.ErrNotFound)
 	m.ObserveGet(zero, errSomeIO())
 	m.ObserveSet(zero, nil)
 	m.ObserveSet(zero, errSomeIO())

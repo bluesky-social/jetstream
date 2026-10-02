@@ -1,8 +1,8 @@
 # Grafana dashboard
 
 `jetstream.json` is the standard operational dashboard shipped with jetstream.
-It covers the whole lifecycle — bootstrap/backfill, merge/cutover, steady
-state, and timestamp import — plus process/runtime health, from a single
+It covers the whole lifecycle — bootstrap/backfill, merge/cutover, and steady
+state — plus process/runtime health, from a single
 Prometheus scrape of the jetstream binary.
 
 ## Prerequisites
@@ -74,11 +74,10 @@ directory instead.
 | Storage | compaction, tombstones, manifest, rewrite I/O |
 | Store & integrity | pebble op latency and every should-be-zero error counter |
 | Cutover & merge *(collapsed)* | phase transitions, merge rev filter, state durations |
-| Timestamp import *(collapsed)* | import phases, row throughput, reject reasons |
 | Process & Go runtime | CPU, memory, goroutines, FDs, GC pauses, network I/O |
 
-Panels for phases the process isn't in (e.g. the import row while idle, merge
-counters in steady state) legitimately show "No data" — series appear when the
+Panels for phases the process isn't in (e.g. merge counters in steady
+state) legitimately show "No data" — series appear when the
 phase runs. Orchestrator phase transitions are also surfaced as dashboard
 annotations across all panels.
 

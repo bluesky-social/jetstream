@@ -4,14 +4,27 @@ import (
 	"container/list"
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
-// blockKey identifies one immutable decoded block.
+// blockKey identifies one immutable decoded block. id is opaque: any
+// comparable value that names the block's bytes exactly. Local mode uses
+// localBlockID; disaggregated mode uses the BlockKeyer's content key (the
+// object's SHA-256, or an inline frame's first seq and SHA-256). seg and
+// epoch serve invalidateSegment, which is local-only.
 type blockKey struct {
-	segIdx     uint64
-	checksum   uint64
-	blockIdx   uint64
+	id    any
+	seg   uint64
+	epoch uint64
+}
+
+// localBlockID names a block by position and segment generation, which a
+// compaction rewrite changes.
+type localBlockID struct {
+	ns         catalog.Namespace
+	seg        uint64
+	block      int
 	generation uint64
 }
 
@@ -26,13 +39,19 @@ type blockKey struct {
 // lazily-memoized bodies back to the cache budget via Entry.grow, so a cold
 // zstd replay storm cannot silently inflate the cache past maxBytes.
 type blockCache struct {
+	// keyer, when set, replaces keyForRef's positional keys. Set before
+	// first use.
+	keyer BlockKeyer
+
 	mu       sync.Mutex
 	maxBytes int
 	curBytes int
 	ll       *list.List // front = most recently used
 	items    map[blockKey]*list.Element
 
-	generationBySegment map[uint64]uint64
+	// epochBySegment counts invalidations per segment, so a decode in flight
+	// across an invalidation does not re-insert what was just purged.
+	epochBySegment map[uint64]uint64
 
 	// Single-flight: in-flight decodes keyed by blockKey. Each inflight holds
 	// the decode result or error, populated by the first goroutine to hit the
@@ -68,18 +87,43 @@ func newBlockCache(maxBytes int) *blockCache {
 		items:    make(map[blockKey]*list.Element),
 		inFlight: make(map[blockKey]*inflight),
 
-		generationBySegment: make(map[uint64]uint64),
+		epochBySegment: make(map[uint64]uint64),
 	}
 }
 
-func (c *blockCache) keyForBlock(segIdx, checksum uint64, blockIdx int) blockKey {
+// BlockKeyer names blocks by content for the decoded block cache. ok=false
+// means the block's bytes can change under its ref, so it is decoded
+// directly and never cached. The disaggregated catalog follower implements
+// it.
+type BlockKeyer interface {
+	BlockCacheKey(ref catalog.BlockRef) (key any, ok bool)
+}
+
+// key returns ref's cache key, or ok=false if ref must not be cached.
+// Without a keyer, a block is cacheable once sealed (Generation != 0).
+func (c *blockCache) key(ref catalog.BlockRef) (blockKey, bool) {
+	if c.keyer == nil {
+		if ref.Generation == 0 {
+			return blockKey{}, false
+		}
+		return c.keyForRef(ref), true
+	}
+	id, ok := c.keyer.BlockCacheKey(ref)
+	if !ok {
+		return blockKey{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return blockKey{id: id, seg: ref.Segment, epoch: c.epochBySegment[ref.Segment]}, true
+}
+
+func (c *blockCache) keyForRef(ref catalog.BlockRef) blockKey {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return blockKey{
-		segIdx:     segIdx,
-		checksum:   checksum,
-		blockIdx:   uint64(blockIdx),
-		generation: c.generationBySegment[segIdx],
+		id:    localBlockID{ns: ref.Namespace, seg: ref.Segment, block: ref.Block, generation: ref.Generation},
+		seg:   ref.Segment,
+		epoch: c.epochBySegment[ref.Segment],
 	}
 }
 
@@ -87,11 +131,11 @@ func (c *blockCache) invalidateSegment(segIdx uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.generationBySegment[segIdx]++
+	c.epochBySegment[segIdx]++
 	for el := c.ll.Front(); el != nil; {
 		next := el.Next()
 		item := itemOf(el)
-		if item.key.segIdx == segIdx {
+		if item.key.seg == segIdx {
 			c.ll.Remove(el)
 			delete(c.items, item.key)
 			c.curBytes -= item.bytes
@@ -148,7 +192,7 @@ func (c *blockCache) getOrDecode(key blockKey, decode func() ([]segment.Event, e
 		return nil, err
 	}
 
-	if c.generationBySegment[key.segIdx] != key.generation {
+	if c.epochBySegment[key.seg] != key.epoch {
 		return inf.entries, nil
 	}
 

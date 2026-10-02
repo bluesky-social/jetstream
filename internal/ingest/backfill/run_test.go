@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -43,7 +45,7 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 	newWriter := func(t *testing.T) *ingest.Writer {
 		t.Helper()
 		dir := t.TempDir()
-		st, err := store.Open(dir, nil)
+		st, err := pebblestore.Open(dir, nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = st.Close() })
 		w, err := ingest.Open(ingest.Config{
@@ -75,28 +77,28 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 		{
 			name: "missing Writer",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, HTTPClient: httpClient, RelayURL: "x", Logger: logger}
+				return Config{Store: memstore.New(), HTTPClient: httpClient, RelayURL: "x", Logger: logger}
 			},
 			errPart: "Config.Writer",
 		},
 		{
 			name: "missing HTTPClient",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), RelayURL: "x", Logger: logger}
+				return Config{Store: memstore.New(), Writer: newWriter(t), RelayURL: "x", Logger: logger}
 			},
 			errPart: "Config.HTTPClient",
 		},
 		{
 			name: "missing RelayURL",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, Logger: logger}
+				return Config{Store: memstore.New(), Writer: newWriter(t), HTTPClient: httpClient, Logger: logger}
 			},
 			errPart: "Config.RelayURL",
 		},
 		{
 			name: "missing Logger",
 			build: func(t *testing.T) Config {
-				return Config{Store: &store.Store{}, Writer: newWriter(t), HTTPClient: httpClient, RelayURL: "x"}
+				return Config{Store: memstore.New(), Writer: newWriter(t), HTTPClient: httpClient, RelayURL: "x"}
 			},
 			errPart: "Config.Logger",
 		},
@@ -104,7 +106,7 @@ func TestRun_RejectsInvalidConfig(t *testing.T) {
 			name: "missing IdentityResolver for selected repos",
 			build: func(t *testing.T) Config {
 				return Config{
-					Store:         &store.Store{},
+					Store:         memstore.New(),
 					Writer:        newWriter(t),
 					HTTPClient:    httpClient,
 					RelayURL:      "x",
@@ -461,7 +463,7 @@ func (s *stubServer) eventIndex(event string, n int) int {
 // runWithStub drives runWithDirectory with a Directory whose Resolver
 // returns the stubServer's PDS document for each fixture DID. This is
 // the integration entry point for our run_test.go.
-func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db *store.Store) error {
+func runWithStub(t *testing.T, ctx context.Context, srv *stubServer, db metastore.Store) error {
 	t.Helper()
 	return runWithStubResolverAndRepos(t, ctx, srv, db, nil, nil)
 }
@@ -470,7 +472,7 @@ func runWithStubRepos(
 	t *testing.T,
 	ctx context.Context,
 	srv *stubServer,
-	db *store.Store,
+	db metastore.Store,
 	repos []atmos.DID,
 ) error {
 	t.Helper()
@@ -481,7 +483,7 @@ func runWithStubResolverAndRepos(
 	t *testing.T,
 	ctx context.Context,
 	srv *stubServer,
-	db *store.Store,
+	db metastore.Store,
 	repos []atmos.DID,
 	resolver atmosidentity.Resolver,
 ) error {
@@ -528,7 +530,7 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 	srv.transientFailGetRepo = map[atmos.DID]int{did: 1}
 	srv.transientFailGetRepoCode = http.StatusServiceUnavailable
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -556,7 +558,7 @@ func TestRun_TransientGetRepoFailureThenRecovers(t *testing.T) {
 
 	// The DID must have completed despite the transient 503, and
 	// the budget must be fully consumed (the engine actually retried).
-	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	got, err := newSeededStore(t, db, nil).Lookup(t.Context(), did)
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State, "transient 503s must be retried to completion")
 
@@ -577,7 +579,7 @@ func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
 	srv := newStubServer(t, fixtures)
 	srv.transientTruncateGetRepo = map[atmos.DID]int{did: 1}
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -603,7 +605,7 @@ func TestRun_TruncatedGetRepoCARThenRecovers(t *testing.T) {
 		RetryMaxDelay:  10 * time.Millisecond,
 	}))
 
-	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	got, err := newSeededStore(t, db, nil).Lookup(t.Context(), did)
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State, "truncated CAR must be retried to completion")
 
@@ -630,7 +632,7 @@ func TestRun_PeriodicallyDrainsQueuedCompletions(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(srv.listReposRelease) }) }
 	t.Cleanup(release)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -669,7 +671,7 @@ func TestRun_PeriodicallyDrainsQueuedCompletions(t *testing.T) {
 		require.FailNow(t, "second listRepos page did not block")
 	}
 
-	statusStore := NewStore(db, nil)
+	statusStore := newSeededStore(t, db, nil)
 	require.Eventually(t, func() bool {
 		rs, err := statusStore.readRepoStatus(firstDID)
 		return err == nil && rs != nil && rs.Backfill.Status == StatusComplete
@@ -694,7 +696,7 @@ func TestRun_HostEnumerationAllowsOnlyOneRetry(t *testing.T) {
 	srv := newStubServer(t, fixtures)
 	srv.transientFailListRepos = 10
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -741,13 +743,13 @@ func TestRun_HappyPath_DownloadsAllRepos(t *testing.T) {
 	}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	require.NoError(t, runWithStub(t, t.Context(), srv, db))
 
-	bf := NewStore(db, nil)
+	bf := newSeededStore(t, db, nil)
 	wantHost := "pds.stub.test"
 	for _, did := range dids {
 		got, err := bf.Lookup(context.Background(), did)
@@ -779,7 +781,7 @@ func TestRun_PassesBackfillBatchSizeToAtmos(t *testing.T) {
 	}
 	srv := newPaginatingStubServer(t, fixtures, 2)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -823,7 +825,7 @@ func TestRun_PassesBackfillWorkersToAtmos(t *testing.T) {
 	srv := newStubServer(t, fixtures)
 	srv.getRepoDelay = 25 * time.Millisecond
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -863,7 +865,7 @@ func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {
 	}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	require.NoError(t, runWithStubRepos(t, t.Context(), srv, db, []atmos.DID{selected}))
@@ -871,7 +873,7 @@ func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {
 	require.Equal(t, int64(0), srv.listReposHit.Load(), "selected backfill must not scan listRepos")
 	require.Equal(t, int64(1), srv.getRepoHit.Load(), "selected backfill should download only requested repos")
 
-	bf := NewStore(db, nil)
+	bf := newSeededStore(t, db, nil)
 	got, err := bf.Lookup(t.Context(), selected)
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State)
@@ -892,7 +894,7 @@ func TestRun_BackfillReposIndexesDeclaredHandle(t *testing.T) {
 		did: didDocumentForTest(did, "Alice.Example.COM", "https://pds.example.com"),
 	}}
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -920,11 +922,11 @@ func TestRun_BackfillReposRepairsCompletedDeclaredHandleMetadata(t *testing.T) {
 		did: didDocumentForTest(did, "repair.test", "https://repair-pds.example.com"),
 	}}
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	bf := NewStore(db, nil)
+	bf := newSeededStore(t, db, nil)
 	require.NoError(t, bf.putRepoStatus(did, &RepoStatus{
 		Backfill: RepoBackfillStatus{Status: StatusComplete, Rev: "rev-complete"},
 		Active:   true,
@@ -956,7 +958,7 @@ func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
 	srv.transientFailGetRepo = map[atmos.DID]int{did: 1}
 	srv.transientFailGetRepoCode = http.StatusServiceUnavailable
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -983,7 +985,7 @@ func TestRun_BackfillReposRetriesTransientGetRepoFailure(t *testing.T) {
 		RetryMaxDelay:    10 * time.Millisecond,
 	}))
 
-	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	got, err := newSeededStore(t, db, nil).Lookup(t.Context(), did)
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State)
 	require.Equal(t, int64(0), srv.listReposHit.Load())
@@ -1003,7 +1005,7 @@ func TestRun_Resume_NoOpAfterCompletion(t *testing.T) {
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -1029,13 +1031,13 @@ func TestRun_PersistsCursorAfterDrain(t *testing.T) {
 	}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	require.NoError(t, runWithStub(t, t.Context(), srv, db))
 
-	host, ok, err := NewStore(db, nil).loadPDSHost("pds.stub.test")
+	host, ok, err := newSeededStore(t, db, nil).loadPDSHost("pds.stub.test")
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, host.Enumerated)
@@ -1060,7 +1062,7 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 	}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -1090,7 +1092,7 @@ func TestRun_MaxRepos_StopsEarly(t *testing.T) {
 	// Count on-disk StatusComplete rows, not Lookup projections: Lookup
 	// deliberately reports interrupted not_started rows as StateComplete
 	// (#262 crash-recovery), which would count never-downloaded repos here.
-	bf := NewStore(db, nil)
+	bf := newSeededStore(t, db, nil)
 	completed := 0
 	for _, did := range dids {
 		rs, err := bf.readRepoStatus(did)
@@ -1114,12 +1116,12 @@ func TestRun_RejectsRetiredRelayCursor(t *testing.T) {
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	// Pre-seed a cursor as if a prior Run got partway through.
-	require.NoError(t, db.Set([]byte(listReposCursorKey), []byte("pretend-this-is-page-7"), store.SyncWrites))
+	require.NoError(t, db.Set(context.Background(), []byte(listReposCursorKey), []byte("pretend-this-is-page-7")))
 
 	err = runWithStub(t, t.Context(), srv, db)
 	require.ErrorContains(t, err, "old-scheme bootstrap in progress")
@@ -1132,11 +1134,11 @@ func TestRun_RejectsRetiredBootstrapLastCursor(t *testing.T) {
 	fixtures := map[atmos.DID]repoFixture{did: buildRepoFixture(t, did)}
 	srv := newStubServer(t, fixtures)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	require.NoError(t, db.Set([]byte(bootstrapLastListReposCursorKey), []byte("after-last-did"), store.SyncWrites))
+	require.NoError(t, db.Set(context.Background(), []byte(bootstrapLastListReposCursorKey), []byte("after-last-did")))
 	err = runWithStub(t, t.Context(), srv, db)
 	require.ErrorContains(t, err, "old-scheme bootstrap in progress")
 }
@@ -1154,7 +1156,7 @@ func TestRun_WritesSegmentFile(t *testing.T) {
 	srv := newStubServer(t, fixtures)
 
 	dataDir := t.TempDir()
-	db, err := store.Open(dataDir, nil)
+	db, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -1198,7 +1200,7 @@ func TestRun_AfterCompleteErrorAbortsAfterDurableCompletion(t *testing.T) {
 	srv := newStubServer(t, fixtures)
 
 	dataDir := t.TempDir()
-	db, err := store.Open(dataDir, nil)
+	db, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -1227,7 +1229,7 @@ func TestRun_AfterCompleteErrorAbortsAfterDurableCompletion(t *testing.T) {
 	})
 	require.ErrorIs(t, err, errComplete)
 
-	got, err := NewStore(db, nil).Lookup(t.Context(), did)
+	got, err := newSeededStore(t, db, nil).Lookup(t.Context(), did)
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State,
 		"completion is committed before post-completion hook failure is surfaced")
@@ -1241,7 +1243,7 @@ func TestRun_RestartAfterQueuedCompletionErrorDoesNotRedownload(t *testing.T) {
 	srv := newStubServer(t, fixtures)
 
 	dataDir := t.TempDir()
-	db, err := store.Open(dataDir, nil)
+	db, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -1305,7 +1307,7 @@ func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 	srv := newPaginatingStubServer(t, fixtures, 1)
 
 	dataDir := t.TempDir()
-	db, err := store.Open(dataDir, nil)
+	db, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -1334,23 +1336,17 @@ func TestRun_AfterRepoCompleteErrorAbortsRun(t *testing.T) {
 	})
 	require.ErrorIs(t, err, errHook)
 
-	got, err := NewStore(db, nil).Lookup(t.Context(), dids[0])
+	got, err := newSeededStore(t, db, nil).Lookup(t.Context(), dids[0])
 	require.NoError(t, err)
 	require.Equal(t, atmosbackfill.StateComplete, got.State,
 		"completion row is durable before the hook failure is surfaced")
 
-	_, closer, err := db.Get([]byte(listReposCursorKey))
-	if closer != nil {
-		require.NoError(t, closer.Close())
-	}
-	require.ErrorIs(t, err, store.ErrNotFound,
+	_, err = db.Get(context.Background(), []byte(listReposCursorKey))
+	require.ErrorIs(t, err, metastore.ErrNotFound,
 		"listRepos cursor must not advance past a failed durable completion hook")
 
-	_, closer, err = db.Get([]byte(bootstrapLastListReposCursorKey))
-	if closer != nil {
-		require.NoError(t, closer.Close())
-	}
-	require.ErrorIs(t, err, store.ErrNotFound,
+	_, err = db.Get(context.Background(), []byte(bootstrapLastListReposCursorKey))
+	require.ErrorIs(t, err, metastore.ErrNotFound,
 		"bootstrap-last cursor must not advance past a failed durable completion hook")
 }
 
@@ -1369,13 +1365,13 @@ func TestRun_PersistsPerHostLastNonEmptyCursor(t *testing.T) {
 	// with NextCursor="" (the drain sentinel).
 	srv := newPaginatingStubServer(t, fixtures, 2)
 
-	db, err := store.Open(t.TempDir(), nil)
+	db, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	require.NoError(t, runWithStub(t, t.Context(), srv, db))
 
-	host, ok, err := NewStore(db, nil).loadPDSHost("pds.stub.test")
+	host, ok, err := newSeededStore(t, db, nil).loadPDSHost("pds.stub.test")
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, host.Enumerated)

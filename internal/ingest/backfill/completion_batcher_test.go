@@ -1,11 +1,12 @@
 package backfill
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/jcalabro/atmos/repo"
@@ -19,11 +20,11 @@ func TestCompletionBatcherStagesCompletionAtDurableSeq(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	did := atmos.DID("did:plc:completebatch")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -38,7 +39,7 @@ func TestCompletionBatcherStagesCompletionAtDurableSeq(t *testing.T) {
 	require.NotNil(t, afterDone)
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -50,17 +51,16 @@ func TestCompletionBatcherStagesCompletionAtDurableSeq(t *testing.T) {
 
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 }
 
 func TestCompletionBatcherHostCursorNeverLeadsCoveredCompletion(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	hostname := "pds.cursor.test"
 	require.NoError(t, bs.OnHost(t.Context(), atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
 	did := atmos.DID("did:plc:cursor-order")
@@ -75,7 +75,6 @@ func TestCompletionBatcherHostCursorNeverLeadsCoveredCompletion(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, afterCommit)
 	require.Nil(t, afterDone)
-	require.NoError(t, batch.Close())
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 	host, _, err := bs.loadPDSHost(hostname)
 	require.NoError(t, err)
@@ -86,11 +85,10 @@ func TestCompletionBatcherHostCursorNeverLeadsCoveredCompletion(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
-	commitErr := st.Commit(batch, store.SyncWrites)
+	commitErr := batch.Commit(context.Background())
 	afterDone(commitErr)
 	require.NoError(t, commitErr)
 	afterCommit()
-	require.NoError(t, batch.Close())
 	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
 	host, _, err = bs.loadPDSHost(hostname)
 	require.NoError(t, err)
@@ -101,11 +99,11 @@ func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) 
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	did := atmos.DID("did:plc:completebatch-equal")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -120,7 +118,6 @@ func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) 
 	require.Nil(t, afterDone)
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 	require.Len(t, cb.queued, 1)
-	require.NoError(t, b.Close())
 
 	b = st.NewBatch()
 	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 43, false, nil)
@@ -128,7 +125,7 @@ func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) 
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -137,7 +134,6 @@ func TestCompletionBatcherDoesNotStageCompletionAtEqualDurableSeq(t *testing.T) 
 
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 }
 
@@ -145,11 +141,11 @@ func TestCompletionBatcherQueueCompleteRequiresWatermark(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	did := atmos.DID("did:plc:completebatch-missing-watermark")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -163,11 +159,11 @@ func TestCompletionBatcherStagesExplicitEmptyRepoCompletion(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	did := atmos.DID("did:plc:completebatch-empty")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -181,7 +177,7 @@ func TestCompletionBatcherStagesExplicitEmptyRepoCompletion(t *testing.T) {
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -190,7 +186,6 @@ func TestCompletionBatcherStagesExplicitEmptyRepoCompletion(t *testing.T) {
 
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 }
 
@@ -203,12 +198,12 @@ func TestCompletionBatcherCommitsMultipleCompletionsInOneBatch(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	metrics := NewMetrics(prometheus.NewRegistry())
-	bs := NewStore(st, metrics)
+	bs := newSeededStore(t, st, metrics)
 	first := atmos.DID("did:plc:completebatch-multi-first")
 	second := atmos.DID("did:plc:completebatch-multi-second")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(first)))
@@ -230,7 +225,7 @@ func TestCompletionBatcherCommitsMultipleCompletionsInOneBatch(t *testing.T) {
 	requireLookupState(t, bs, first, atmosbackfill.StateDiscovered)
 	requireLookupState(t, bs, second, atmosbackfill.StateDiscovered)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -241,7 +236,6 @@ func TestCompletionBatcherCommitsMultipleCompletionsInOneBatch(t *testing.T) {
 
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.CompletionDurableBatches), 0,
@@ -264,12 +258,12 @@ func TestCompletionBatcherForcedStageRejectsNonDurableAppendedCompletion(t *test
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	metrics := NewMetrics(prometheus.NewRegistry())
-	bs := NewStore(st, metrics)
+	bs := newSeededStore(t, st, metrics)
 	did := atmos.DID("did:plc:completebatch-forced-nondurable")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -284,7 +278,6 @@ func TestCompletionBatcherForcedStageRejectsNonDurableAppendedCompletion(t *test
 	require.ErrorContains(t, err, "events not durable")
 	require.Nil(t, afterCommit)
 	require.Nil(t, afterDone)
-	require.NoError(t, b.Close())
 
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
 	require.Len(t, cb.queued, 1, "the completion stays queued, not silently dropped")
@@ -298,7 +291,6 @@ func TestCompletionBatcherForcedStageRejectsNonDurableAppendedCompletion(t *test
 	require.NoError(t, err)
 	require.Nil(t, afterCommit)
 	require.Nil(t, afterDone)
-	require.NoError(t, b2.Close())
 	require.Len(t, cb.queued, 1)
 }
 
@@ -306,11 +298,11 @@ func TestCompletionBatcherQueueCompleteReplacesDuplicateDID(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	did := atmos.DID("did:plc:completebatch-duplicate")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -329,14 +321,13 @@ func TestCompletionBatcherQueueCompleteReplacesDuplicateDID(t *testing.T) {
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
 	}
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 
 	rs, err := bs.readRepoStatus(did)
@@ -350,11 +341,11 @@ func TestCompletionBatcherHoldsCountsLockUntilAfterDone(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ready := atmos.DID("did:plc:completebatch-lock-ready")
 	discovered := atmos.DID("did:plc:completebatch-lock-discovered")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(ready)))
@@ -364,7 +355,6 @@ func TestCompletionBatcherHoldsCountsLockUntilAfterDone(t *testing.T) {
 	require.NoError(t, cb.QueueComplete(t.Context(), ready, "", &repo.Commit{DID: string(ready), Rev: "rev-ready"}))
 
 	b := st.NewBatch()
-	defer func() { _ = b.Close() }()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 42, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
@@ -382,7 +372,7 @@ func TestCompletionBatcherHoldsCountsLockUntilAfterDone(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -404,11 +394,11 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	ready := atmos.DID("did:plc:completebatch-ready")
 	pending := atmos.DID("did:plc:completebatch-pending")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(ready)))
@@ -429,7 +419,7 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 	requireLookupState(t, bs, ready, atmosbackfill.StateDiscovered)
 	requireLookupState(t, bs, pending, atmosbackfill.StateDiscovered)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -440,7 +430,6 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Len(t, cb.queued, 1)
 	require.Equal(t, pending, cb.queued[0].did)
 
@@ -451,7 +440,7 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 	require.NotNil(t, afterDone)
 	require.Len(t, cb.queued, 1)
 
-	commitErr = st.Commit(b, store.SyncWrites)
+	commitErr = b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -461,7 +450,6 @@ func TestCompletionBatcherAfterCommitRemovesOnlyStagedCompletions(t *testing.T) 
 
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 }
 
@@ -469,12 +457,12 @@ func TestCompletionBatcherRecordsQueueAndDurableBatchMetrics(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	metrics := NewMetrics(prometheus.NewRegistry())
-	bs := NewStore(st, metrics)
+	bs := newSeededStore(t, st, metrics)
 	ready := atmos.DID("did:plc:completebatch-metrics-ready")
 	pending := atmos.DID("did:plc:completebatch-metrics-pending")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(ready)))
@@ -494,14 +482,13 @@ func TestCompletionBatcherRecordsQueueAndDurableBatchMetrics(t *testing.T) {
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
 	}
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.CompletionDurableBatches), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(metrics.CompletionDurableRepos), 0)
@@ -514,11 +501,11 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	did := atmos.DID("did:plc:completebatch-retry")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -534,7 +521,6 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 	require.Len(t, cb.queued, 1)
 
 	afterDone(errors.New("synthetic commit failure"))
-	require.NoError(t, b.Close())
 	require.Len(t, cb.queued, 1)
 	require.Equal(t, did, cb.queued[0].did)
 	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
@@ -545,7 +531,7 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
@@ -555,17 +541,16 @@ func TestCompletionBatcherCommitFailureKeepsStagedCompletionQueued(t *testing.T)
 
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 }
 
 func TestCompletionBatcherCommitFailureKeepsHostCursorQueued(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	const hostname = "pds-cursor-retry.example.com"
 	require.NoError(t, bs.OnHost(t.Context(), atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
 	cb := NewCompletionBatcher(bs, nil)
@@ -577,7 +562,6 @@ func TestCompletionBatcherCommitFailureKeepsHostCursorQueued(t *testing.T) {
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
 	afterDone(errors.New("synthetic commit failure"))
-	require.NoError(t, b.Close())
 	require.Contains(t, cb.cursors, hostname)
 	host, _, err := bs.loadPDSHost(hostname)
 	require.NoError(t, err)
@@ -586,11 +570,10 @@ func TestCompletionBatcherCommitFailureKeepsHostCursorQueued(t *testing.T) {
 	b = st.NewBatch()
 	afterCommit, afterDone, err = cb.StageDurable(t.Context(), b, 0, false, nil)
 	require.NoError(t, err)
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	afterDone(commitErr)
 	require.NoError(t, commitErr)
 	afterCommit()
-	require.NoError(t, b.Close())
 	require.NotContains(t, cb.cursors, hostname)
 	host, _, err = bs.loadPDSHost(hostname)
 	require.NoError(t, err)
@@ -603,11 +586,11 @@ func TestCompletionBatcherCommitFailureKeepsHostCursorQueued(t *testing.T) {
 // exhausted host resumes from it on the next run.
 func TestCompletionBatcherExhaustedPreservesPendingCheckpoint(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	const hostname = "pds-exhaust-mid-batch.example.com"
 	require.NoError(t, bs.OnHost(t.Context(), atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
 	cb := NewCompletionBatcher(bs, nil)
@@ -617,11 +600,10 @@ func TestCompletionBatcherExhaustedPreservesPendingCheckpoint(t *testing.T) {
 	b := st.NewBatch()
 	afterCommit, afterDone, err := cb.StageDurable(t.Context(), b, 0, false, nil)
 	require.NoError(t, err)
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	afterDone(commitErr)
 	require.NoError(t, commitErr)
 	afterCommit()
-	require.NoError(t, b.Close())
 
 	host, _, err := bs.loadPDSHost(hostname)
 	require.NoError(t, err)
@@ -636,11 +618,11 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	did := atmos.DID("did:plc:completebatch-replaced-after-stage")
 	require.NoError(t, bs.OnDiscover(t.Context(), testListReposEntry(did)))
 
@@ -659,14 +641,13 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 	require.Len(t, cb.queued, 1)
 	require.Equal(t, "rev-new", cb.queued[0].commit.Rev)
 
-	commitErr := st.Commit(b, store.SyncWrites)
+	commitErr := b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
 	}
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Len(t, cb.queued, 1)
 	require.Equal(t, "rev-new", cb.queued[0].commit.Rev)
 
@@ -675,14 +656,13 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 	require.NoError(t, err)
 	require.NotNil(t, afterCommit)
 	require.NotNil(t, afterDone)
-	commitErr = st.Commit(b, store.SyncWrites)
+	commitErr = b.Commit(context.Background())
 	if commitErr != nil {
 		afterDone(commitErr)
 		require.NoError(t, commitErr)
 	}
 	afterCommit()
 	afterDone(nil)
-	require.NoError(t, b.Close())
 	require.Empty(t, cb.queued)
 
 	rs, err := bs.readRepoStatus(did)

@@ -27,6 +27,25 @@ const testWitnessedAt int64 = 1_700_000_000_000_000
 // atmos's streaming decoder would emit.
 func buildCommit(t *testing.T, did, rev string, recs ...struct{ Coll, Rkey string }) (streaming.Event, [][]byte) {
 	t.Helper()
+	blocks := make([]rawRecord, 0, len(recs))
+	for i, rc := range recs {
+		blk, err := cbor.Marshal(map[string]any{"v": i})
+		require.NoError(t, err)
+		blocks = append(blocks, rawRecord{rc.Coll, rc.Rkey, blk})
+	}
+	return buildCommitBlocks(t, did, rev, blocks...)
+}
+
+// rawRecord is one record for buildCommitBlocks: its block bytes land in the
+// CAR verbatim, so a test can archive a record atmos's encoder would never
+// produce.
+type rawRecord struct {
+	Coll, Rkey string
+	Block      []byte
+}
+
+func buildCommitBlocks(t *testing.T, did, rev string, recs ...rawRecord) (streaming.Event, [][]byte) {
+	t.Helper()
 
 	key, err := crypto.GenerateP256()
 	require.NoError(t, err)
@@ -41,16 +60,11 @@ func buildCommit(t *testing.T, did, rev string, recs ...struct{ Coll, Rkey strin
 
 	payloads := make([][]byte, 0, len(recs))
 	ops := make([]comatproto.SyncSubscribeRepos_RepoOp, 0, len(recs))
-	for i, rc := range recs {
-		val := map[string]any{"v": i}
-		require.NoError(t, r.Create(rc.Coll, rc.Rkey, val))
-		// Capture the encoded record bytes from the repo. atmos's
-		// Repo.Get returns the CID and the raw block bytes that
-		// will land in the CAR — exactly what atmos's streaming
-		// decoder will see on the other side.
-		cid, blk, err := r.Get(rc.Coll, rc.Rkey)
-		require.NoError(t, err)
-		payloads = append(payloads, append([]byte(nil), blk...))
+	for _, rc := range recs {
+		cid := cbor.ComputeCID(cbor.CodecDagCBOR, rc.Block)
+		require.NoError(t, mstore.PutBlock(cid, rc.Block))
+		require.NoError(t, r.Tree.Insert(rc.Coll+"/"+rc.Rkey, cid))
+		payloads = append(payloads, append([]byte(nil), rc.Block...))
 
 		ops = append(ops, comatproto.SyncSubscribeRepos_RepoOp{
 			Action: "create",
@@ -524,6 +538,36 @@ func TestConvertEvent_MissingBlockDrop_CarriesReason(t *testing.T) {
 	require.Len(t, doe.Dropped, 1)
 	require.Equal(t, ingest.DropReasonMissingBlock, doe.Dropped[0].Reason)
 	require.Len(t, got, 1)
+}
+
+// TestConvertEvent_InvalidDataModel_DropsOpKeepsSiblings: records outside
+// the atproto data model (the shapes the disaggregated test bed found
+// archived) drop with their own reason; the well-formed sibling survives.
+func TestConvertEvent_InvalidDataModel_DropsOpKeepsSiblings(t *testing.T) {
+	t.Parallel()
+
+	float, err := cbor.Marshal(map[string]any{"$type": "net.anisota.x", "v": 1.5})
+	require.NoError(t, err)
+	str, err := cbor.Marshal(`{"$type":"app.bsky.feed.post"}`)
+	require.NoError(t, err)
+	blake3 := append([]byte{0xa1, 0x61, 'l', 0xd8, 0x2a, 0x58, 37, 0x00, 0x01, 0x71, 0x1e, 0x20}, make([]byte, 32)...)
+	good, err := cbor.Marshal(map[string]any{"text": "ok"})
+	require.NoError(t, err)
+
+	for name, bad := range map[string][]byte{"float": float, "string": str, "blake3 cid": blake3, "trailing": {0xa0, 0xa0}} {
+		evt, payloads := buildCommitBlocks(t, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "3l3qo2vutsw2b",
+			rawRecord{"app.bsky.feed.post", "good0", good},
+			rawRecord{"app.bsky.feed.post", "bad0", bad},
+		)
+		got, err := ConvertEvent(evt, testWitnessedAt)
+		doe, ok := errors.AsType[*DroppedOpsError](err)
+		require.True(t, ok, "%s must surface *DroppedOpsError, got %v", name, err)
+		require.Len(t, doe.Dropped, 1, name)
+		require.Equal(t, ingest.DropReasonInvalidDataModel, doe.Dropped[0].Reason, name)
+		require.Equal(t, "bad0", doe.Dropped[0].RKey, name)
+		require.Len(t, got, 1, name)
+		require.Equal(t, payloads[0], got[0].Payload, name)
+	}
 }
 
 func TestConvertEvent_CommitUnknownAction_Errors(t *testing.T) {

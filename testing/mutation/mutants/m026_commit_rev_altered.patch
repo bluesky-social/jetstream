@@ -22,8 +22,15 @@ expected-tier: default
 tiers: default,stress
 
 diff --git a/internal/ingest/live/events.go b/internal/ingest/live/events.go
+index 82cbcfb..20fa86d 100644
 --- a/internal/ingest/live/events.go
 +++ b/internal/ingest/live/events.go
-@@ -156 +156 @@ func convertVerifiedOps(evt streaming.Event, indexedAt int64) ([]segment.Event,
+@@ -263,7 +263,7 @@ func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, err
+ 			DID:                 commit.Repo,
+ 			Collection:          string(op.Collection),
+ 			Rkey:                string(op.RKey),
 -			Rev:                 commit.Rev,
 +			Rev:                 commit.Rev + "x",
+ 		}
+ 		// Deletes have no record bytes; everything else carries the
+ 		// raw CBOR record block exactly as atmos extracted it from

@@ -1,0 +1,31 @@
+mutant: m076_compaction_skips_refresh_after_publish
+target: internal/ingest/orchestrator/compact_deletes.go
+failure-mode: |
+  A compaction chunk that published a generation does not refresh the
+  leader's catalog view, so the next chunk of the same pass reads a
+  segment's replaced generation and rewrites from it. PublishGeneration's
+  source check refuses the publish as corruption and the leader exits;
+  without that check the new generation would silently resurrect the
+  rows the earlier chunk removed. Removing the source check alone is an
+  equivalent mutant (a replaced source is already deleted, so the
+  missing-generation check fires), so this models the bug it guards.
+expected-detection: |
+  The layer 3 oracle: a pass whose tombstones span more than one chunk
+  (cap 4) rewrites a segment twice, the leader fails loud on the second
+  publish, and the run reports an unexpected leader error.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/ingest/orchestrator/compact_deletes.go b/internal/ingest/orchestrator/compact_deletes.go
+index 680d87a..8df9b93 100644
+--- a/internal/ingest/orchestrator/compact_deletes.go
++++ b/internal/ingest/orchestrator/compact_deletes.go
+@@ -422,7 +422,7 @@ sendLoop:
+ 			o.cfg.Metrics.incCompactionSegmentsClean()
+ 		}
+ 	}
+-	if published && o.cfg.Disaggregated != nil {
++	if false && published && o.cfg.Disaggregated != nil {
+ 		// The next chunk's view must name the generations this one
+ 		// published: a rewrite of a replaced source generation is refused
+ 		// as corruption.

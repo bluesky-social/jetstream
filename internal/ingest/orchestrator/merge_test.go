@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
@@ -93,7 +95,7 @@ func TestMerge_DropsCoveredCommits_KeepsOthers(t *testing.T) {
 	}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -122,8 +124,10 @@ func TestMerge_PublishesTerminalSealToManifest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, mft.SegmentCount(), "manifest starts before merge seals any destination segment")
 
-	fix.cfg.IngestOnAfterSeal = mft.OnSegmentSealed
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	fix.cfg.Catalog = manifestCatalog(t, fix.cfg.DataDir, func(idx uint64, path string) error {
+		return manifest.ApplySegmentFile(mft, nil, idx, path)
+	})
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -147,14 +151,13 @@ func TestMerge_RefreshesRepoRev_PreservesBackfillRev(t *testing.T) {
 	}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
 
-	val, closer, err := fix.store.Get(backfill.RepoKey("did:plc:a"))
+	val, err := fix.store.Get(context.Background(), backfill.RepoKey("did:plc:a"))
 	require.NoError(t, err)
-	defer func() { _ = closer.Close() }()
 	rs, err := backfill.DecodeRepoStatus(val)
 	require.NoError(t, err)
 	require.Equal(t, "3l7", rs.Rev, "top-level Rev advances to last surviving rev")
@@ -167,7 +170,7 @@ func TestMerge_MultiSourceContiguousCommit(t *testing.T) {
 	src2 := []segment.Event{ev("did:plc:a", "3l7", segment.KindCreate, 1001)}
 	fix := newMergeFixture(t, [][]segment.Event{src1, src2}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -186,7 +189,7 @@ func TestMerge_EmptyLiveSegmentsDir(t *testing.T) {
 	t.Parallel()
 	fix := newMergeFixture(t, nil, nil) // creates empty live_segments dir
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -197,7 +200,7 @@ func TestMerge_RestartAfterCleanup_NoLiveSegmentsDir(t *testing.T) {
 	fix := newMergeFixture(t, nil, nil)
 	require.NoError(t, os.RemoveAll(filepath.Join(fix.dataDir, "backfill")))
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
@@ -208,7 +211,7 @@ func TestMerge_TopLevelRunAdvancesPhase(t *testing.T) {
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 
@@ -218,7 +221,7 @@ func TestMerge_TopLevelRunAdvancesPhase(t *testing.T) {
 	go func() { done <- o.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
-		p, err := lifecycle.ReadPhase(fix.store)
+		p, err := lifecycle.ReadPhase(t.Context(), fix.store)
 		return err == nil && p == lifecycle.PhaseSteadyState
 	}, 5*time.Second, 20*time.Millisecond, "phase did not advance to steady_state")
 	cancel()
@@ -250,7 +253,7 @@ func TestMerge_CrashAfterFlushBeforeCommit_ProducesDuplicates(t *testing.T) {
 	}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: flush-before-commit")
 	fix.cfg.CrashInjector = pointErrorInjector{
 		point: crashpoint.AfterMergeDstFlushBeforeSourceCommit,
@@ -296,7 +299,7 @@ func TestMerge_CrashAfterSealBeforeDiscovery_RestartCleansUp(t *testing.T) {
 	srcEvs := []segment.Event{ev("did:plc:a", "3l6", segment.KindCreate, 1000)}
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: seal-before-removeall")
 	fix.cfg.CrashInjector = pointErrorInjector{
 		point: crashpoint.AfterMergeDstSealBeforeDiscovery,
@@ -334,7 +337,7 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 	fix := newMergeFixture(t, [][]segment.Event{srcEvs}, map[string]string{"did:plc:a": "3l5"})
 	fix.relay.repos = []listReposEntry{{DID: "did:plc:new", Active: true}}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	sentinel := errors.New("kill point: discovery-before-cleanup")
 	fix.cfg.CrashInjector = pointErrorInjector{
 		point: crashpoint.AfterMergeDiscoveryBeforeCleanup,
@@ -345,11 +348,10 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 	require.NoError(t, err)
 	require.ErrorIs(t, o.runMerge(t.Context()), sentinel)
 
-	val, closer, err := fix.store.Get(backfill.RepoKey("did:plc:new"))
+	val, err := fix.store.Get(context.Background(), backfill.RepoKey("did:plc:new"))
 	require.NoError(t, err, "discovered DID row must be durable before cleanup")
 	rs, err := backfill.DecodeRepoStatus(val)
 	require.NoError(t, err)
-	_ = closer.Close()
 	require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
 	require.True(t, rs.Active)
 
@@ -361,11 +363,10 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, o2.runMerge(t.Context()))
 
-	val, closer, err = fix.store.Get(backfill.RepoKey("did:plc:new"))
+	val, err = fix.store.Get(context.Background(), backfill.RepoKey("did:plc:new"))
 	require.NoError(t, err, "discovered DID row must survive idempotent discovery replay")
 	rs, err = backfill.DecodeRepoStatus(val)
 	require.NoError(t, err)
-	_ = closer.Close()
 	require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
 	require.True(t, rs.Active)
 
@@ -388,7 +389,8 @@ func TestMerge_CrashAfterDiscoveryBeforeCleanup_RestartIsIdempotent(t *testing.T
 func TestMerge_SealsActiveSourceSegmentBeforeDrain(t *testing.T) {
 	t.Parallel()
 
-	// No sealed sources from the fixture; we build the unsealed one by hand.
+	// The fixture leaves one empty sealed source; we build the unsealed one
+	// after it by hand.
 	fix := newMergeFixture(t, nil, map[string]string{"did:plc:active": "3l5"})
 	liveDir := filepath.Join(fix.dataDir, "backfill", "live_segments")
 
@@ -409,11 +411,11 @@ func TestMerge_SealsActiveSourceSegmentBeforeDrain(t *testing.T) {
 	// otherwise this test would pass for the wrong reason.
 	srcFiles, err := readSegFiles(liveDir)
 	require.NoError(t, err)
-	require.Len(t, srcFiles, 1)
-	require.False(t, isSealed(t, srcFiles[0]),
+	require.Len(t, srcFiles, 2)
+	require.False(t, isSealed(t, srcFiles[1]),
 		"precondition: trailing source segment must be active/unsealed")
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
@@ -449,29 +451,27 @@ func TestMerge_DiscoversNewDIDsViaListReposResume(t *testing.T) {
 		{DID: "did:plc:new", Active: true},
 	}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
 
 	// Pre-existing did:plc:a row: top-level Rev was advanced by the
 	// merge's commitSourceComplete (rev 3l6), but Backfill is unchanged.
-	val, closer, err := fix.store.Get(backfill.RepoKey("did:plc:a"))
+	val, err := fix.store.Get(context.Background(), backfill.RepoKey("did:plc:a"))
 	require.NoError(t, err)
 	rsA, err := backfill.DecodeRepoStatus(val)
 	require.NoError(t, err)
-	_ = closer.Close()
 	require.Equal(t, "3l6", rsA.Rev)
 	require.Equal(t, backfill.StatusComplete, rsA.Backfill.Status)
 	require.Equal(t, "3l5", rsA.Backfill.Rev)
 
 	// Newly discovered did:plc:new gets a StatusFailed row with the
 	// synthetic LastError so the steady-state retry path picks it up.
-	val2, closer2, err := fix.store.Get(backfill.RepoKey("did:plc:new"))
+	val2, err := fix.store.Get(context.Background(), backfill.RepoKey("did:plc:new"))
 	require.NoError(t, err)
 	rsNew, err := backfill.DecodeRepoStatus(val2)
 	require.NoError(t, err)
-	_ = closer2.Close()
 	require.Equal(t, backfill.StatusFailed, rsNew.Backfill.Status)
 	require.Equal(t, "discovered post-bootstrap; queued for retry", rsNew.Backfill.LastError)
 	require.True(t, rsNew.Active)
@@ -502,33 +502,30 @@ func TestMerge_DiscoveryWalksMultiplePages(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()))
 
 	for _, did := range []string{"did:plc:new1", "did:plc:new2"} {
-		val, closer, err := fix.store.Get(backfill.RepoKey(did))
+		val, err := fix.store.Get(context.Background(), backfill.RepoKey(did))
 		require.NoError(t, err, "expected discovered row for %s", did)
 		rs, err := backfill.DecodeRepoStatus(val)
 		require.NoError(t, err)
-		_ = closer.Close()
 		require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
 	}
 
 	// Active flag round-trip: matches the entry the relay returned.
-	val1, closer1, err := fix.store.Get(backfill.RepoKey("did:plc:new1"))
+	val1, err := fix.store.Get(context.Background(), backfill.RepoKey("did:plc:new1"))
 	require.NoError(t, err)
 	rs1, err := backfill.DecodeRepoStatus(val1)
 	require.NoError(t, err)
-	_ = closer1.Close()
 	require.True(t, rs1.Active)
 
-	val2, closer2, err := fix.store.Get(backfill.RepoKey("did:plc:new2"))
+	val2, err := fix.store.Get(context.Background(), backfill.RepoKey("did:plc:new2"))
 	require.NoError(t, err)
 	rs2, err := backfill.DecodeRepoStatus(val2)
 	require.NoError(t, err)
-	_ = closer2.Close()
 	require.False(t, rs2.Active)
 }
 
@@ -552,17 +549,16 @@ func TestMerge_DiscoveryToleratesDuplicateEntriesAndDetectsCursorLoop(t *testing
 		},
 	}
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	require.NoError(t, o.runMerge(t.Context()), "an exhausted discovery host must not block cutover")
 
 	for _, did := range []string{"did:plc:duplicate", "did:plc:beforeloop"} {
-		val, closer, err := fix.store.Get(backfill.RepoKey(did))
+		val, err := fix.store.Get(context.Background(), backfill.RepoKey(did))
 		require.NoError(t, err, "expected discovered row for %s before loop abort", did)
 		rs, err := backfill.DecodeRepoStatus(val)
 		require.NoError(t, err)
-		_ = closer.Close()
 		require.Equal(t, backfill.StatusFailed, rs.Backfill.Status)
 	}
 
@@ -587,7 +583,7 @@ func TestMerge_DiscoveryHostErrorExhaustsAndCutoverContinues(t *testing.T) {
 	t.Cleanup(fix.relay.srv.Close)
 	fix.cfg.RelayURL = fix.relay.srv.URL
 
-	require.NoError(t, lifecycle.WritePhase(fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), fix.store, lifecycle.PhaseMerging, time.Now().UTC()))
 	o, err := New(fix.cfg)
 	require.NoError(t, err)
 	err = o.runMerge(t.Context())
@@ -597,4 +593,14 @@ func TestMerge_DiscoveryHostErrorExhaustsAndCutoverContinues(t *testing.T) {
 	// retry the durable exhausted roster row.
 	_, err = os.Stat(filepath.Join(fix.dataDir, "backfill", "live_segments"))
 	require.True(t, os.IsNotExist(err))
+}
+
+// manifestCatalog builds the local catalog the runtime wires, feeding
+// main-namespace seals to onSealed.
+func manifestCatalog(t *testing.T, dataDir string, onSealed func(idx uint64, path string) error) *localcatalog.Catalog {
+	t.Helper()
+	c, err := localcatalog.New(localcatalog.DataDirConfig(nil, dataDir))
+	require.NoError(t, err)
+	c.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error { return onSealed(v.Index, path) })
+	return c
 }

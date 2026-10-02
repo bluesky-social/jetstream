@@ -63,6 +63,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/jcalabro/atmos"
@@ -80,6 +81,9 @@ var knownForeignJetstreamEnvPrefixes = []string{
 
 	// client api keys, which might just be set ambiently in dev environments perhaps
 	"JETSTREAM_API_KEY",
+
+	// test harnesses (just test-storage: PG URL, S3 endpoints)
+	"JETSTREAM_TEST_",
 }
 
 func main() {
@@ -136,6 +140,7 @@ func newAppWithEnviron(environ func() []string) *cli.Command {
 			versionCommand(),
 			inspectSegmentCommand(),
 			inspectAllCommand(),
+			storageCommand(),
 		},
 	}
 }
@@ -171,7 +176,7 @@ func versionCommand() *cli.Command {
 }
 
 func serveCommand() *cli.Command {
-	return &cli.Command{
+	cmd := &cli.Command{
 		Name:  "serve",
 		Usage: "Run the jetstream HTTP server",
 		Flags: []cli.Flag{
@@ -219,7 +224,7 @@ func serveCommand() *cli.Command {
 			},
 			&cli.StringFlag{
 				Name:    "data-dir",
-				Usage:   "Path to the data directory; the metadata store lives at <data-dir>/meta.pebble",
+				Usage:   "Path to the data directory; the metadata store lives at <data-dir>/meta.pebble. Local storage only: must be unset with --storage=disaggregated",
 				Sources: cli.EnvVars("JETSTREAM_DATA_DIR"),
 				Value:   "./data",
 			},
@@ -371,6 +376,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE"),
 				Value:   5,
 			},
+			&cli.FloatFlag{
+				Name:    "subscribe-cold-events-per-sec",
+				Usage:   "Events/sec this process serves from cold (archive) reads, summed over all subscribers, so replays cannot starve the live tail. 0 disables the limit.",
+				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_COLD_EVENTS_PER_SEC"),
+				Value:   200_000,
+			},
 			&cli.IntFlag{
 				Name:    "cursor-block-index-cache-size",
 				Usage:   "Deprecated compatibility no-op: sealed segment metadata is always resident in the manifest.",
@@ -395,21 +406,248 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_COMPACTION_REWRITE_WORKERS"),
 				Value:   0,
 			},
-			&cli.StringFlag{
-				Name:    "timestamp-import-token",
-				Usage:   "Bearer token gating the timestamp-import XRPC endpoints. Empty (default) disables import: the endpoints always return 401. Front the endpoint with TLS (terminated by your proxy); the token is a bearer secret.",
-				Sources: cli.EnvVars("JETSTREAM_TIMESTAMP_IMPORT_TOKEN"),
-				Value:   "",
-			},
-			&cli.StringFlag{
-				Name:    "timestamp-import-dir",
-				Usage:   "Directory the timestamp-import endpoint may read staged CSVs from. Submitted paths are confined here (.. and symlink escapes rejected). Empty uses <data-dir>/imports.",
-				Sources: cli.EnvVars("JETSTREAM_TIMESTAMP_IMPORT_DIR"),
-				Value:   "",
-			},
 		},
 		Action: runServe,
 	}
+	cmd.Flags = append(cmd.Flags, storageFlags()...)
+	return cmd
+}
+
+// storageCommand groups the commands that administer disaggregated storage.
+func storageCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "storage",
+		Usage: "Administer disaggregated storage (PostgreSQL catalog plus S3 objects)",
+		Commands: []*cli.Command{
+			{
+				Name:   "init",
+				Usage:  "Create a new archive in the PostgreSQL database and S3 bucket that the storage flags name (design §15.1). Refuses a database that already holds an archive.",
+				Flags:  storageInitFlags(),
+				Action: runStorageInit,
+			},
+		},
+	}
+}
+
+// storageInitFlags is the subset of storageFlags that init reads: the
+// connections and the lease it holds while creating the first segments.
+func storageInitFlags() []cli.Flag {
+	var out []cli.Flag
+	for _, f := range storageFlags() {
+		name := f.Names()[0]
+		if strings.HasPrefix(name, "pg-") || strings.HasPrefix(name, "s3-") || name == "leader-lease" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// runStorageInit creates the archive whatever --storage says: init only
+// ever targets disaggregated storage, and requiring the flag would add a
+// step without catching a mistake.
+func runStorageInit(ctx context.Context, cmd *cli.Command) error {
+	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, _, err := storageConfigFromCommand(cmd)
+	if err != nil {
+		return err
+	}
+	archive, err := jetstreamd.InitStorage(runCtx, cfg)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(cmd.Root().Writer, "initialized archive %s\n", objstore.FormatUUID(archive.ArchiveID))
+	return err
+}
+
+// storageFlagCategory groups the disaggregated-storage flags in --help.
+const storageFlagCategory = "Disaggregated storage (design §18)"
+
+// storageFlags declares every design §18 variable. They are declared even
+// before the runtime reads them all so that none is rejected as an unknown
+// JETSTREAM_* variable. The `storage` subcommands reuse them.
+//
+// --pg-url holds a password. urfave/cli renders defaults before reading env
+// sources, so --help shows no value today; HideDefault keeps it that way if
+// that ever changes. Everything else logs it only through
+// pgstore.RedactURL.
+func storageFlags() []cli.Flag {
+	def := jetstreamd.DefaultStorageConfig()
+	cat := storageFlagCategory
+	return []cli.Flag{
+		&cli.StringFlag{
+			Name: "storage", Category: cat, Usage: "Storage backend: local (segments and Pebble under --data-dir) or disaggregated (PostgreSQL catalog plus S3 objects, no local disk; --data-dir must be unset)",
+			Sources: cli.EnvVars("JETSTREAM_STORAGE"), Value: string(def.Mode),
+		},
+		&cli.StringFlag{
+			Name: "pg-url", Category: cat, Usage: "PostgreSQL connection string (secret: set it in the environment, never in .env)",
+			Sources: cli.EnvVars("JETSTREAM_PG_URL"), HideDefault: true,
+		},
+		&cli.IntFlag{
+			Name: "pg-max-conns", Category: cat, Usage: "PostgreSQL connection pool size",
+			Sources: cli.EnvVars("JETSTREAM_PG_MAX_CONNS"), Value: def.PG.MaxConns,
+		},
+		&cli.StringFlag{
+			Name: "s3-endpoint", Category: cat, Usage: "S3 endpoint URL; empty uses the AWS default. Credentials come from the AWS SDK default chain (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, web identity, instance metadata)",
+			Sources: cli.EnvVars("JETSTREAM_S3_ENDPOINT"),
+		},
+		&cli.StringFlag{
+			Name: "s3-region", Category: cat, Usage: "S3 region",
+			Sources: cli.EnvVars("JETSTREAM_S3_REGION"),
+		},
+		&cli.StringFlag{
+			Name: "s3-bucket", Category: cat, Usage: "S3 bucket",
+			Sources: cli.EnvVars("JETSTREAM_S3_BUCKET"),
+		},
+		&cli.StringFlag{
+			Name: "s3-prefix", Category: cat, Usage: "S3 key prefix",
+			Sources: cli.EnvVars("JETSTREAM_S3_PREFIX"),
+		},
+		&cli.BoolFlag{
+			Name: "s3-path-style", Category: cat, Usage: "Use path-style S3 addressing (SeaweedFS, MinIO)",
+			Sources: cli.EnvVars("JETSTREAM_S3_PATH_STYLE"),
+		},
+		&cli.IntFlag{
+			Name: "s3-upload-concurrency", Category: cat, Usage: "Concurrent S3 uploads",
+			Sources: cli.EnvVars("JETSTREAM_S3_UPLOAD_CONCURRENCY"), Value: def.S3.UploadConcurrency,
+		},
+		&cli.IntFlag{
+			Name: "s3-read-concurrency", Category: cat, Usage: "Concurrent S3 GETs for footer load and prefetch",
+			Sources: cli.EnvVars("JETSTREAM_S3_READ_CONCURRENCY"), Value: def.S3.ReadConcurrency,
+		},
+		&cli.DurationFlag{
+			Name: "s3-retry-timeout", Category: cat, Usage: "Give up on one S3 operation, retries included, after this long",
+			Sources: cli.EnvVars("JETSTREAM_S3_RETRY_TIMEOUT"), Value: def.S3.RetryTimeout,
+		},
+		&cli.DurationFlag{
+			Name: "s3-read-retry-timeout", Category: cat, Usage: "Retry budget for S3 reads that serve clients; after it they answer 503",
+			Sources: cli.EnvVars("JETSTREAM_S3_READ_RETRY_TIMEOUT"), Value: def.S3.ReadRetryTimeout,
+		},
+		&cli.DurationFlag{
+			Name: "leader-lease", Category: cat, Usage: "Writer lease duration",
+			Sources: cli.EnvVars("JETSTREAM_LEADER_LEASE"), Value: def.Leader.Lease,
+		},
+		&cli.DurationFlag{
+			Name: "leader-renew-interval", Category: cat, Usage: "Writer lease renew period; must be shorter than --leader-lease",
+			Sources: cli.EnvVars("JETSTREAM_LEADER_RENEW_INTERVAL"), Value: def.Leader.RenewInterval,
+		},
+		&cli.DurationFlag{
+			Name: "leader-acquire-interval", Category: cat, Usage: "Writer lease acquire attempt period",
+			Sources: cli.EnvVars("JETSTREAM_LEADER_ACQUIRE_INTERVAL"), Value: def.Leader.AcquireInterval,
+		},
+		&cli.DurationFlag{
+			Name: "hot-batch-max-age", Category: cat, Usage: "Hot-mode batch age cut",
+			Sources: cli.EnvVars("JETSTREAM_HOT_BATCH_MAX_AGE"), Value: def.Hot.BatchMaxAge,
+		},
+		&cli.DurationFlag{
+			Name: "block-max-age", Category: cat, Usage: "Hot-mode open block age cut",
+			Sources: cli.EnvVars("JETSTREAM_BLOCK_MAX_AGE"), Value: def.BlockMaxAge,
+		},
+		&cli.IntFlag{
+			Name: "hot-inline-bytes-per-sec", Category: cat, Usage: "Live inline token bucket rate, in bytes per second",
+			Sources: cli.EnvVars("JETSTREAM_HOT_INLINE_BYTES_PER_SEC"), Value: int(def.Hot.InlineBytesPerSec),
+		},
+		&cli.IntFlag{
+			Name: "hot-bulk-pending-bytes", Category: cat, Usage: "Bulk (backfill and retry) pending-byte permits",
+			Sources: cli.EnvVars("JETSTREAM_HOT_BULK_PENDING_BYTES"), Value: int(def.Hot.BulkPendingBytes),
+		},
+		&cli.IntFlag{
+			Name: "hot-pending-bytes", Category: cat, Usage: "Total frozen-but-uncommitted byte cap",
+			Sources: cli.EnvVars("JETSTREAM_HOT_PENDING_BYTES"), Value: int(def.Hot.PendingBytes),
+		},
+		&cli.IntFlag{
+			Name: "hot-max-unfolded-events", Category: cat, Usage: "Committed-but-unfolded event cap",
+			Sources: cli.EnvVars("JETSTREAM_HOT_MAX_UNFOLDED_EVENTS"), Value: def.Hot.MaxUnfoldedEvents,
+		},
+		&cli.DurationFlag{
+			Name: "catalog-poll-interval", Category: cat, Usage: "Catalog follower poll period; covers a lost NOTIFY",
+			Sources: cli.EnvVars("JETSTREAM_CATALOG_POLL_INTERVAL"), Value: def.CatalogPollInterval,
+		},
+		&cli.DurationFlag{
+			Name: "max-view-age", Category: cat, Usage: "Report not ready when the catalog mirror is older than this",
+			Sources: cli.EnvVars("JETSTREAM_MAX_VIEW_AGE"), Value: def.MaxViewAge,
+		},
+		&cli.DurationFlag{
+			Name: "max-archive-response-duration", Category: cat, Usage: "Cut off one archive response after this long",
+			Sources: cli.EnvVars("JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION"), Value: def.MaxArchiveResponseDuration,
+		},
+		&cli.DurationFlag{
+			Name: "gc-interval", Category: cat, Usage: "Object GC period",
+			Sources: cli.EnvVars("JETSTREAM_GC_INTERVAL"), Value: def.GC.Interval,
+		},
+		&cli.DurationFlag{
+			Name: "gc-delay", Category: cat, Usage: "Age an object must stay unreferenced before GC deletes it",
+			Sources: cli.EnvVars("JETSTREAM_GC_DELAY"), Value: def.GC.Delay,
+		},
+		&cli.DurationFlag{
+			Name: "gc-orphan-age", Category: cat, Usage: "Age of an uploading object before GC deletes it",
+			Sources: cli.EnvVars("JETSTREAM_GC_ORPHAN_AGE"), Value: def.GC.OrphanAge,
+		},
+		&cli.IntFlag{
+			Name: "object-cache-bytes", Category: cat, Usage: "Compressed object cache budget",
+			Sources: cli.EnvVars("JETSTREAM_OBJECT_CACHE_BYTES"), Value: int(def.ObjectCacheBytes),
+		},
+		&cli.IntFlag{
+			Name: "compaction-memory-bytes", Category: cat, Usage: "Compaction working-set budget",
+			Sources: cli.EnvVars("JETSTREAM_COMPACTION_MEMORY_BYTES"), Value: int(def.CompactionMemoryBytes),
+		},
+	}
+}
+
+// storageConfigFromCommand resolves the storage flags. In disaggregated mode
+// it returns an empty data dir, and refuses an explicitly set one: --data-dir
+// has a default, so only IsSet tells a deliberate choice from the default.
+func storageConfigFromCommand(cmd *cli.Command) (jetstreamd.StorageConfig, string, error) {
+	cfg := jetstreamd.StorageConfig{
+		Mode: jetstreamd.StorageMode(cmd.String("storage")),
+		PG: jetstreamd.PGConfig{
+			URL:      cmd.String("pg-url"),
+			MaxConns: cmd.Int("pg-max-conns"),
+		},
+		S3: jetstreamd.S3Config{
+			Endpoint:          cmd.String("s3-endpoint"),
+			Region:            cmd.String("s3-region"),
+			Bucket:            cmd.String("s3-bucket"),
+			Prefix:            cmd.String("s3-prefix"),
+			PathStyle:         cmd.Bool("s3-path-style"),
+			UploadConcurrency: cmd.Int("s3-upload-concurrency"),
+			ReadConcurrency:   cmd.Int("s3-read-concurrency"),
+			RetryTimeout:      cmd.Duration("s3-retry-timeout"),
+			ReadRetryTimeout:  cmd.Duration("s3-read-retry-timeout"),
+		},
+		Leader: jetstreamd.LeaderConfig{
+			Lease:           cmd.Duration("leader-lease"),
+			RenewInterval:   cmd.Duration("leader-renew-interval"),
+			AcquireInterval: cmd.Duration("leader-acquire-interval"),
+		},
+		Hot: jetstreamd.HotConfig{
+			BatchMaxAge:       cmd.Duration("hot-batch-max-age"),
+			InlineBytesPerSec: int64(cmd.Int("hot-inline-bytes-per-sec")),
+			BulkPendingBytes:  int64(cmd.Int("hot-bulk-pending-bytes")),
+			PendingBytes:      int64(cmd.Int("hot-pending-bytes")),
+			MaxUnfoldedEvents: cmd.Int("hot-max-unfolded-events"),
+		},
+		BlockMaxAge:                cmd.Duration("block-max-age"),
+		CatalogPollInterval:        cmd.Duration("catalog-poll-interval"),
+		MaxViewAge:                 cmd.Duration("max-view-age"),
+		MaxArchiveResponseDuration: cmd.Duration("max-archive-response-duration"),
+		GC: jetstreamd.GCConfig{
+			Interval:  cmd.Duration("gc-interval"),
+			Delay:     cmd.Duration("gc-delay"),
+			OrphanAge: cmd.Duration("gc-orphan-age"),
+		},
+		ObjectCacheBytes:      int64(cmd.Int("object-cache-bytes")),
+		CompactionMemoryBytes: int64(cmd.Int("compaction-memory-bytes")),
+	}
+	dataDir := cmd.String("data-dir")
+	if cfg.Disaggregated() {
+		if cmd.IsSet("data-dir") {
+			return jetstreamd.StorageConfig{}, "", fmt.Errorf("serve: JETSTREAM_DATA_DIR (--data-dir) must be unset when JETSTREAM_STORAGE=disaggregated")
+		}
+		dataDir = ""
+	}
+	return cfg, dataDir, nil
 }
 
 func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
@@ -422,6 +660,11 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		return jetstreamd.Options{}, fmt.Errorf("serve: --backfill-repos cannot be combined with --max-backfill-repos")
 	}
 
+	storage, dataDir, err := storageConfigFromCommand(cmd)
+	if err != nil {
+		return jetstreamd.Options{}, err
+	}
+
 	skipMergeDiscovery := cmd.Bool("skip-merge-discovery")
 	if maxBackfillRepos > 0 || len(backfillRepos) > 0 {
 		skipMergeDiscovery = true
@@ -430,13 +673,14 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 	return jetstreamd.Options{
 		PublicAddr:                     cmd.String("addr"),
 		DebugAddr:                      cmd.String("debug-addr"),
-		DataDir:                        cmd.String("data-dir"),
+		DataDir:                        dataDir,
+		Storage:                        storage,
 		RelayURL:                       cmd.String("relay-url"),
 		PLCURL:                         cmd.String("plc-url"),
 		OTelServiceName:                cmd.String("otel-service-name"),
 		LogLevel:                       cmd.String("log-level"),
 		LogFormat:                      cmd.String("log-format"),
-		LogOutput:                      os.Stderr,
+		LogOutput:                      cmd.Root().ErrWriter,
 		ShutdownTimeout:                cmd.Duration("shutdown-timeout"),
 		ClientDrainTimeout:             cmd.Duration("client-drain-timeout"),
 		MaxBackfillRepos:               maxBackfillRepos,
@@ -465,12 +709,11 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		SubscribeReadBatch:             cmd.Int("subscribe-read-batch"),
 		SubscribeSlowWindow:            cmd.Duration("subscribe-slow-window"),
 		SubscribeSlowMinRate:           cmd.Float("subscribe-slow-min-rate"),
+		SubscribeColdEventsPerSec:      cmd.Float("subscribe-cold-events-per-sec"),
 		CursorBlockIndexCacheSize:      cmd.Int("cursor-block-index-cache-size"),
 		CompactionInterval:             cmd.Duration("compaction-interval"),
 		CompactionTombstoneCap:         cmd.Int("compaction-tombstone-cap"),
 		CompactionRewriteWorkers:       cmd.Int("compaction-rewrite-workers"),
-		TimestampImportToken:           cmd.String("timestamp-import-token"),
-		TimestampImportDir:             cmd.String("timestamp-import-dir"),
 	}, nil
 }
 
@@ -515,7 +758,7 @@ func runServe(ctx context.Context, cmd *cli.Command) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cmd.Duration("shutdown-timeout"))
 	defer cancel()
 	// Run suppresses caller-driven cancellation to nil, so on a clean signal
-	// shutdown Close's error (e.g. a failed import drain) is the only failure
+	// shutdown Close's error (e.g. a run that did not drain in time) is the only failure
 	// signal left — it must reach the exit status, not be swallowed.
 	closeErr := rt.Close(shutdownCtx)
 	if runErr != nil {

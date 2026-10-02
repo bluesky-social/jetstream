@@ -10,6 +10,8 @@ const (
 	resultNotFound   = "not_found"
 	resultBadRequest = "bad_request"
 	resultError      = "error"
+	// resultUnavailable is a 503: the object store did not answer.
+	resultUnavailable = "unavailable"
 )
 
 // Metrics owns the prometheus state for getBlock. A nil *Metrics is valid:

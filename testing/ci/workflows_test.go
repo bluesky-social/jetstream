@@ -73,6 +73,46 @@ func TestInfrastructureRetryIsNarrowAndOneShot(t *testing.T) {
 	require.NotContains(t, workflow, "pull_request")
 }
 
+// The storage job brings `just up` up, runs `just test-storage` with storage
+// required (a missing backend fails instead of skipping), and always tears
+// the environment down. Plain `just` never needs any of it.
+func TestStorageWorkflowRunsBothObjectStores(t *testing.T) {
+	t.Parallel()
+
+	root := repoRoot(t)
+	workflow := readFile(t, filepath.Join(root, ".github/workflows/ci.yml"))
+	justfile := readFile(t, filepath.Join(root, "justfile"))
+
+	_, job, ok := strings.Cut(workflow, "\n  test-storage:\n")
+	require.True(t, ok, "ci.yml has a test-storage job")
+	if next := regexp.MustCompile(`\n  [a-z-]+:\n`).FindStringIndex(job); next != nil {
+		job = job[:next[0]]
+	}
+	for _, host := range []string{"registry-1.docker.io:443", "auth.docker.io:443", "production.cloudflare.docker.com:443", "production.cloudfront.docker.com:443"} {
+		require.Contains(t, job, host)
+	}
+	up := strings.Index(job, "--command just up")
+	test := strings.Index(job, "--command just test-storage")
+	down := strings.Index(job, "--command just down")
+	require.True(t, up != -1 && test > up && down > test, "just up, just test-storage, then just down")
+	require.Regexp(t, `if: always\(\)\n\s+run: .*--command just down`, job)
+
+	_, recipe, ok := strings.Cut(justfile, "\ntest-storage *ARGS:\n")
+	require.True(t, ok, "justfile has a test-storage recipe")
+	recipe, _, _ = strings.Cut(recipe, "\n\n")
+	for _, want := range []string{
+		"JETSTREAM_TEST_STORAGE_REQUIRED=1",
+		"JETSTREAM_TEST_PG_URL=",
+		"JETSTREAM_TEST_S3_ENDPOINT=http://127.0.0.1:18333",
+		"JETSTREAM_TEST_S3_ENDPOINT=http://127.0.0.1:19000",
+	} {
+		require.Contains(t, recipe, want)
+	}
+	_, defaultTest, _ := strings.Cut(justfile, "\ntest *ARGS=")
+	defaultTest, _, _ = strings.Cut(defaultTest, "\n\n")
+	require.NotContains(t, defaultTest, "JETSTREAM_TEST_", "plain `just test` needs no storage")
+}
+
 func fuzzTargets(t *testing.T, root string) []string {
 	t.Helper()
 	var targets []string

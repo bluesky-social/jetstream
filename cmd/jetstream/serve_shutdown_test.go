@@ -13,7 +13,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
@@ -30,9 +30,9 @@ func TestServe_GracefulShutdownClosesSubscriber(t *testing.T) {
 
 	dataDir := t.TempDir()
 	{
-		s, err := store.Open(dataDir, nil)
+		s, err := pebblestore.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState, time.Now().UTC()))
+		require.NoError(t, lifecycle.WritePhase(t.Context(), s, lifecycle.PhaseSteadyState, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 
@@ -173,19 +173,4 @@ func waitRuntimePublicAddr(t *testing.T, rt *jetstreamd.Runtime, done <-chan err
 	}
 	t.Fatal("serve never bound public listener")
 	return ""
-}
-
-func waitRuntimeSteadyState(t *testing.T, rt *jetstreamd.Runtime, done <-chan error) {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	ready := make(chan error, 1)
-	go func() { ready <- rt.WaitSteadyState(ctx) }()
-	select {
-	case err := <-ready:
-		require.NoError(t, err, "runtime did not publish steady-state writer")
-	case err := <-done:
-		t.Fatalf("serve exited before steady-state writer was published: %v", err)
-	}
 }

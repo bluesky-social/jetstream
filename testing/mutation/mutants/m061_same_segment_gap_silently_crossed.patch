@@ -1,10 +1,10 @@
 mutant: m061_same_segment_gap_silently_crossed
 target: internal/subscribe/replay.go
 failure-mode: |
-  Bounded cold replay silently crosses an unregistered sequence hole when
-  durable blocks on both sides share one segment envelope. Segment-level
-  no-progress checks cannot see this shape, so a missing crash-gap record can
-  become silent client data loss.
+  Bounded cold replay silently crosses an unregistered sequence hole between
+  two durable block refs, whether they share one segment envelope or sit in
+  adjacent segments. A missing crash-gap record or a withheld segment in the
+  middle of the archive can then become silent client data loss.
 expected-detection: |
   The seqlease tier's same-segment unregistered-gap test writes two durable
   blocks with a hole between their preserved block envelopes and requires
@@ -16,6 +16,12 @@ tiers: seqlease
 diff --git a/internal/subscribe/replay.go b/internal/subscribe/replay.go
 --- a/internal/subscribe/replay.go
 +++ b/internal/subscribe/replay.go
-@@ -420 +420 @@ func walkSealedSegment(m *manifest.Manifest, fs vfs.FS, bounds manifest.SegmentBounds, current uint64, stopSeq uint64, cache *blockCache, gaps *seqspace.Gaps, onGapJump func(start, end uint64), emit func(*Entry) error) (uint64, error) {
--				return current, fmt.Errorf("subscribe: unregistered sequence hole [%d,%d) between durable blocks in segment %d", current, block.MinSeq, bounds.Idx)
-+				current = block.MinSeq
+@@ -156,7 +156,7 @@
+ 		}
+ 		if ref.MinSeq > w.current {
+ 			if stopSeq != 0 && w.current < stopSeq {
+-				return fmt.Errorf("subscribe: unregistered sequence hole [%d,%d) before segment %d block %d", w.current, ref.MinSeq, ref.Segment, ref.Block)
++				w.current = ref.MinSeq
+ 			}
+ 			// Unbounded callers retain the historical compaction/replay behavior:
+ 			// emit every extant row without asserting complete coverage to a floor.

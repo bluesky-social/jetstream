@@ -1,5 +1,5 @@
-// Package identity caches atmos identity resolutions in pebble under
-// sync/identity/<did>. Each entry stores an 8-byte big-endian Unix-nanosecond
+// Package identity caches atmos identity resolutions in a best-effort KV under
+// sync/identity/<did>; in local mode that is meta.pebble. Each entry stores an 8-byte big-endian Unix-nanosecond
 // expiry followed by JSON. Expired or undecodable entries are misses and are
 // replaced on resolution.
 //

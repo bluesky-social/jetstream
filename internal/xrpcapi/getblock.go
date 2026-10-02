@@ -3,11 +3,11 @@ package xrpcapi
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
@@ -23,11 +23,12 @@ import (
 // getBlockHandler serves one sealed-segment block as its raw stored zstd frame.
 // Like getSegmentHandler it implements xrpcserver.Handler directly so it can use
 // http.ServeContent for conditional/Range handling. The block bytes, block
-// count, and ETag are all derived from a single freshly-opened fd — never the
+// count, and ETag are all derived from a single SegmentFile — never the
 // manifest — so a concurrent compaction rewrite cannot splice generations.
 type getBlockHandler struct {
-	src                  SegmentSource
+	opener               SegmentOpener
 	logger               *slog.Logger
+	maxDuration          time.Duration
 	compactionCacheGrace time.Duration
 	compactionDeadline   CompactionDeadline
 	metrics              *Metrics
@@ -54,6 +55,15 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 		}
 		return err
 	}
+	// readFailed answers a failed read: 503 when the object store is out,
+	// which is not logged per request, and otherwise a logged 500.
+	readFailed := func(err error, logMsg, clientMsg string, attrs ...any) error {
+		if xerr := storeUnavailable(w, err); xerr != nil {
+			return fail(resultUnavailable, xerr)
+		}
+		h.logger.Error(logMsg, append(attrs, slog.Any("err", err))...)
+		return fail(resultError, xrpcserver.InternalError(clientMsg))
+	}
 
 	name, err := r.Params.String("segment")
 	if err != nil {
@@ -76,42 +86,31 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 			attribute.Int("block.index", blockIdx))
 	}
 
-	ref, ok := h.src.SegmentByIdx(idx)
-	if !ok {
+	ctx, cancel := responseDeadline(ctx, w, h.maxDuration)
+	defer cancel()
+
+	// The block bytes, block count, and ETag MUST all come from this single
+	// SegmentFile. Never take the offset or checksum from the in-memory
+	// manifest: during a compaction rename→refresh window it can be stale, and
+	// mixing manifest metadata with file reads would splice two file
+	// generations together.
+	f, err := h.opener.OpenSegment(ctx, idx)
+	if errors.Is(err, ErrSegmentNotFound) {
 		return fail(resultNotFound, &xrpc.Error{
 			StatusCode: http.StatusNotFound, Name: jetstream.ErrJetstreamGetBlock_SegmentNotFound, Message: "segment not found",
 		})
 	}
-
-	// The block bytes, block count, and ETag MUST all come from this single
-	// freshly-opened fd. Never take the offset or checksum from the in-memory
-	// manifest: during a compaction rename→refresh window it can be stale, and
-	// mixing manifest metadata with on-disk reads would splice two file
-	// generations together.
-	f, err := os.Open(ref.Path)
 	if err != nil {
-		h.logger.Error("getBlock: open sealed file failed",
-			slog.String("name", name), slog.String("path", ref.Path), slog.Any("err", err))
-		return fail(resultError, xrpcserver.InternalError("failed to open segment"))
+		return readFailed(err, "getBlock: open sealed file failed", "failed to open segment",
+			slog.String("name", name))
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		h.logger.Error("getBlock: stat sealed file failed",
-			slog.String("name", name), slog.String("path", ref.Path), slog.Any("err", err))
-		return fail(resultError, xrpcserver.InternalError("failed to stat segment"))
-	}
 
-	hdr, err := segment.ReadSealedHeader(f)
-	if err != nil {
-		h.logger.Error("getBlock: read sealed header failed",
-			slog.String("name", name), slog.String("path", ref.Path), slog.Any("err", err))
-		return fail(resultError, xrpcserver.InternalError("failed to read segment header"))
-	}
-	if hdr.FooterOffset > uint64(info.Size()) {
+	hdr := f.Header()
+	if hdr.FooterOffset > uint64(f.Size()) {
 		h.logger.Error("getBlock: sealed header extends past file",
-			slog.String("name", name), slog.String("path", ref.Path),
-			slog.Uint64("footer_offset", hdr.FooterOffset), slog.Int64("file_size", info.Size()))
+			slog.String("name", name),
+			slog.Uint64("footer_offset", hdr.FooterOffset), slog.Int64("file_size", f.Size()))
 		return fail(resultError, xrpcserver.InternalError("failed to read segment footer"))
 	}
 	if blockIdx >= int(hdr.BlockCount) {
@@ -122,23 +121,35 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 
 	var content io.ReadSeeker
 	var contentSize int64
-	if isHeadRequest(r.HTTPReq) {
+	if bf, ok := f.(blockFramer); ok {
+		// Each block is its own object: HEAD reads nothing, and GET reads
+		// the whole verified object rather than a footer entry and a range.
+		if isHeadRequest(r.HTTPReq) {
+			section := bf.BlockFrameSection(blockIdx)
+			content, contentSize = section, section.Size()
+		} else {
+			frame, err := bf.BlockFrame(blockIdx)
+			if err != nil {
+				return readFailed(err, "getBlock: read block object failed", "failed to read block",
+					slog.String("name", name), slog.Int("block", blockIdx))
+			}
+			content, contentSize = bytes.NewReader(frame), int64(len(frame))
+		}
+	} else if isHeadRequest(r.HTTPReq) {
 		// HEAD needs only the validated footer entry and virtual frame range;
 		// do not allocate a buffer proportional to the compressed frame.
 		section, err := segment.BlockFrameSection(f, hdr, blockIdx)
 		if err != nil {
-			h.logger.Error("getBlock: validate block frame failed",
-				slog.String("name", name), slog.Int("block", blockIdx), slog.Any("err", err))
-			return fail(resultError, xrpcserver.InternalError("failed to read block"))
+			return readFailed(err, "getBlock: validate block frame failed", "failed to read block",
+				slog.String("name", name), slog.Int("block", blockIdx))
 		}
 		content = section
 		contentSize = section.Size()
 	} else {
 		frame, err := segment.ReadBlockFrame(f, hdr, blockIdx)
 		if err != nil {
-			h.logger.Error("getBlock: read block frame failed",
-				slog.String("name", name), slog.Int("block", blockIdx), slog.Any("err", err))
-			return fail(resultError, xrpcserver.InternalError("failed to read block"))
+			return readFailed(err, "getBlock: read block frame failed", "failed to read block",
+				slog.String("name", name), slog.Int("block", blockIdx))
 		}
 		content = bytes.NewReader(frame)
 		contentSize = int64(len(frame))
@@ -158,7 +169,7 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 	// this point the response may be partially written, so per the Handler
 	// contract we return nil.
 	rec := &blockResponseRecorder{ResponseWriter: w}
-	http.ServeContent(rec, contentRequest(r.HTTPReq), name, info.ModTime(), content)
+	http.ServeContent(rec, contentRequest(r.HTTPReq), name, f.ModTime(), content)
 	result = resultOK
 	if rec.status >= http.StatusBadRequest {
 		result = resultError

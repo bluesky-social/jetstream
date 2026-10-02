@@ -13,7 +13,7 @@ import (
 // TestStateStore_Swarm pins observational equivalence to an in-memory
 // reference implementation across a randomized op stream. The reference
 // is sync.MemStateStore — the in-memory map atmos itself uses for tests.
-// If our pebble shape diverges (e.g. drops a Save under load, or fails
+// If our storage shape diverges (e.g. drops a Save under load, or fails
 // to round-trip a particular field combination), the test will catch it.
 func TestStateStore_Swarm(t *testing.T) {
 	t.Parallel()

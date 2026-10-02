@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
@@ -86,7 +86,7 @@ func (r *durableOrderRecorder) observeFSLog(format string, args ...any) {
 	}
 }
 
-func (r *durableOrderRecorder) BeforeWrite(op store.WriteOp, keys [][]byte) error {
+func (r *durableOrderRecorder) BeforeWrite(op metastore.WriteOp, keys [][]byte) error {
 	var keyStrings []string
 	for _, key := range keys {
 		keyStrings = append(keyStrings, string(key))

@@ -1,13 +1,18 @@
 package orchestrator
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
+	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
@@ -19,7 +24,7 @@ import (
 func validBaseConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -64,3 +69,55 @@ func TestConfig_Validate_MissingFields(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.Contains(t, err.Error(), "Store")
 }
+
+func TestConfig_Validate_Disaggregated(t *testing.T) {
+	t.Parallel()
+	valid := func() Config {
+		cfg := validBaseConfig(t)
+		cfg.DataDir = ""
+		cfg.Disaggregated = &Disaggregated{
+			Session: &catalog.Session{},
+			Direct: func(context.Context, catalog.Namespace) (*ingest.DirectConfig, error) {
+				return nil, nil
+			},
+			Hot:     func(context.Context) (*ingest.HotConfig, error) { return nil, nil },
+			Objects: nopObjects{},
+		}
+		return cfg
+	}
+	cfg := valid()
+	require.NoError(t, cfg.validate())
+	compacting := func(c *Config) {
+		c.CompactionInterval = time.Minute
+		c.Disaggregated.Catalog = nopCompactionCatalog{}
+		c.Disaggregated.Uploader = nopUploader{}
+	}
+	cfg = valid()
+	compacting(&cfg)
+	require.NoError(t, cfg.validate())
+
+	for name, mutate := range map[string]func(*Config){
+		"no session":             func(c *Config) { c.Disaggregated.Session = nil },
+		"no direct":              func(c *Config) { c.Disaggregated.Direct = nil },
+		"no hot":                 func(c *Config) { c.Disaggregated.Hot = nil },
+		"no objects":             func(c *Config) { c.Disaggregated.Objects = nil },
+		"compaction no catalog":  func(c *Config) { compacting(c); c.Disaggregated.Catalog = nil },
+		"compaction no uploader": func(c *Config) { compacting(c); c.Disaggregated.Uploader = nil },
+		"negative memory":        func(c *Config) { c.Disaggregated.CompactionMemoryBytes = -1 },
+		"async flush":            func(c *Config) { c.BackfillAsyncFlushWorkers = 2 },
+		"local segment catalog":  func(c *Config) { c.Catalog = &localcatalog.Catalog{} },
+	} {
+		cfg := valid()
+		mutate(&cfg)
+		require.ErrorIs(t, cfg.validate(), ErrInvalidConfig, name)
+	}
+}
+
+// nopCompactionCatalog and nopUploader are for config validation only.
+type (
+	nopCompactionCatalog struct{ CompactionCatalog }
+	nopUploader          struct{ ingest.ObjectUploader }
+)
+
+// nopObjects is an objstore.Store for config validation only.
+type nopObjects struct{ objstore.Store }

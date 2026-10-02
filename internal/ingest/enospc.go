@@ -10,7 +10,7 @@ import (
 // WrapDiskFull converts an ENOSPC-rooted persistence error into the fatal
 // disk-full operator message; every other error (including nil) passes
 // through unchanged. All segment persistence paths — the active writer, the
-// pebble durable-batch commit, compaction rewrite, and import patch — must
+// pebble durable-batch commit, and compaction rewrite — must
 // route disk-full errors through this one wrapper so operators see a single,
 // actionable message regardless of which path hit the full disk.
 func WrapDiskFull(dataDir, op string, err error) error {

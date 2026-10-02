@@ -12,8 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/bluesky-social/jetstream/internal/timestamp"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -49,7 +48,7 @@ type Config struct {
 	FS vfs.FS
 
 	// Store is the shared metadata pebble db. Required.
-	Store *store.Store
+	Store metastore.Store
 
 	// RelayURL is the upstream relay base URL (https or wss).
 	RelayURL string
@@ -69,7 +68,7 @@ type Config struct {
 	// SyncStateStore is the verifier state store when it supports staged
 	// durability. It is forwarded to live consumers so verifier state commits
 	// atomically with the relay cursor after block fsync.
-	SyncStateStore *syncstate.PebbleStateStore
+	SyncStateStore *syncstate.StateStore
 
 	// Tombstones is the steady-state live tombstone set. Bootstrap leaves
 	// live.Config.Tombstones nil because live_segments are re-sequenced at
@@ -162,6 +161,12 @@ type Config struct {
 	BootstrapLiveMaxSegmentBytes   int64
 	BootstrapLiveMaxEventsPerBlock int
 
+	// SteadyMaxEventsPerBlock forwards to the steady-state writer. Zero
+	// leaves the ingest default. Production leaves it unset; oracle tests
+	// use a tiny limit to make the steady writer fsync without thousands of
+	// events.
+	SteadyMaxEventsPerBlock int
+
 	// BackfillRepos, when non-empty, replaces bootstrap listRepos
 	// discovery with this explicit DID list. Debug-only knob for
 	// targeted production smoke tests; leave empty in production.
@@ -203,10 +208,18 @@ type Config struct {
 	// nil; deterministic harnesses feed the firehose in-memory.
 	LiveDial streaming.DialFunc
 
-	// IngestOnAfterSeal is forwarded to every writer that appends to
-	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
-	// OnSegmentSealed callback. Optional.
-	IngestOnAfterSeal func(idx uint64, path string) error
+	// Catalog holds the archive: every ingest writer publishes to it, each
+	// with its namespace (catalog.Main for <DataDir>/segments and
+	// catalog.BootstrapLive for <DataDir>/backfill/live_segments), and merge
+	// and compaction read and rewrite segments through it. It must describe
+	// DataDir. cmd/jetstream wires the local catalog, which feeds the
+	// manifest. Nil uses a private local catalog over DataDir.
+	Catalog SegmentCatalog
+
+	// Disaggregated, when set, runs the lifecycle on the shared catalog
+	// (design §10.10), and DataDir, FS, and Catalog are unused. Store must
+	// be the leader session's fenced metadata store.
+	Disaggregated *Disaggregated
 
 	// OnSegmentCompacted refreshes serving metadata after a sealed segment is
 	// rewritten by compaction. cmd/jetstream wires this to the manifest refresh
@@ -220,24 +233,6 @@ type Config struct {
 	// OnSegmentCompacted only on mismatch, keeping no-op passes cheap.
 	// Optional; nil makes reconcile refresh every sealed segment.
 	SegmentManifestChecksums func() map[uint64]uint64
-
-	// ImportSelector resolves a DID to the sealed segments that may contain it,
-	// from the manifest's resident blooms (no disk I/O). Wired by cmd/jetstream
-	// to the manifest; required only to run a timestamp-import job (M5+). nil
-	// disables import (RunImport returns ErrImportUnavailable).
-	ImportSelector timestamp.Selector
-
-	// ImportMetrics observes timestamp-import job progress and outcomes
-	// (design §6 J). Optional; nil means no import counters increment.
-	ImportMetrics *ImportMetrics
-
-	// ImportRules is the durable imported indexed_at rule store. Required for
-	// timestamp import under #269; nil leaves import unavailable.
-	ImportRules *timestamp.RuleStore
-
-	// TimestampStamper applies durable imported indexed_at rules at append
-	// time. Optional; nil means no imported rules are active.
-	TimestampStamper ingest.TimestampStamper
 
 	// CompactionBloomNarrowMaxDIDs bounds the candidate-DID set handed to the
 	// segment-level bloom prefilter; larger tombstone sets skip narrowing
@@ -319,13 +314,24 @@ type Config struct {
 	// SegmentIOFaultInjector is a test-only deterministic segment-file I/O
 	// fault seam, forwarded to every segment writer the orchestrator opens
 	// (backfill, bootstrap-live, merge, steady-state) and to the
-	// compaction-rewrite and import-patch call sites. Production leaves it
-	// nil, mirroring CrashInjector.
+	// compaction-rewrite call sites. Production leaves it nil, mirroring
+	// CrashInjector.
 	SegmentIOFaultInjector segment.IOFaultInjector
 }
 
 func (c *Config) validate() error {
-	if c.DataDir == "" {
+	if d := c.Disaggregated; d != nil {
+		switch {
+		case d.Session == nil || d.Direct == nil || d.Hot == nil || d.Objects == nil:
+			return fmt.Errorf("%w: Disaggregated needs Session, Direct, Hot, and Objects", ErrInvalidConfig)
+		case c.CompactionInterval != 0 && (d.Catalog == nil || d.Uploader == nil):
+			return fmt.Errorf("%w: Disaggregated compaction needs Catalog and Uploader", ErrInvalidConfig)
+		case d.CompactionMemoryBytes < 0:
+			return fmt.Errorf("%w: Disaggregated CompactionMemoryBytes must not be negative", ErrInvalidConfig)
+		case c.Catalog != nil || c.BackfillAsyncFlushWorkers != 0:
+			return fmt.Errorf("%w: Disaggregated takes neither Catalog nor BackfillAsyncFlushWorkers", ErrInvalidConfig)
+		}
+	} else if c.DataDir == "" {
 		return fmt.Errorf("%w: DataDir is required", ErrInvalidConfig)
 	}
 	if c.Store == nil {
@@ -350,6 +356,9 @@ func (c *Config) validate() error {
 	}
 	if c.BootstrapLiveMaxEventsPerBlock < 0 {
 		return fmt.Errorf("%w: BootstrapLiveMaxEventsPerBlock must be >= 0", ErrInvalidConfig)
+	}
+	if c.SteadyMaxEventsPerBlock < 0 {
+		return fmt.Errorf("%w: SteadyMaxEventsPerBlock must be >= 0", ErrInvalidConfig)
 	}
 	if c.FailedRepoRetryInterval < 0 {
 		return fmt.Errorf("%w: FailedRepoRetryInterval must be >= 0", ErrInvalidConfig)

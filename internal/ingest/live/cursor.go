@@ -1,21 +1,22 @@
 // package live: cursor.go persists the upstream relay firehose
-// cursor in pebble so a process restart resumes from the last
+// cursor in the metadata store so a process restart resumes from the last
 // durably-flushed block. docs/README.md §3.1.1: persisted cursor must be
 // less than or equal to the latest durable event in the segment file.
 //
 // The on-disk encoding is [1B version][8B LE uint64], delegated to
-// the store package's GetVersionedUint64LE / SetVersionedUint64LE
-// helpers so every cursor-shaped key in pebble shares one layout.
+// metastore's GetVersionedUint64LE / SetVersionedUint64LE helpers so
+// every cursor-shaped key in the metadata store shares one layout.
 // atmos exposes the cursor as int64; we cast at the boundary and
 // document the implicit non-negativity constraint (atmos relays
 // only emit positive seq values).
 package live
 
 import (
+	"context"
 	"fmt"
 	"math"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 )
 
 const (
@@ -37,8 +38,8 @@ const (
 // silent re-tail of the firehose that drops every historical event
 // between the corrupt seq and now (AGENTS.md: crashing > silent
 // data loss).
-func LoadUpstreamCursor(s *store.Store, key string) (int64, error) {
-	v, ok, err := s.GetVersionedUint64LE(key, cursorV1)
+func LoadUpstreamCursor(s metastore.Store, key string) (int64, error) {
+	v, ok, err := metastore.GetVersionedUint64LE(context.Background(), s, key, cursorV1)
 	if err != nil {
 		return 0, fmt.Errorf("livestream: %s: %w", key, err)
 	}
@@ -51,20 +52,19 @@ func LoadUpstreamCursor(s *store.Store, key string) (int64, error) {
 	return int64(v), nil
 }
 
-// SaveUpstreamCursor durably persists v under key with pebble.Sync.
-// This is a test-only seed helper used to write a cursor into pebble
-// directly; production persists the cursor via the Consumer's writer durable
+// SaveUpstreamCursor durably persists v under key. This is a test-only
+// seed helper used to write a cursor into the metadata store directly; production persists the cursor via the Consumer's writer durable
 // batch hook, which batches the cursor with sync state under a single Commit.
 //
 // Rejects negative values so the on-disk invariant "stored cursor >= 0"
 // holds by construction at every write site, and LoadUpstreamCursor
 // can surface storage corruption (rather than caller bugs) as the
 // only path to a negative read.
-func SaveUpstreamCursor(s *store.Store, key string, v int64) error {
+func SaveUpstreamCursor(s metastore.Store, key string, v int64) error {
 	if v < 0 {
 		return fmt.Errorf("livestream: refuse to save negative cursor %d to %s", v, key)
 	}
-	if err := s.SetVersionedUint64LE(key, cursorV1, uint64(v)); err != nil {
+	if err := metastore.SetVersionedUint64LE(context.Background(), s, key, cursorV1, uint64(v)); err != nil {
 		return fmt.Errorf("livestream: save %s: %w", key, err)
 	}
 	return nil

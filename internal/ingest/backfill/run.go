@@ -15,8 +15,8 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	atmosidentity "github.com/jcalabro/atmos/identity"
@@ -34,7 +34,7 @@ const (
 )
 
 type Config struct {
-	Store       *store.Store
+	Store       metastore.Store
 	Writer      *ingest.Writer
 	HTTPClient  *http.Client
 	RelayURL    string
@@ -109,6 +109,9 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		st := NewStore(cfg.Store, cfg.Metrics)
+		if err := st.SeedCounts(ctx); err != nil {
+			return err
+		}
 		st.afterComplete = cfg.AfterRepoComplete
 		st.afterCompleteError = recordFatal
 		st.crashInjector = cfg.CrashInjector

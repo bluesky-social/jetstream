@@ -1,10 +1,11 @@
 package backfill
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 )
 
 // These keys belong to the retired relay-global enumeration scheme. They are
@@ -19,17 +20,16 @@ const (
 // resumed under the per-PDS cursor scheme. There is no safe translation for
 // opaque relay cursors; operators must finish with the old binary or start a
 // fresh bootstrap data directory.
-func RejectRetiredCursors(db *store.Store) error {
+func RejectRetiredCursors(db metastore.Store) error {
 	for _, key := range []string{listReposCursorKey, bootstrapLastListReposCursorKey} {
-		val, closer, err := db.Get([]byte(key))
-		if errors.Is(err, store.ErrNotFound) {
+		val, err := db.Get(context.Background(), []byte(key))
+		if errors.Is(err, metastore.ErrNotFound) {
 			continue
 		}
 		if err != nil {
 			return fmt.Errorf("backfill: check retired cursor %s: %w", key, err)
 		}
 		nonEmpty := len(val) > 0
-		_ = closer.Close()
 		if nonEmpty {
 			return fmt.Errorf("backfill: old-scheme bootstrap in progress (%s is non-empty); finish on the old binary or restart bootstrap from a fresh data dir", key)
 		}

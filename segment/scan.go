@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -192,4 +193,46 @@ func WalkActiveRangeFS(fs vfs.FS, path string, startOffset, endOffset uint64, fn
 		return fmt.Errorf("%w: active range ended at %d, want %d", ErrCorruptSegment, off, end)
 	}
 	return nil
+}
+
+// ActiveBlocksFS returns the block index of the active segment at path,
+// rebuilt from its frames the way New rebuilds it, without opening the file
+// for writing. A torn tail (a frame whose prefix points past EOF, which only
+// a crash mid-flush leaves) ends the index: the blocks before it are the
+// durable ones New would keep. A sealed file returns ErrSegmentSealed. Nil
+// fs uses the host OS filesystem.
+func ActiveBlocksFS(fs vfs.FS, path string) ([]BlockInfo, error) {
+	f, err := openSegmentReadOnly(fs, path)
+	if err != nil {
+		return nil, err // pass through os.PathError; caller may errors.Is
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("segment: stat %s: %w", path, err)
+	}
+	size := info.Size()
+	if size < ReservedHeaderBytes {
+		return nil, fmt.Errorf("%w: %s is %d bytes", ErrCorruptSegment, path, size)
+	}
+	var head [12]byte
+	if _, err := f.ReadAt(head[:], 0); err != nil {
+		return nil, fmt.Errorf("segment: read header %s: %w", path, err)
+	}
+	if !bytes.Equal(head[:len(segmentMagic)], segmentMagic) {
+		return nil, fmt.Errorf("%w: %s: bad magic %q", ErrCorruptSegment, path, head[:len(segmentMagic)])
+	}
+	if binary.LittleEndian.Uint64(head[4:12]) != 0 {
+		return nil, fmt.Errorf("%w: %s", ErrSegmentSealed, path)
+	}
+	end, err := lastGoodOffset(f, size)
+	if err != nil {
+		return nil, err
+	}
+	walk, err := walkActiveFrames(f, end)
+	if err != nil {
+		return nil, fmt.Errorf("segment: walk active frames %s: %w", path, err)
+	}
+	return walk.infos, nil
 }

@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
@@ -169,9 +170,9 @@ func TestArchiveHead_SegmentValidationAndUnavailableCases(t *testing.T) {
 func TestArchiveHead_ReadinessAndCorruption(t *testing.T) {
 	t.Parallel()
 	s, dir := newTestServer(t, 1)
-	readyErr := New(Config{Src: s.src, Logger: s.logger, Ready: func(_ context.Context) error {
+	readyErr := New(Config{Src: s.src, Logger: s.logger, Ready: lifecycle.ReadinessFunc(func(_ context.Context) error {
 		return fmt.Errorf("bootstrap in progress")
-	}})
+	})})
 	readyTS := httptest.NewServer(archiveMux(readyErr))
 	t.Cleanup(readyTS.Close)
 	resp := doHead(t, getSegURL(readyTS.URL, ingest.SegmentFilename(0)))
@@ -262,9 +263,9 @@ func TestArchiveHead_BlockCorruptionReadinessAndObservability(t *testing.T) {
 	require.Equal(t, codes.Error, spans[1].Status().Code)
 	require.Positive(t, spanAttr(t, spans[0], "block.compressed_size").AsInt64())
 
-	ready := New(Config{Src: m, Logger: slog.Default(), Ready: func(_ context.Context) error {
+	ready := New(Config{Src: m, Logger: slog.Default(), Ready: lifecycle.ReadinessFunc(func(_ context.Context) error {
 		return fmt.Errorf("manifest warming")
-	}})
+	})})
 	readyTS := httptest.NewServer(archiveMux(ready))
 	t.Cleanup(readyTS.Close)
 	resp = doHead(t, blockURL(readyTS.URL, ingest.SegmentFilename(0), 0))

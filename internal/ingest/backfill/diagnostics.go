@@ -11,8 +11,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/xrpc"
 )
@@ -64,52 +63,46 @@ func normalizeHostStatusKey(host string) (string, []byte, error) {
 	return normalized, []byte(hostKeyPrefix + normalized), nil
 }
 
-func stageHandleIndexSet(batch *pebble.Batch, handle string, did atmos.DID) error {
+func stageHandleIndexSet(batch metastore.Batch, handle string, did atmos.DID) error {
 	key, ok := normalizeHandleIndexKey(handle)
 	if !ok {
 		return nil
 	}
-	if err := batch.Set(key, []byte(did), nil); err != nil {
-		return fmt.Errorf("backfill: stage handle index %q: %w", handle, err)
-	}
+	batch.Set(key, []byte(did))
 	return nil
 }
 
-func stageHandleIndexDeleteIfMatches(db *store.Store, batch *pebble.Batch, handle string, did atmos.DID) error {
+func stageHandleIndexDeleteIfMatches(db metastore.Store, batch metastore.Batch, handle string, did atmos.DID) error {
 	key, ok := normalizeHandleIndexKey(handle)
 	if !ok {
 		return nil
 	}
-	val, closer, err := db.Get(key)
-	if errors.Is(err, store.ErrNotFound) {
+	val, err := db.Get(context.Background(), key)
+	if errors.Is(err, metastore.ErrNotFound) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("backfill: read handle index %q before delete: %w", handle, err)
 	}
-	defer func() { _ = closer.Close() }()
 	if string(val) != string(did) {
 		return nil
 	}
-	if err := batch.Delete(key, nil); err != nil {
-		return fmt.Errorf("backfill: stage delete handle index %q: %w", handle, err)
-	}
+	batch.Delete(key)
 	return nil
 }
 
-func lookupDIDByHandle(db *store.Store, handle string) (atmos.DID, bool, error) {
+func lookupDIDByHandle(db metastore.Store, handle string) (atmos.DID, bool, error) {
 	key, ok := normalizeHandleIndexKey(handle)
 	if !ok {
 		return "", false, nil
 	}
-	val, closer, err := db.Get(key)
-	if errors.Is(err, store.ErrNotFound) {
+	val, err := db.Get(context.Background(), key)
+	if errors.Is(err, metastore.ErrNotFound) {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("backfill: lookup handle index %q: %w", handle, err)
 	}
-	defer func() { _ = closer.Close() }()
 	did, err := atmos.ParseDID(string(val))
 	if err != nil {
 		return "", false, fmt.Errorf("backfill: lookup handle index %q: invalid DID: %w", handle, err)
@@ -119,20 +112,19 @@ func lookupDIDByHandle(db *store.Store, handle string) (atmos.DID, bool, error) 
 
 // LookupDIDByHandle reads the local declared-handle index. The index is
 // an operator convenience only; it is not bidirectionally verified.
-func LookupDIDByHandle(db *store.Store, handle string) (atmos.DID, bool, error) {
+func LookupDIDByHandle(db metastore.Store, handle string) (atmos.DID, bool, error) {
 	return lookupDIDByHandle(db, handle)
 }
 
 // LoadRepoStatus reads one repo/<did> row.
-func LoadRepoStatus(db *store.Store, did atmos.DID) (*RepoStatus, bool, error) {
-	val, closer, err := db.Get(repoKey(did))
-	if errors.Is(err, store.ErrNotFound) {
+func LoadRepoStatus(db metastore.Store, did atmos.DID) (*RepoStatus, bool, error) {
+	val, err := db.Get(context.Background(), repoKey(did))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("backfill: load repo status %s: %w", did, err)
 	}
-	defer func() { _ = closer.Close() }()
 	rs, err := decodeRepoStatus(val)
 	if err != nil {
 		return nil, false, fmt.Errorf("backfill: load repo status %s: %w", did, err)
@@ -141,29 +133,23 @@ func LoadRepoStatus(db *store.Store, did atmos.DID) (*RepoStatus, bool, error) {
 }
 
 // LoadHostStatus reads one host/<bucket> row.
-func LoadHostStatus(db *store.Store, host string) (*HostStatus, bool, error) {
+func LoadHostStatus(db metastore.Store, host string) (*HostStatus, bool, error) {
 	return loadHostStatus(db, host)
 }
 
 // ListHostStatuses scans the maintained host aggregate keyspace. This is
 // bounded by the number of PDS host buckets, not the number of accounts.
-func ListHostStatuses(db *store.Store) ([]HostStatus, error) {
+func ListHostStatuses(db metastore.Store) ([]HostStatus, error) {
 	prefix := []byte(hostKeyPrefix)
-	it, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: store.PrefixUpperBound(prefix),
-	})
+	it, err := db.NewIter(context.Background(), prefix, metastore.PrefixUpperBound(prefix))
 	if err != nil {
 		return nil, fmt.Errorf("backfill: open host status iter: %w", err)
 	}
 	defer func() { _ = it.Close() }()
 
 	var out []HostStatus
-	for it.First(); it.Valid(); it.Next() {
-		val, err := it.ValueAndErr()
-		if err != nil {
-			return nil, fmt.Errorf("backfill: read host status: %w", err)
-		}
+	for it.Next() {
+		val := it.Value()
 		hs, err := decodeHostStatus(val)
 		if err != nil {
 			return nil, err
@@ -172,7 +158,7 @@ func ListHostStatuses(db *store.Store) ([]HostStatus, error) {
 		hs.Host = strings.TrimPrefix(key, hostKeyPrefix)
 		out = append(out, *hs)
 	}
-	if err := it.Error(); err != nil {
+	if err := it.Err(); err != nil {
 		return nil, fmt.Errorf("backfill: iterate host statuses: %w", err)
 	}
 	return out, nil
@@ -398,19 +384,18 @@ func EncodeHostStatus(s *HostStatus) ([]byte, error) {
 	return encodeHostStatus(s)
 }
 
-func loadHostStatus(db *store.Store, host string) (*HostStatus, bool, error) {
+func loadHostStatus(db metastore.Store, host string) (*HostStatus, bool, error) {
 	normalized, key, err := normalizeHostStatusKey(host)
 	if err != nil {
 		return nil, false, err
 	}
-	val, closer, err := db.Get(key)
-	if errors.Is(err, store.ErrNotFound) {
+	val, err := db.Get(context.Background(), key)
+	if errors.Is(err, metastore.ErrNotFound) {
 		return newHostStatus(normalized), false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("backfill: load host status %q: %w", host, err)
 	}
-	defer func() { _ = closer.Close() }()
 
 	s, err := decodeHostStatus(val)
 	if err != nil {
@@ -420,7 +405,7 @@ func loadHostStatus(db *store.Store, host string) (*HostStatus, bool, error) {
 	return s, true, nil
 }
 
-func stageHostStatus(batch *pebble.Batch, s *HostStatus) error {
+func stageHostStatus(batch metastore.Batch, s *HostStatus) error {
 	if s == nil {
 		return fmt.Errorf("backfill: stage host status: nil status")
 	}
@@ -437,8 +422,6 @@ func stageHostStatus(batch *pebble.Batch, s *HostStatus) error {
 	if err != nil {
 		return err
 	}
-	if err := batch.Set(key, enc, nil); err != nil {
-		return fmt.Errorf("backfill: stage host status %q: %w", s.Host, err)
-	}
+	batch.Set(key, enc)
 	return nil
 }

@@ -15,10 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
@@ -55,7 +57,7 @@ type pagedCutoverServer struct {
 	dataDir  string
 	segDir   string
 	manifest *manifest.Manifest
-	store    *store.Store
+	store    *pebblestore.Store
 	writer   *ingest.Writer
 	tail     *subscribe.Tail
 
@@ -129,9 +131,18 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 	require.NoError(t, m.Wait(context.Background()))
 	s.manifest = m
 
-	st, err := store.Open(dataDir, store.NewMetrics(prometheus.NewRegistry()))
+	// Wired like the runtime: the catalog hears every seal first and feeds
+	// main-namespace seals to the manifest.
+	cat, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
 	require.NoError(t, err)
-	require.NoError(t, st.Set([]byte("seq/next"), encodeUint64LEOracle(nextSeq), store.SyncWrites))
+	require.NoError(t, cat.Refresh(context.Background()))
+	cat.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error {
+		return manifest.ApplySegmentFile(m, nil, v.Index, path)
+	})
+
+	st, err := pebblestore.Open(dataDir, pebblestore.NewMetrics(prometheus.NewRegistry()))
+	require.NoError(t, err)
+	require.NoError(t, st.Set(context.Background(), []byte("seq/next"), encodeUint64LEOracle(nextSeq)))
 	s.store = st
 
 	w, err := ingest.Open(ingest.Config{
@@ -139,17 +150,18 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		Store:       st,
 		Logger:      logger,
 		Metrics:     ingest.NewMetrics(prometheus.NewRegistry()),
-		OnAfterSeal: m.OnSegmentSealed,
+		Catalog:     cat,
 	})
 	require.NoError(t, err)
 	s.writer = w
 
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        m,
+		Catalog:         cat,
+		Fetcher:         cat.Fetcher(),
 		WriterRef:       &writerPtr,
 		BlockCacheBytes: 1 << 20,
 	})
@@ -195,6 +207,8 @@ func newPagedCutoverServer(t *testing.T, cfg pagedCutoverConfig) *pagedCutoverSe
 		Tail:     tail,
 		Store:    st,
 		Manifest: m,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 		Writer:   w,
 		Logger:   logger,
 		Metrics:  subscribe.NewMetrics(prometheus.NewRegistry()),

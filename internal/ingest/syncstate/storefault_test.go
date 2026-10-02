@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
 )
@@ -17,30 +17,29 @@ import (
 // letting the verifier run ahead of the durable archive.
 //
 // The fault targets the sync/ prefix batch commit; the assertion is that
-// Flush propagates the injected error AND, because the commit failed, the
-// promoted entry is NOT durable on a fresh reader (no silent advance).
+// the commit propagates the injected error AND, because it failed, the
+// promoted entry is NOT durable on a fresh reader (no silent advance) but is
+// still promoted in memory, so the next batch persists it.
 func TestStateStore_FlushFailsLoudOnStoreFault(t *testing.T) {
 	t.Parallel()
 
 	injected := errors.New("injected: syncstate flush commit failed")
-	fault := &store.KeyPrefixFault{
+	fault := &metastore.KeyPrefixFault{
 		Prefix:  []byte("sync/"),
-		Op:      store.WriteOpBatchCommit,
+		Op:      metastore.WriteOpBatchCommit,
 		Ordinal: 1,
 		Err:     injected,
 	}
-	raw, err := store.Open(t.TempDir(), nil, store.WithFaultInjector(fault))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = raw.Close() })
+	raw := newTestStore(t)
 
-	s := New(raw)
+	s := New(metastore.WithFaults(raw, fault))
 	did := parseDID(t, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
 	want := atmossync.ChainState{Rev: "3l3qo2vutsw2b", Data: fixedCID(t)}
 	require.NoError(t, s.SaveChain(t.Context(), did, want))
 	s.PromoteChain(did, want.Rev)
 
-	// The flush commit fails: Flush must surface it loud.
-	require.ErrorIs(t, s.Flush(), injected)
+	// The flush commit fails and must surface loud.
+	require.ErrorIs(t, flush(t, s), injected)
 
 	// No silent advance: a fresh reader sees nothing durable, because the
 	// failed commit applied nothing.
@@ -48,4 +47,10 @@ func TestStateStore_FlushFailsLoudOnStoreFault(t *testing.T) {
 	durable, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.Nil(t, durable, "syncstate must not be durable when its commit failed")
+
+	require.NoError(t, flush(t, s))
+	durable, err = New(raw).LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, durable, "a failed commit must leave the promoted entry for the next batch")
+	require.Equal(t, want, *durable)
 }

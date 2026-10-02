@@ -1,0 +1,26 @@
+mutant: m062_stale_leader_fence_ignored
+target: internal/catalog/scripts.go
+failure-mode: |
+  A catalog transaction whose fence bump loses to a newer epoch counts the
+  failure but runs its body anyway (design D1). A deposed leader that is
+  still running keeps writing hot batches, folds, and metadata next to its
+  successor, so two writers interleave in the durable archive.
+expected-detection: |
+  The layer 3 oracle's stale_leader fault opens a session at the old epoch
+  after a lease change and requires CommitMeta and CommitHotBatch to fail
+  with ErrFenced and leave no key behind; every full seed fires it.
+  TestScripts_FenceLost pins the same contract at the script layer.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -150,7 +150,6 @@ func (s *Session) runBody(ctx context.Context, kind TxKind, tx Tx, body func(tx
+ 	}
+ 	if !ok {
+ 		s.lm.FenceFailure()
+-		return 0, fmt.Errorf("%s: epoch %d: %w", kind, s.epoch, ErrFenced)
+ 	}
+ 	if err := body(tx, rev); err != nil {
+ 		return 0, sessionEnded(string(kind), err)

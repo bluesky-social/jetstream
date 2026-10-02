@@ -1,10 +1,11 @@
 package orchestrator
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -126,7 +127,7 @@ func TestShouldKeep(t *testing.T) {
 
 func TestRepoStatusLookup_CachesAndCountsFirstReads(t *testing.T) {
 	t.Parallel()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -137,7 +138,7 @@ func TestRepoStatusLookup_CachesAndCountsFirstReads(t *testing.T) {
 	}
 	enc, err := backfill.EncodeRepoStatus(rs)
 	require.NoError(t, err)
-	require.NoError(t, st.Set(backfill.RepoKey("did:plc:a"), enc, store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), backfill.RepoKey("did:plc:a"), enc))
 
 	var lookups int
 	cache := newRepoStatusLookup(st, func() { lookups++ })

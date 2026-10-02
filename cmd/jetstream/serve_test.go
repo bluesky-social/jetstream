@@ -18,7 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos"
@@ -61,6 +61,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, ":8080", opts.PublicAddr)
 	require.Equal(t, "", opts.DebugAddr)
 	require.Equal(t, "./data", opts.DataDir)
+	require.Equal(t, jetstreamd.DefaultStorageConfig(), opts.Storage)
 	require.Equal(t, "https://bsky.network", opts.RelayURL)
 	require.Equal(t, "", opts.PLCURL)
 	require.Equal(t, "jetstream", opts.OTelServiceName)
@@ -99,8 +100,6 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, 4*time.Hour, opts.CompactionInterval)
 	require.Equal(t, 32_000_000, opts.CompactionTombstoneCap)
 	require.Equal(t, 0, opts.CompactionRewriteWorkers)
-	require.Equal(t, "", opts.TimestampImportToken)
-	require.Equal(t, "", opts.TimestampImportDir)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
@@ -167,6 +166,7 @@ func TestUnknownJetstreamEnvVars_SortedAndDedupesKnownFlags(t *testing.T) {
 		"JETSTREAM_ADDR=127.0.0.1:0",
 		"JETSTREAM_APP_INSTANCE=jetstream-0",
 		"JETSTREAM_SIM_DATA_DIR=./data-sim",
+		"JETSTREAM_TEST_PG_URL=postgres://127.0.0.1:15432/jetstream",
 		"OTEL_SERVICE_NAME=jetstream-test",
 		"JETSTREAM_AAA=value=with=equals",
 	})
@@ -232,8 +232,6 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--compaction-interval=9h",
 		"--compaction-tombstone-cap=123456",
 		"--compaction-rewrite-workers=3",
-		"--timestamp-import-token=test-token",
-		"--timestamp-import-dir=/tmp/jetstream-imports",
 	}))
 	require.Equal(t, "127.0.0.1:18080", opts.PublicAddr)
 	require.Equal(t, "127.0.0.1:16060", opts.DebugAddr)
@@ -276,8 +274,6 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, 9*time.Hour, opts.CompactionInterval)
 	require.Equal(t, 123456, opts.CompactionTombstoneCap)
 	require.Equal(t, 3, opts.CompactionRewriteWorkers)
-	require.Equal(t, "test-token", opts.TimestampImportToken)
-	require.Equal(t, "/tmp/jetstream-imports", opts.TimestampImportDir)
 	require.Nil(t, opts.BarrierAfterBootstrap)
 	require.Nil(t, opts.BarrierAfterMerge)
 	require.Nil(t, opts.OnSteadyStateEvent)
@@ -573,7 +569,7 @@ func TestServe_BootstrapsAndShutsDownCleanly(t *testing.T) {
 	}
 
 	// Re-open and confirm both DIDs are still at Complete.
-	s, err := store.Open(dataDir, nil)
+	s, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -598,13 +594,16 @@ func preSeedComplete(dataDir string, dids []atmos.DID) error {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return err
 	}
-	s, err := store.Open(dataDir, nil)
+	s, err := pebblestore.Open(dataDir, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = s.Close() }()
 
 	bf := backfill.NewStore(s, nil)
+	if err := bf.SeedCounts(context.Background()); err != nil {
+		return err
+	}
 	for _, did := range dids {
 		key, err := crypto.GenerateP256()
 		if err != nil {
@@ -645,9 +644,9 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 
 	// Pre-populate phase=steady_state.
 	{
-		s, err := store.Open(dataDir, nil)
+		s, err := pebblestore.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseSteadyState, time.Now().UTC()))
+		require.NoError(t, lifecycle.WritePhase(t.Context(), s, lifecycle.PhaseSteadyState, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 
@@ -707,10 +706,10 @@ func TestServe_StartsInSteadyStatePhase(t *testing.T) {
 	}
 
 	// Phase should still be steady_state.
-	s, err := store.Open(dataDir, nil)
+	s, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
-	p, err := lifecycle.ReadPhase(s)
+	p, err := lifecycle.ReadPhase(t.Context(), s)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseSteadyState, p)
 }
@@ -724,9 +723,9 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 
 	dataDir := t.TempDir()
 	{
-		s, err := store.Open(dataDir, nil)
+		s, err := pebblestore.Open(dataDir, nil)
 		require.NoError(t, err)
-		require.NoError(t, lifecycle.WritePhase(s, lifecycle.PhaseMerging, time.Now().UTC()))
+		require.NoError(t, lifecycle.WritePhase(t.Context(), s, lifecycle.PhaseMerging, time.Now().UTC()))
 		require.NoError(t, s.Close())
 	}
 
@@ -782,10 +781,10 @@ func TestServe_AdvancesFromMergingToSteadyState(t *testing.T) {
 		t.Fatal("serve did not shut down")
 	}
 
-	s, err := store.Open(dataDir, nil)
+	s, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
-	p, err := lifecycle.ReadPhase(s)
+	p, err := lifecycle.ReadPhase(t.Context(), s)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseSteadyState, p)
 }

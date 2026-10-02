@@ -17,7 +17,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -122,7 +122,7 @@ func newCorpusVerifier(t *testing.T, docs map[string][]byte, onFailure func(did 
 func runCorpusConsumer(t *testing.T, frames [][]byte, docs map[string][]byte, wantEvents int, onVerifyFailure func(did atmos.DID, err error)) ([]segment.Event, []segment.Event, *live.Metrics, *ingest.DropMetrics) {
 	t.Helper()
 
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

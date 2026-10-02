@@ -14,8 +14,15 @@ expected-tier: default
 tiers: default,stress
 
 diff --git a/segment/seal.go b/segment/seal.go
+index de8c9c9..7326dd0 100644
 --- a/segment/seal.go
 +++ b/segment/seal.go
-@@ -244 +244 @@ func (res *blockWalkResult) internCollection(collection string, countEvent bool,
+@@ -256,7 +256,7 @@ func (res *blockWalkResult) internCollection(collection string, countEvent bool,
+ 		res.collectionIDByName[col] = id
+ 	}
+ 	if countEvent {
 -		res.collectionEventCounts[id]++
 +		res.collectionEventCounts[id] += 2
+ 	}
+ 	blockCollections[id] = struct{}{}
+ 	return nil

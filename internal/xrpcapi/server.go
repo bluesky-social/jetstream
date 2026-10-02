@@ -6,32 +6,19 @@ package xrpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
 	"go.opentelemetry.io/otel/trace"
 )
-
-// ImportConfig wires the bearer-gated timestamp-import endpoints. It is
-// optional: a zero ImportConfig (nil Manager) leaves importTimestamps /
-// getImportStatus unregistered, so a server built without import support
-// returns the framework's default 404 for those NSIDs.
-type ImportConfig struct {
-	// Manager runs and reports import jobs. nil disables the endpoints.
-	Manager ImportManager
-	// Token is the bearer secret. Empty means the endpoints are registered but
-	// every request is rejected 401 (secure-by-default), matching the design's
-	// "disabled -> 401" rule and keeping the wire surface identical whether or
-	// not a token is set.
-	Token string
-	// RunCtx roots submitted jobs' background runs; cancel it on shutdown.
-	RunCtx context.Context
-}
 
 // SegmentSource is the read-only manifest surface xrpcapi needs. The
 // concrete *manifest.Manifest satisfies it; tests can pass a fake.
@@ -41,10 +28,37 @@ type SegmentSource interface {
 	PlanSnapshot(manifest.PlanSnapshotRequest) (manifest.PlanSnapshotResult, error)
 }
 
-// ReadyFunc is called at the start of every XRPC request. Return an error
-// when the archive is not safe to expose yet, for example during bootstrap
-// or manifest startup.
-type ReadyFunc func(context.Context) error
+// SeqSyncer brings a pod's view of the archive up to seq before a request
+// is answered from it. The disaggregated catalog follower implements it with
+// a synchronous tick when seq is past its mirror (design §11.6), so a client
+// that learned of seq on a fresher pod is not planned short of it.
+type SeqSyncer interface {
+	SyncSeq(ctx context.Context, seq uint64) error
+}
+
+// DefaultMaxArchiveResponseDuration bounds one getSegment or getBlock
+// response in disaggregated mode (JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION).
+const DefaultMaxArchiveResponseDuration = time.Hour
+
+// DefaultGCDelayMargin is CheckGCDelay's allowance for clock skew between
+// pods and the catalog, and for scheduling delays.
+const DefaultGCDelayMargin = 10 * time.Minute
+
+// CheckGCDelay reports whether GC_DELAY outlives every reader of a replaced
+// generation's objects (design §11.7): a pod may serve a view up to
+// maxViewAge old, and an open response may read from it for up to
+// maxResponse more, so objects must survive both plus a margin for clock
+// skew and scheduling. Zero margin means DefaultGCDelayMargin.
+func CheckGCDelay(gcDelay, maxViewAge, maxResponse, margin time.Duration) error {
+	if margin <= 0 {
+		margin = DefaultGCDelayMargin
+	}
+	if need := maxViewAge + maxResponse + margin; gcDelay <= need {
+		return fmt.Errorf("GC delay %s must exceed max view age %s + max archive response duration %s + %s",
+			gcDelay, maxViewAge, maxResponse, margin)
+	}
+	return nil
+}
 
 // Server builds the XRPC handler tree for the jetstream lexicons.
 type Server struct {
@@ -54,20 +68,30 @@ type Server struct {
 }
 
 // Config holds the dependencies for the XRPC server. Zero values are valid:
-// a nil Logger defaults to slog.Default(); a nil Ready disables the readiness
-// gate; an unknown or disabled CompactionDeadline disables caching; nil
-// Metrics/Tracer make getBlock observability no-ops. Plan must be populated for
-// planSnapshot to accept non-empty filters.
+// a nil Logger defaults to slog.Default(); a nil Opener serves segment files
+// from the paths Src reports; a nil Ready disables the readiness gate; an
+// unknown or disabled CompactionDeadline disables caching; nil Metrics/Tracer
+// make getBlock observability no-ops. Plan must be populated for planSnapshot
+// to accept non-empty filters.
+//
+// Ready runs at the start of every archive request and turns an error into a
+// 503, for example during bootstrap or manifest startup.
+//
+// MaxResponseDuration, when positive, cuts off a getSegment or getBlock
+// response that runs longer; zero leaves responses unbounded. Sync, when set,
+// runs before planSnapshot plans against a seq the request names.
 type Config struct {
 	Src                  SegmentSource
+	Opener               SegmentOpener
 	Logger               *slog.Logger
-	Ready                ReadyFunc
+	Ready                lifecycle.Readiness
 	CompactionCacheGrace time.Duration
 	CompactionDeadline   CompactionDeadline
 	Plan                 PlanConfig
 	Metrics              *Metrics
 	Tracer               trace.Tracer
-	Import               ImportConfig
+	MaxResponseDuration  time.Duration
+	Sync                 SeqSyncer
 
 	// Dictionary is the v2 subscribe compression dictionary served by
 	// getZstdDictionary. Empty Bytes leaves the endpoint unregistered.
@@ -80,18 +104,22 @@ func New(cfg Config) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	opener := cfg.Opener
+	if opener == nil {
+		opener = FileOpener{Src: cfg.Src}
+	}
 	s := &Server{src: cfg.Src, logger: logger, xrpc: &xrpcserver.Server{}}
 	s.xrpc.HandleQuery(getSegmentNSID, withReady(cfg.Ready, &getSegmentHandler{
-		src: cfg.Src, logger: logger,
+		opener: opener, logger: logger, maxDuration: cfg.MaxResponseDuration,
 		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 	}))
 	s.xrpc.HandleQuery(getBlockNSID, withReady(cfg.Ready, &getBlockHandler{
-		src: cfg.Src, logger: logger,
+		opener: opener, logger: logger, maxDuration: cfg.MaxResponseDuration,
 		compactionCacheGrace: cfg.CompactionCacheGrace, compactionDeadline: cfg.CompactionDeadline,
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
 	}))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))
-	s.xrpc.HandleProcedure("network.bsky.jetstream.planSnapshot", withReady(cfg.Ready, newPlanSnapshotHandler(cfg.Src, cfg.Plan)))
+	s.xrpc.HandleProcedure("network.bsky.jetstream.planSnapshot", withReady(cfg.Ready, newPlanSnapshotHandler(cfg.Src, cfg.Plan, cfg.Sync)))
 
 	// The v2 subscribe compression dictionary. Deliberately NOT behind the
 	// readiness gate: the artifact is compiled in and immutable, and a
@@ -101,21 +129,6 @@ func New(cfg Config) *Server {
 			newGetZstdDictionaryHandler(cfg.Dictionary))
 	}
 
-	// Timestamp-import endpoints (design §8 M6). Registered only when a manager
-	// is wired; bearer-gated (401-by-default when no token) and NOT behind the
-	// readiness gate — an operator must be able to submit/monitor an import
-	// during any phase, and the manager itself refuses work the archive can't
-	// take yet.
-	if cfg.Import.Manager != nil {
-		runCtx := cfg.Import.RunCtx
-		if runCtx == nil {
-			runCtx = context.Background()
-		}
-		s.xrpc.HandleProcedure("network.bsky.jetstream.importTimestamps",
-			withBearer(cfg.Import.Token, newImportTimestampsHandler(cfg.Import.Manager, runCtx)))
-		s.xrpc.HandleQuery("network.bsky.jetstream.getImportStatus",
-			withBearer(cfg.Import.Token, newGetImportStatusHandler(cfg.Import.Manager)))
-	}
 	return s
 }
 
@@ -125,12 +138,47 @@ func (s *Server) Handler() http.Handler {
 	return s.xrpc
 }
 
-func withReady(ready ReadyFunc, h xrpcserver.Handler) xrpcserver.Handler {
+// responseDeadline bounds a response to d when d is positive: ctx ends, so
+// object reads stop, and the connection's write deadline is set, so a
+// stalled client cannot hold the response open either. Pinning a generation
+// is only safe for GC_DELAY, so no response may outlive it (design §11.7).
+// The write deadline is best-effort: a wrapping ResponseWriter that cannot
+// reach the connection leaves only the ctx cutoff.
+func responseDeadline(ctx context.Context, w http.ResponseWriter, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return ctx, func() {}
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
+	return context.WithTimeout(ctx, d)
+}
+
+// storeRetryAfter is the Retry-After, in seconds, on a 503 for an object
+// store outage. The store has already retried for its read budget, so an
+// immediate client retry would only queue behind the same outage.
+const storeRetryAfter = "5"
+
+// storeUnavailable returns the 503 for a read that failed because the object
+// store did not answer within its retry budget (design §1838), or nil for
+// any other error. It sets Retry-After, so call it before anything is
+// written.
+func storeUnavailable(w http.ResponseWriter, err error) error {
+	if !errors.Is(err, objstore.ErrUnavailable) {
+		return nil
+	}
+	w.Header().Set("Retry-After", storeRetryAfter)
+	return &xrpc.Error{
+		StatusCode: http.StatusServiceUnavailable,
+		Name:       "ServiceUnavailable",
+		Message:    "archive storage is unavailable; retry later",
+	}
+}
+
+func withReady(ready lifecycle.Readiness, h xrpcserver.Handler) xrpcserver.Handler {
 	if ready == nil {
 		return h
 	}
 	return xrpcserver.HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *xrpcserver.Request) error {
-		if err := ready(ctx); err != nil {
+		if err := ready.Ready(ctx); err != nil {
 			return &xrpc.Error{
 				StatusCode: http.StatusServiceUnavailable,
 				Name:       "ServiceUnavailable",

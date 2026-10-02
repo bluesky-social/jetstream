@@ -16,7 +16,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -26,9 +26,9 @@ import (
 
 // makeSteadyState writes the steady_state phase marker so the handler's
 // IsSteadyState gate passes.
-func makeSteadyState(t *testing.T, st *store.Store) {
+func makeSteadyState(t *testing.T, st *pebblestore.Store) {
 	t.Helper()
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 }
 
 func TestHandler_ReplaysFromCursor(t *testing.T) {
@@ -43,10 +43,12 @@ func TestHandler_ReplaysFromCursor(t *testing.T) {
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
 	makeSteadyState(t, st)
 
+	cat := mustCatalog(t, segDir, w)
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        m,
+		Catalog:         cat,
+		Fetcher:         cat.Fetcher(),
 		WriterRef:       &writerPtr,
 		BlockCacheBytes: 1 << 20,
 	})
@@ -92,7 +94,7 @@ func TestHandler_ReplaysFromCursor(t *testing.T) {
 func TestHandler_CursorDuringWarmupReturns503(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	makeSteadyState(t, st)
@@ -244,6 +246,48 @@ func TestHandler_V2ClampedTimestampCursorEmitsOutdatedCursorInfo(t *testing.T) {
 		"the info message names the seq actually resumed from")
 }
 
+// TestHandler_V2FutureSeqCursorEmitsFutureCursorInfo: a seq cursor past the
+// next seq (say, one saved from another archive) starts at the live tip,
+// below the cursor. The client dedups events at or below its cursor, so
+// without the notice it would silently drop events until the tip passed it.
+// A cursor equal to the next seq is an ordinary reconnect and gets no notice.
+func TestHandler_V2FutureSeqCursorEmitsFutureCursorInfo(t *testing.T) {
+	t.Parallel()
+	srv := newCursorReplaySubscription(t, 200, 299, true)
+	dial := func(ctx context.Context, cursor string) *websocket.Conn {
+		conn, dialResp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/?cursor="+cursor, nil)
+		require.NoError(t, err)
+		if dialResp != nil && dialResp.Body != nil {
+			_ = dialResp.Body.Close()
+		}
+		t.Cleanup(func() { _ = conn.CloseNow() })
+		return conn
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, frame, err := dial(ctx, "5000").Read(ctx)
+	require.NoError(t, err)
+	var envelope struct {
+		Payload struct {
+			Type    string `json:"$type"`
+			Name    string `json:"name"`
+			Message string `json:"message"`
+		} `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(frame, &envelope))
+	require.Equal(t, "network.bsky.jetstream.subscribeEvents#info", envelope.Payload.Type)
+	require.Equal(t, "FutureCursor", envelope.Payload.Name)
+	require.Contains(t, envelope.Payload.Message, "5000")
+	require.Contains(t, envelope.Payload.Message, "live tip")
+
+	// Nothing is written after the tip, so any frame here is a spurious notice.
+	quiet, cancelQuiet := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancelQuiet()
+	_, frame, err = dial(ctx, "300").Read(quiet)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "unexpected frame %s", frame)
+}
+
 // TestHandler_V1TooOldCursorClampsAndUpgrades pins v1 parity: with the reject
 // flag unset, the same below-floor cursor is silently clamped to the floor and
 // the connection upgrades to a websocket (no 400), matching legacy jetstream.
@@ -294,7 +338,7 @@ func TestHandler_RejectsInvalidCursor(t *testing.T) {
 func newActiveTimestampServer(t *testing.T, v2 bool, blockSize int) (*httptest.Server, *ingest.Writer) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 	segDir := filepath.Join(dir, "segments")
 	w, err := ingest.Open(ingest.Config{
@@ -310,10 +354,12 @@ func newActiveTimestampServer(t *testing.T, v2 bool, blockSize int) (*httptest.S
 	m := mustOpenManifest(t, segDir)
 	makeSteadyState(t, st)
 
+	cat := mustCatalog(t, segDir, w)
 	var writerPtr atomic.Pointer[ingest.Writer]
 	writerPtr.Store(w)
 	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        m,
+		Catalog:         cat,
+		Fetcher:         cat.Fetcher(),
 		WriterRef:       &writerPtr,
 		BlockCacheBytes: 1 << 20,
 	})

@@ -220,3 +220,22 @@ func TestStatusRecorder_PreservesReaderFrom(t *testing.T) {
 
 	require.True(t, readFromCalled, "ReadFrom must delegate to the inner writer (sendfile path)")
 }
+
+// A handler behind the middleware can still set per-response deadlines
+// through http.ResponseController; the archive response cutoff relies on it.
+func TestMiddleware_PreservesResponseController(t *testing.T) {
+	t.Parallel()
+
+	m := obs.NewMetrics()
+	errc := make(chan error, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		errc <- http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Minute))
+	})
+
+	ts := httptest.NewServer(m.Middleware("deadline", handler))
+	t.Cleanup(ts.Close)
+
+	resp := getCtx(t, ts.URL)
+	require.NoError(t, resp.Body.Close())
+	require.NoError(t, <-errc)
+}

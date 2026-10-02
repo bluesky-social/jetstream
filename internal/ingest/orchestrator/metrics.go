@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
@@ -12,15 +13,6 @@ const (
 	metricsNamespace           = "jetstream"
 	metricsSubsystem           = "orchestrator"
 	compactionMetricsSubsystem = "compaction"
-	importMetricsSubsystem     = "import"
-)
-
-// Import phase gauge values (stable wire values for dashboards). 0 = idle
-// (no import running), matching the prometheus default for a never-set gauge.
-const (
-	ImportPhaseGaugeIdle        = 0
-	ImportPhaseGaugeParseBucket = 1
-	ImportPhaseGaugeApply       = 2
 )
 
 // Phase gauge values. These are stable wire values — operators
@@ -69,15 +61,17 @@ type Metrics struct {
 	CompactionBytesRewritten    prometheus.Counter
 	CompactionWatermarkSeq      prometheus.Gauge
 	CompactionWatermarkLag      prometheus.Gauge
+	CompactionBlocksExamined    prometheus.Counter
+	CompactionBlocksFetched     prometheus.Counter
+
+	// tombstones is the set the tombstone gauges read. Metrics live for the
+	// process but each writer session builds its own set.
+	tombstones atomic.Pointer[tombstone.Set]
 }
 
 // NewMetrics registers the orchestrator counters/gauges against reg.
+// The optional tombstone set is bound as if by SetTombstones.
 func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metrics {
-	var ts *tombstone.Set
-	if len(tombstones) > 0 {
-		ts = tombstones[0]
-	}
-
 	m := &Metrics{
 		Phase: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -157,6 +151,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Name: "tombstone_set_entries",
 		Help: "Current number of entries in the live in-memory tombstone set.",
 	}, func() float64 {
+		ts := m.tombstones.Load()
 		if ts == nil {
 			return 0
 		}
@@ -167,6 +162,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Name: "tombstone_set_bytes",
 		Help: "Estimated bytes held by the live in-memory tombstone set.",
 	}, func() float64 {
+		ts := m.tombstones.Load()
 		if ts == nil {
 			return 0
 		}
@@ -212,6 +208,16 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Name: "watermark_lag_seconds",
 		Help: "Header-granular witnessed_at lag between the sealed segment tip and the compaction watermark.",
 	})
+	m.CompactionBlocksExamined = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
+		Name: "blocks_examined_total",
+		Help: "Blocks of the segments disaggregated compaction examined; blocks_fetched_total over this is the fraction a sparse rewrite reads.",
+	})
+	m.CompactionBlocksFetched = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
+		Name: "blocks_fetched_total",
+		Help: "Blocks disaggregated compaction's sparse rewrites fetched: candidates plus the vanished-DID check's extra reads.",
+	})
 	reg.MustRegister(
 		m.Phase,
 		m.PhaseTransitions,
@@ -237,8 +243,20 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		m.CompactionBytesRewritten,
 		m.CompactionWatermarkSeq,
 		m.CompactionWatermarkLag,
+		m.CompactionBlocksExamined,
+		m.CompactionBlocksFetched,
 	)
+	if len(tombstones) > 0 {
+		m.SetTombstones(tombstones[0])
+	}
 	return m
+}
+
+// SetTombstones points the tombstone gauges at ts. Nil reads as empty.
+func (m *Metrics) SetTombstones(ts *tombstone.Set) {
+	if m != nil {
+		m.tombstones.Store(ts)
+	}
 }
 
 func (m *Metrics) setPhase(v float64) {
@@ -371,4 +389,14 @@ func (m *Metrics) setCompactionWatermarkLag(seconds float64) {
 	if m != nil {
 		m.CompactionWatermarkLag.Set(seconds)
 	}
+}
+
+// addCompactionBlocks counts a disaggregated segment rewrite's blocks and
+// the blocks it fetched.
+func (m *Metrics) addCompactionBlocks(blocks, fetched int) {
+	if m == nil || blocks == 0 {
+		return
+	}
+	m.CompactionBlocksExamined.Add(float64(blocks))
+	m.CompactionBlocksFetched.Add(float64(fetched))
 }

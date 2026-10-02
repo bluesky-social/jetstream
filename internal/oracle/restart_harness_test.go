@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -23,10 +24,10 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
@@ -62,7 +63,7 @@ const (
 	// Segment-fault tier (#200): the child installs a deterministic segment
 	// I/O fault (segment.IOFaultInjector) that fails the Ordinal-th
 	// occurrence of one I/O op kind (write/sync/rename) across every segment
-	// writer plus the compaction-rewrite and import-patch paths. Same
+	// writer plus the compaction-rewrite path. Same
 	// fail-loud protocol as the store-fault tier: the child runs to natural
 	// completion, and writes the observed-marker IFF the runtime surfaced
 	// the injected sentinel through rt.Run; marker absence is the kill.
@@ -467,7 +468,7 @@ func restartBootstrapLiveLimitsFromEnv(t *testing.T) (int64, int) {
 // crash/predicate tiers). The fault fails the Ordinal-th batch_commit that
 // touches a key under the configured prefix — the merge source-cursor commit
 // rides merge/next_source_idx, the boundary m006 swallows.
-func newOracleStoreFaultFromEnv(t *testing.T) store.FaultInjector {
+func newOracleStoreFaultFromEnv(t *testing.T) metastore.FaultInjector {
 	t.Helper()
 
 	prefix := os.Getenv(envRestartStoreFaultPrefix)
@@ -479,21 +480,21 @@ func newOracleStoreFaultFromEnv(t *testing.T) store.FaultInjector {
 		require.NoError(t, parseIntEnv(os.LookupEnv, envRestartStoreFaultOrdinal, &ordinal))
 		require.Greaterf(t, ordinal, 0, "%s must be >= 1", envRestartStoreFaultOrdinal)
 	}
-	return &store.KeyPrefixFault{
+	return &metastore.KeyPrefixFault{
 		Prefix:  []byte(prefix),
-		Op:      store.WriteOpBatchCommit,
+		Op:      metastore.WriteOpBatchCommit,
 		Ordinal: ordinal,
 		Err:     errStoreFaultInjected,
 	}
 }
 
 // oracleSegmentIOFault fails the ordinal-th occurrence of one segment I/O op
-// kind across the whole child process (every writer plus Patch/Rewrite),
+// kind across the whole child process (every writer plus Rewrite),
 // mirroring opOrdinalIOFault in segment/writer_test.go. The atomic counter
 // makes the ordinal race-safe across backfill worker goroutines; which
 // concrete file operation lands on the ordinal may vary run-to-run for
 // write/sync (concurrent writers), but the fail-loud contract under test is
-// op-agnostic. IOOpRename is deterministic: only Patch/Rewrite rename.
+// op-agnostic. IOOpRename is deterministic: only Rewrite renames.
 type oracleSegmentIOFault struct {
 	op      segment.IOOp
 	ordinal int
@@ -640,7 +641,11 @@ func (i *oracleCrashInjector) SimulateCrash(ctx context.Context, point crashpoin
 //
 // A fresh child observes 1..tip. A recovering child starts after persisted
 // cursor C; earlier frames are already durable. Checking contiguity from the
-// lowest observed seq therefore works for both.
+// lowest observed seq therefore works for both. Frames above C can be durable
+// too: C is the parallel verifier's watermark, and a later frame on another
+// DID can commit with its verifier state before the session ends, so its
+// redelivery is dropped as a replay. A gate in the same process can inherit
+// such frames from the previous session's gates.
 type cutoverDeliveryGate struct {
 	relayURL string
 	timeout  time.Duration
@@ -665,6 +670,23 @@ func (g *cutoverDeliveryGate) observe(ev *segment.Event) {
 	g.mu.Lock()
 	g.seen[ev.UpstreamRelayCursor] = struct{}{}
 	g.mu.Unlock()
+}
+
+// inherit records every frame the prev gates observed. Each was observed
+// after its append returned, so it is durable or will be redelivered; a frame
+// that is neither is a lost event, and the final model check catches that.
+func (g *cutoverDeliveryGate) inherit(prev ...*cutoverDeliveryGate) {
+	for _, p := range prev {
+		if p == nil {
+			continue
+		}
+		p.mu.Lock()
+		seen := maps.Clone(p.seen)
+		p.mu.Unlock()
+		g.mu.Lock()
+		maps.Copy(g.seen, seen)
+		g.mu.Unlock()
+	}
 }
 
 // waitDelivered samples the relay firehose tip and blocks until every frame

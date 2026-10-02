@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -20,11 +20,17 @@ func TestPendingEventsForDID_NilWriterReturnsNil(t *testing.T) {
 	require.Nil(t, get("did:plc:anything"))
 }
 
+func TestPendingEventsForDID_DisaggregatedReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, pendingEventsForDID(nil)("did:plc:anything"))
+}
+
 func TestPendingEventsForDID_ReturnsUnflushedEventsFilteredByDID(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

@@ -1,10 +1,11 @@
 package live
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,11 +51,11 @@ func FuzzLoadUpstreamCursor(f *testing.F) {
 		// Build an in-memory test store, inject the raw bytes, and
 		// drive LoadUpstreamCursor. We bypass SaveUpstreamCursor on
 		// purpose so we can exercise the decode-rejection paths.
-		st, err := store.Open(t.TempDir(), nil)
+		st, err := pebblestore.Open(t.TempDir(), nil)
 		require.NoError(t, err)
 		defer func() { _ = st.Close() }()
 
-		require.NoError(t, st.Set([]byte("relay/cursor"), raw, store.SyncWrites))
+		require.NoError(t, st.Set(context.Background(), []byte("relay/cursor"), raw))
 		cur, err := LoadUpstreamCursor(st, "relay/cursor")
 		if err != nil {
 			return
@@ -78,7 +79,7 @@ func FuzzUpstreamCursorRoundTrip(f *testing.F) {
 		if v < 0 {
 			t.Skip()
 		}
-		st, err := store.Open(t.TempDir(), nil)
+		st, err := pebblestore.Open(t.TempDir(), nil)
 		require.NoError(t, err)
 		defer func() { _ = st.Close() }()
 

@@ -20,7 +20,7 @@ Definitions and references for terms used in the code and docs. The code and lin
 
 **Manifest** — the list of segments jetstream serves. It is rebuilt from a directory scan and file headers, rather than stored in pebble. Source: `docs/README.md` §3.5.
 
-**Metadata store** — the single pebble db at `data/meta.pebble/` holding everything that isn't cheaply re-derivable from segments: `relay/cursor`, lifecycle `phase`, seq tip/lease/registered vacancies, `repo/<did>`, the `pdshost/<hostname>` fleet roster/cursors, `account/<did>`, `sync/<did>`, and `compaction/seq`. Source: `docs/README.md` §3.5, `internal/store`.
+**Metadata store** — the single pebble db at `data/meta.pebble/` holding everything that isn't cheaply re-derivable from segments: `relay/cursor`, lifecycle `phase`, seq tip/lease/registered vacancies, `repo/<did>`, the `pdshost/<hostname>` fleet roster/cursors, `account/<did>`, `sync/<did>`, and `compaction/seq`. Reached through the `metastore.Store` interface (`internal/metastore`); the Pebble impl is `internal/metastore/pebblestore`. Source: `docs/README.md` §3.5.
 
 ## Ingestion lifecycle
 
@@ -45,8 +45,6 @@ Definitions and references for terms used in the code and docs. The code and lin
 **Readable log (hot tail)** — the byte-bounded, seq-indexed FIFO the ingest writer keeps of recently appended events, so caught-up subscribers get served from memory and wake on the next append. Source: `internal/subscribe/doc.go`, `internal/ingest` writer.
 
 **Cold reader** — the fallback path when a subscriber's cursor is older than what the readable log still holds in memory: a bounded disk walk over sealed segments plus the active segment's flushed region, routed through a shared decoded-block LRU cache. Source: `internal/subscribe/doc.go`, `internal/subscribe/replay.go`.
-
-**Bucketed** — a timestamp-import status flag (`getImportStatus`) meaning the import's rows have been grouped/bucketed for processing. Used only by the import API. Source: `internal/timestamp`, `docs/README.md` §8.
 
 ## Testing
 

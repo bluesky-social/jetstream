@@ -9,31 +9,30 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/gttp"
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
-	"github.com/bluesky-social/jetstream/internal/importer"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
-	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream/internal/leader"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
-	"github.com/bluesky-social/jetstream/internal/timestamp"
-	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/internal/web"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
@@ -41,27 +40,33 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Runtime is one fully constructed jetstream daemon instance.
+// Runtime is one fully constructed jetstream daemon instance. Build
+// constructs the per-process graph; Run drives writer sessions under the
+// leader loop (see session.go).
 type Runtime struct {
 	opts Options
 
 	processLogger *slog.Logger
 	logger        *slog.Logger
 
-	tracerShutdown  obs.TracerShutdown
-	cancelManifest  context.CancelFunc
-	metaStore       *store.Store
-	importRules     *timestamp.RuleStore
-	manifest        *manifest.Manifest
-	tail            *subscribe.Tail
-	verifier        *atmossync.Verifier
-	orchestrator    *orchestrator.Orchestrator
-	importer        *importer.Manager
-	importRunCtx    context.Context
-	cancelImport    context.CancelFunc
-	steadyReady     chan struct{}
-	steadyReadyOnce sync.Once
-	server          *server.Server
+	tracerShutdown obs.TracerShutdown
+	cancelManifest context.CancelFunc
+	metaStore      *pebblestore.Store
+	manifest       *manifest.Manifest
+	catalogLoad    *backgroundLoad
+	tail           *subscribe.Tail
+	server         *server.Server
+
+	sessions      *sessionFactory
+	orchMetrics   *orchestrator.Metrics
+	leaderMetrics *leader.Metrics
+	deadline      *compactionDeadline
+	// pending is the first session, built by Build so invalid options fail
+	// there. Guarded by closeMu.
+	pending *writerSession
+	// disagg is set in disaggregated mode, where it replaces metaStore,
+	// catalogLoad, and the local writer lock.
+	disagg *disaggregated
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -99,6 +104,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.BootstrapLiveMaxEventsPerBlock < 0 {
 		return nil, fmt.Errorf("serve: BootstrapLiveMaxEventsPerBlock must be >= 0, got %d", opts.BootstrapLiveMaxEventsPerBlock)
 	}
+	if opts.SessionRestartDelay < 0 {
+		return nil, fmt.Errorf("serve: SessionRestartDelay must be >= 0, got %s", opts.SessionRestartDelay)
+	}
+	if opts.SteadyMaxSegmentBytes < 0 {
+		return nil, fmt.Errorf("serve: SteadyMaxSegmentBytes must be >= 0, got %d", opts.SteadyMaxSegmentBytes)
+	}
+	if opts.SteadyMaxEventsPerBlock < 0 {
+		return nil, fmt.Errorf("serve: SteadyMaxEventsPerBlock must be >= 0, got %d", opts.SteadyMaxEventsPerBlock)
+	}
 	if opts.FailedRepoRetryInterval < 0 {
 		return nil, fmt.Errorf("serve: --failed-repo-retry-interval must be >= 0 (FailedRepoRetryInterval must be >= 0), got %s", opts.FailedRepoRetryInterval)
 	}
@@ -133,6 +147,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return nil, fmt.Errorf("serve: --plan-whole-segment-threshold must be > 0 and <= 1 (PlanWholeSegmentThreshold must be > 0 and <= 1), got %g", opts.PlanWholeSegmentThreshold)
 	}
 
+	if err := opts.Storage.Validate(opts); err != nil {
+		return nil, err
+	}
+
 	processLogger, err := obs.BuildLoggerFromStrings(opts.LogOutput, opts.LogLevel, opts.LogFormat)
 	if err != nil {
 		return nil, err
@@ -151,13 +169,19 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		"version", info.Version,
 		"commit", info.Commit,
 		"built", info.Date,
+		"storage_mode", opts.Storage.EffectiveMode(),
 	)
+	if opts.Storage.Disaggregated() {
+		return buildDisaggregated(ctx, opts, processLogger, logger)
+	}
+	if opts.Storage.storageSettingsSet() {
+		logger.Warn("disaggregated storage settings are ignored because JETSTREAM_STORAGE is local", "storage", opts.Storage)
+	}
 
 	rt := &Runtime{
 		opts:          opts,
 		processLogger: processLogger,
 		logger:        logger,
-		steadyReady:   make(chan struct{}),
 	}
 	cleanupTimeout := opts.ShutdownTimeout
 	if cleanupTimeout <= 0 {
@@ -179,7 +203,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.tracerShutdown = tracerShutdown
 
 	metrics := obs.NewMetrics()
-	storeMetrics := store.NewMetrics(metrics.Registry)
+	storeMetrics := pebblestore.NewMetrics(metrics.Registry)
 	segmentMetrics := obs.NewSegmentMetrics(metrics.Registry)
 	verifierMetrics := obs.NewVerifierMetrics(metrics.Registry)
 	subscribeMetrics := subscribe.NewMetrics(metrics.Registry)
@@ -196,23 +220,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: create segments dir %s: %w", segmentsDir, err))
 	}
 
-	metaStore, err := store.Open(opts.DataDir, storeMetrics,
-		store.WithFS(opts.StorageFS),
-		store.WithFaultInjector(opts.StoreFaultInjector),
-	)
+	metaStore, err := pebblestore.Open(opts.DataDir, storeMetrics, pebblestore.WithFS(opts.StorageFS))
 	if err != nil {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
-
-	importRules, err := timestamp.OpenRuleStore(timestamp.RuleStoreConfig{
-		DataDir: opts.DataDir,
-		FS:      opts.StorageFS,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: open timestamp import rule store: %w", err))
+	var metaKV metastore.Store = metaStore
+	if opts.StoreFaultInjector != nil {
+		metaKV = metastore.WithFaults(metaStore, opts.StoreFaultInjector)
 	}
-	rt.importRules = importRules
 
 	manifestCtx, cancelManifest := context.WithCancel(ctx)
 	rt.cancelManifest = cancelManifest
@@ -228,17 +244,36 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.manifest = mft
 
-	// writerPtr is published by the orchestrator once the steady-state
-	// live consumer opens its ingest.Writer; the cursor handler reads it
-	// atomically. Before steady-state the lifecycle.IsSteadyState gate
-	// returns 503, so the nil-pointer window is harmless.
-	var writerPtr atomic.Pointer[ingest.Writer]
+	// The local catalog hears about every seal from the ingest writers and
+	// feeds main-namespace seals to the manifest.
+	segCatalog, err := localcatalog.New(localcatalog.Config{
+		FS: opts.StorageFS,
+		Dirs: map[catalog.Namespace]string{
+			catalog.Main:          segmentsDir,
+			catalog.BootstrapLive: filepath.Join(opts.DataDir, "backfill", "live_segments"),
+		},
+		// Merge cleanup removes the whole backfill tree.
+		Roots: map[catalog.Namespace]string{catalog.BootstrapLive: filepath.Join(opts.DataDir, "backfill")},
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build segment catalog: %w", err))
+	}
+	segCatalog.OnSealed(catalog.Main, func(v catalog.SegmentView, path string) error {
+		return manifest.ApplySegmentFile(mft, opts.StorageFS, v.Index, path)
+	})
+	// Like the manifest, the catalog loads what is on disk in the
+	// background. Writers may publish seals meanwhile; Refresh keeps them.
+	// Readers wait on catalogLoad before their first view.
+	catalogLoad := startBackgroundLoad(manifestCtx, segCatalog.Refresh)
+	rt.catalogLoad = catalogLoad
 
-	// Verifier setup (shared across phases). The verifier itself is
-	// owned by the orchestrator's per-phase live consumers, but we
-	// construct it here because its async-error drain is a sibling
-	// goroutine in the top-level errgroup -- it's a process-wide
-	// observability concern.
+	// The slot is published by each session's orchestrator once the
+	// steady-state live consumer opens its ingest.Writer; the cursor handler
+	// reads it atomically. Before steady-state the lifecycle.IsSteadyState
+	// gate returns 503, so the nil-pointer window is harmless.
+	slot := &writerSlot{}
+	writerPtr := &slot.ptr
+
 	relayHTTPURL, err := live.DeriveRelayHTTPURL(opts.RelayURL)
 	if err != nil {
 		return fail(fmt.Errorf("serve: derive relay HTTP URL: %w", err))
@@ -260,22 +295,23 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	resolver := newIdentityResolver(opts)
 	directory := &identity.Directory{
 		Resolver:               resolver,
-		Cache:                  identcache.New(metaStore, identcache.DefaultTTL),
+		Cache:                  identcache.New(identcache.NewPebbleKV(metaStore), identcache.DefaultTTL),
 		SkipHandleVerification: true,
 	}
 
-	stateStore := syncstate.New(metaStore)
-	tombstones := tombstone.New()
-	// This state is owned and updated by the orchestrator, but xrpcapi sees
-	// only its read-only deadline surface. It starts unknown, so archive
-	// responses remain no-cache until steady-state scheduling is live.
-	compactionSchedule := orchestrator.NewCompactionScheduleState()
+	// Each session's orchestrator owns and updates its compaction schedule;
+	// xrpcapi sees only this read-only deadline surface. It starts unknown,
+	// so archive responses remain no-cache until steady-state scheduling is
+	// live.
+	deadline := &compactionDeadline{}
+	rt.deadline = deadline
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
-		Manifest:        mft,
-		WriterRef:       &writerPtr,
-		FS:              opts.StorageFS,
+		Catalog:         segCatalog,
+		Fetcher:         segCatalog.Fetcher(),
+		Ready:           catalogLoad.Wait,
+		WriterRef:       writerPtr,
 		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
 		Metrics:         subscribeMetrics,
 	})
@@ -285,43 +321,25 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		ReadBatch:   opts.SubscribeReadBatch,
 		SlowWindow:  opts.SubscribeSlowWindow,
 		SlowMinRate: opts.SubscribeSlowMinRate,
-	}, coldRd.Read, func() uint64 {
-		if w := writerPtr.Load(); w != nil {
-			return w.NextSeq()
-		}
-		return 0
-	})
+
+		ColdEventsPerSec: opts.SubscribeColdEventsPerSec,
+	}, coldRd.Read, slot.nextSeq)
 	if err != nil {
 		return fail(fmt.Errorf("serve: build subscribe tail: %w", err))
 	}
 	rt.tail = tail
+	slot.tail = tail
+	tail.SetReadLogSource(slot.readLog)
 
-	verifierLogger := processLogger.With(slog.String("component", "verifier"))
-	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
-		Directory:  directory,
-		StateStore: stateStore,
-		SyncClient: gt.Some(syncClient),
-		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			verifierMetrics.IncFailure(obs.Classify(vErr))
-			verifierLogger.Warn("verification failure",
-				"did", did,
-				"err", vErr,
-			)
-		}),
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build verifier: %w", err))
-	}
-	rt.verifier = verifier
-
-	// The orchestrator owns all ingestion-lifecycle subsystems
-	// (backfill engine, bootstrap-time live consumer, steady-state
-	// live consumer). The runtime is no longer phase-aware.
+	// Each session's orchestrator owns all ingestion-lifecycle subsystems
+	// (backfill engine, bootstrap-time live consumer, steady-state live
+	// consumer). The runtime is not phase-aware.
 	//
-	// The /subscribe tail reads the steady writer's readable log (wired in
-	// OnSteadyStateWriter below), not the live consumer's OnEvent hook: every
-	// producer sharing the steady writer — the live consumer AND the failed-repo
-	// retry runner — must become visible through the writer-owned seq stream.
+	// The /subscribe tail reads the steady writer's readable log (published
+	// through the writer slot by OnSteadyStateWriter below), not the live
+	// consumer's OnEvent hook: every producer sharing the steady writer — the
+	// live consumer AND the failed-repo retry runner — must become visible
+	// through the writer-owned seq stream.
 	// OnEvent remains the live-consumer-only observation hook for tests/oracle.
 	onSteadyStateEvent := func(ev *segment.Event) {
 		if opts.OnSteadyStateEvent != nil {
@@ -329,7 +347,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		}
 	}
 	onSegmentCompacted := func(idx uint64, path string) error {
-		if err := mft.OnSegmentCompacted(idx, path); err != nil {
+		if err := manifest.ApplySegmentFile(mft, opts.StorageFS, idx, path); err != nil {
+			return err
+		}
+		if err := segCatalog.Reload(catalog.Main, idx); err != nil {
 			return err
 		}
 		coldRd.InvalidateSegment(idx)
@@ -347,136 +368,104 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
 		}
 	}
-	orch, err := orchestrator.New(orchestrator.Config{
-		DataDir:        opts.DataDir,
-		FS:             opts.StorageFS,
-		Store:          metaStore,
-		RelayURL:       opts.RelayURL,
-		HTTPClient:     xrpcClient.HTTPClient.Val(),
-		Directory:      directory,
-		Verifier:       verifier,
-		SyncStateStore: stateStore,
-		Tombstones:     tombstones,
-		// Bare logger; orchestrator.New attaches component=orchestrator
-		// itself, and its children (live, ingest, backfill) attach
-		// their own component on top of the bare parent.
-		Logger:                         processLogger,
-		Metrics:                        orchestrator.NewMetrics(metrics.Registry, tombstones),
-		IngestMetrics:                  ingest.NewMetrics(metrics.Registry),
-		LiveMetrics:                    liveMetrics,
-		DropMetrics:                    ingest.NewDropMetrics(metrics.Registry),
-		BackfillMetrics:                backfillMetrics,
-		SegmentMetrics:                 segmentMetrics,
-		OnEvent:                        onSteadyStateEvent,
-		OnBootstrapLiveEvent:           opts.OnBootstrapLiveEvent,
-		MaxBackfillRepos:               opts.MaxBackfillRepos,
-		BackfillGlobalDownloads:        opts.effectiveBackfillGlobalDownloads(),
-		BackfillHostWorkers:            opts.effectiveBackfillHostWorkers(),
-		BackfillMaxActiveHosts:         opts.effectiveBackfillMaxActiveHosts(),
-		BackfillMaxHosts:               opts.effectiveBackfillMaxHosts(),
-		BackfillWorkers:                opts.BackfillWorkers,
-		BackfillNewHostClient:          backfillNewHostClient,
-		BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
-		BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
-		ReadLogRetentionBytes:          int64(opts.effectiveSubscribeReadLogRetentionBytes()),
-		BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
-		BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
-		BackfillRepos:                  opts.BackfillRepos,
-		SkipMergeDiscovery:             opts.SkipMergeDiscovery,
-		BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
-		FailedRepoRetryInterval:        opts.FailedRepoRetryInterval,
-		FailedRepoRetryWorkers:         opts.FailedRepoRetryWorkers,
-		FailedRepoRetryHostWorkers:     opts.FailedRepoRetryHostWorkers,
-		FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
-		LiveReconnectBackoff:           opts.LiveReconnectBackoff,
-		LiveDial:                       opts.LiveDial,
-		IngestOnAfterSeal:              mft.OnSegmentSealed,
-		OnSegmentCompacted:             onSegmentCompacted,
-		SegmentManifestChecksums:       mft.SegmentChecksums,
-		ImportSelector:                 mft,
-		ImportMetrics:                  orchestrator.NewImportMetrics(metrics.Registry),
-		ImportRules:                    importRules,
-		TimestampStamper:               importRules,
-		CompactionInterval:             opts.CompactionInterval,
-		CompactionSchedule:             compactionSchedule,
-		CompactionTombstoneCap:         opts.CompactionTombstoneCap,
-		CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
-		OnCompactionPass:               onCompactionPass,
-		OnBeforeCompactionPass:         opts.OnBeforeCompactionPass,
-		BarrierBeforeCutover:           phaseBarrier(opts.BarrierBeforeCutover),
-		BarrierAfterBootstrap:          phaseBarrier(opts.BarrierAfterBootstrap),
-		BarrierAfterMerge:              phaseBarrier(opts.BarrierAfterMerge),
-		AfterRepoComplete:              opts.AfterRepoComplete,
-		CrashInjector:                  opts.CrashInjector,
-		SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
-		OnSteadyStateWriter: func(w *ingest.Writer) {
-			// Fires after the steady writer opens and before any producer
-			// (live consumer, retry runner, compactor) starts, so subscribers
-			// read the writer-owned log from its first event.
-			tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
-			writerPtr.Store(w)
-			rt.steadyReadyOnce.Do(func() { close(rt.steadyReady) })
+	rt.orchMetrics = orchestrator.NewMetrics(metrics.Registry)
+	rt.leaderMetrics = leader.NewMetrics(metrics.Registry)
+	// Store, Verifier, SyncStateStore, Tombstones, and CompactionSchedule are
+	// per-session; sessionFactory.build fills them in.
+	rt.sessions = &sessionFactory{
+		store:           metaKV,
+		directory:       directory,
+		syncClient:      syncClient,
+		verifierMetrics: verifierMetrics,
+		logger:          processLogger,
+		orch: orchestrator.Config{
+			DataDir:    opts.DataDir,
+			FS:         opts.StorageFS,
+			RelayURL:   opts.RelayURL,
+			HTTPClient: xrpcClient.HTTPClient.Val(),
+			Directory:  directory,
+			// Bare logger; orchestrator.New attaches component=orchestrator
+			// itself, and its children (live, ingest, backfill) attach
+			// their own component on top of the bare parent.
+			Logger:                         processLogger,
+			Metrics:                        rt.orchMetrics,
+			IngestMetrics:                  ingest.NewMetrics(metrics.Registry),
+			LiveMetrics:                    liveMetrics,
+			DropMetrics:                    ingest.NewDropMetrics(metrics.Registry),
+			BackfillMetrics:                backfillMetrics,
+			SegmentMetrics:                 segmentMetrics,
+			OnEvent:                        onSteadyStateEvent,
+			OnBootstrapLiveEvent:           opts.OnBootstrapLiveEvent,
+			MaxBackfillRepos:               opts.MaxBackfillRepos,
+			BackfillGlobalDownloads:        opts.effectiveBackfillGlobalDownloads(),
+			BackfillHostWorkers:            opts.effectiveBackfillHostWorkers(),
+			BackfillMaxActiveHosts:         opts.effectiveBackfillMaxActiveHosts(),
+			BackfillMaxHosts:               opts.effectiveBackfillMaxHosts(),
+			BackfillWorkers:                opts.BackfillWorkers,
+			BackfillNewHostClient:          backfillNewHostClient,
+			BackfillBatchSize:              opts.effectiveBackfillBatchSize(),
+			BackfillAsyncFlushWorkers:      opts.BackfillAsyncFlushWorkers,
+			ReadLogRetentionBytes:          int64(opts.effectiveSubscribeReadLogRetentionBytes()),
+			BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
+			BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
+			SteadyMaxEventsPerBlock:        opts.SteadyMaxEventsPerBlock,
+			BackfillRepos:                  opts.BackfillRepos,
+			SkipMergeDiscovery:             opts.SkipMergeDiscovery,
+			BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
+			FailedRepoRetryInterval:        opts.FailedRepoRetryInterval,
+			FailedRepoRetryWorkers:         opts.FailedRepoRetryWorkers,
+			FailedRepoRetryHostWorkers:     opts.FailedRepoRetryHostWorkers,
+			FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
+			LiveReconnectBackoff:           opts.LiveReconnectBackoff,
+			LiveDial:                       opts.LiveDial,
+			Catalog:                        segCatalog,
+			OnSegmentCompacted:             onSegmentCompacted,
+			SegmentManifestChecksums:       mft.SegmentChecksums,
+			CompactionInterval:             opts.CompactionInterval,
+			CompactionTombstoneCap:         opts.CompactionTombstoneCap,
+			CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
+			OnCompactionPass:               onCompactionPass,
+			OnBeforeCompactionPass:         opts.OnBeforeCompactionPass,
+			BarrierBeforeCutover:           phaseBarrier(opts.BarrierBeforeCutover),
+			BarrierAfterBootstrap:          phaseBarrier(opts.BarrierAfterBootstrap),
+			BarrierAfterMerge:              phaseBarrier(opts.BarrierAfterMerge),
+			AfterRepoComplete:              opts.AfterRepoComplete,
+			CrashInjector:                  opts.CrashInjector,
+			SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
+			OnSteadyStateWriter:            slot.publish,
 		},
-	})
+	}
+	pending, err := rt.sessions.build()
 	if err != nil {
-		return fail(fmt.Errorf("serve: build orchestrator: %w", err))
+		return fail(err)
 	}
-	rt.orchestrator = orch
+	rt.pending = pending
 
-	// Timestamp-import job manager (design §8 M6). Always constructed so the
-	// endpoints exist and return a secure-by-default 401 when no token is set;
-	// the manager confines CSV paths to the import dir and shares the
-	// orchestrator's rewrite lock via RunImport. The import dir defaults to
-	// <data-dir>/imports; per-job scratch (offset files) lives under
-	// <data-dir>/import-scratch, kept separate from the operator's staged CSVs.
-	importDir := opts.TimestampImportDir
-	if importDir == "" {
-		importDir = filepath.Join(opts.DataDir, "imports")
-	}
-	if err := mkdirAllRuntimeFS(opts.StorageFS, importDir, 0o755); err != nil {
-		return fail(fmt.Errorf("serve: create import dir %s: %w", importDir, err))
-	}
-	importRunCtx, cancelImport := context.WithCancel(context.Background())
-	rt.importRunCtx = importRunCtx
-	rt.cancelImport = cancelImport
-	importMgr, err := importer.New(importer.Config{
-		Store:      metaStore,
-		Runner:     orch,
-		ImportDir:  importDir,
-		ScratchDir: filepath.Join(opts.DataDir, "import-scratch"),
-		Ready: func() error {
-			if !lifecycle.IsSteadyState(metaStore) || writerPtr.Load() == nil {
-				return importer.ErrNotReady
-			}
-			return nil
-		},
-		Logger: processLogger,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build import manager: %w", err))
-	}
-	rt.importer = importMgr
-
-	// Status collector + handler are built here (after the import manager) so
-	// the status page can surface the current import job.
+	// Status and repo verification read segments through the catalog, so
+	// they wait for its background load like the cold reader does.
 	statusCollector, err := status.New(status.Options{
-		Store:                 metaStore,
+		Store:                 metaKV,
 		DataDir:               opts.DataDir,
+		Archive:               segCatalog,
+		ArchiveReady:          catalogLoad.Wait,
 		Manifest:              mft,
 		CursorLookback:        opts.CursorLookback,
 		IdentityResolver:      resolver,
-		ImportReporter:        importReporter{mgr: importMgr},
 		LastSeenUpstreamEvent: liveMetrics.LastSeenUpstreamEvent,
-		Writer: func() *ingest.Writer {
-			return writerPtr.Load()
-		},
+		Writer:                writerPtr.Load,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("serve: build status collector: %w", err))
 	}
+	repoArchive := repoexport.Archive{
+		Catalog:  segCatalog,
+		Fetcher:  segCatalog.Fetcher(),
+		Selector: repoexport.FooterSelector{Source: segCatalog, Primary: newManifestSelector(mft)},
+		Ready:    catalogLoad.Wait,
+	}
 	statusHandler, err := web.New(web.Options{
 		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
+		RepoActions:                web.NewRepoActions(repoArchive, resolver, pendingEventsForDID(writerPtr)),
 		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
 		Logger:                     processLogger,
 	})
@@ -494,14 +483,16 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}, processLogger, metrics)
 
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
-	// before steady-state, lifecycle.IsSteadyState gates with 503 so
+	// before steady-state, the phase readiness gate answers 503 so
 	// nil-pointer reads are harmless.
+	phaseReady := lifecycle.SteadyState(metaKV)
 	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Store:     metaStore,
+		Ready:     phaseReady,
 		Manifest:  mft,
-		FS:        opts.StorageFS,
-		WriterRef: &writerPtr,
+		Catalog:   segCatalog,
+		Fetcher:   segCatalog.Fetcher(),
+		WriterRef: writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,
 		Lookback:  opts.CursorLookback,
@@ -512,10 +503,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// handler owns this one NSID while atmos xrpcserver keeps the rest.
 	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Store:     metaStore,
+		Ready:     phaseReady,
 		Manifest:  mft,
-		FS:        opts.StorageFS,
-		WriterRef: &writerPtr,
+		Catalog:   segCatalog,
+		Fetcher:   segCatalog.Fetcher(),
+		WriterRef: writerPtr,
 		Logger:    processLogger,
 		Metrics:   subscribeMetrics,
 		Lookback:  opts.CursorLookback,
@@ -530,17 +522,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	xrpcSrv := xrpcapi.New(xrpcapi.Config{
 		Src:    mft,
 		Logger: processLogger,
-		Ready: func(ctx context.Context) error {
-			if !lifecycle.IsSteadyState(metaStore) {
-				return errors.New("bootstrap in progress")
-			}
+		Ready: lifecycle.AllReady(phaseReady, lifecycle.ReadinessFunc(func(ctx context.Context) error {
 			if err := mft.Wait(ctx); err != nil {
 				return fmt.Errorf("manifest warming up: %w", err)
 			}
 			return nil
-		},
+		})),
 		CompactionCacheGrace: opts.CompactionCacheGrace,
-		CompactionDeadline:   compactionSchedule,
+		CompactionDeadline:   deadline,
 		Plan: xrpcapi.PlanConfig{
 			MaxDIDs:               opts.PlanMaxDIDs,
 			MaxCollections:        opts.PlanMaxCollections,
@@ -549,11 +538,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		},
 		Metrics: xrpcMetrics,
 		Tracer:  obs.Tracer("xrpcapi"),
-		Import: xrpcapi.ImportConfig{
-			Manager: importMgr,
-			Token:   opts.TimestampImportToken,
-			RunCtx:  importRunCtx,
-		},
 		Dictionary: xrpcapi.DictionaryConfig{
 			ID:    subscribe.DictionaryV2ID,
 			Bytes: subscribe.DictionaryV2(),
@@ -602,19 +586,6 @@ func (r *Runtime) PublicAddr() string {
 	return r.server.PublicAddr()
 }
 
-// WaitSteadyState blocks until the steady-state writer has been published.
-func (r *Runtime) WaitSteadyState(ctx context.Context) error {
-	if r == nil || r.steadyReady == nil {
-		return errors.New("runtime: not built")
-	}
-	select {
-	case <-r.steadyReady:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 // Run starts the constructed service graph and blocks until shutdown or a
 // fatal subsystem error.
 func (r *Runtime) Run(ctx context.Context) (runErr error) {
@@ -639,50 +610,15 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 
 	g, gctx := errgroup.WithContext(runCtx)
 
-	g.Go(r.goroutineRoot("manifest_cancel", func() error {
-		<-gctx.Done()
-		r.cancelManifestLoad()
-		return nil
-	}))
-
-	g.Go(r.goroutineRoot("manifest_wait", func() error {
-		if err := r.manifest.Wait(gctx); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return fmt.Errorf("manifest load: %w", err)
-		}
-		return nil
-	}))
+	if r.disagg != nil {
+		r.runDisaggregated(gctx, g)
+	} else {
+		r.runLocal(gctx, g)
+	}
 
 	if !r.opts.Headless {
 		g.Go(r.goroutineRoot("http_server", func() error {
 			return r.server.Run(gctx)
-		}))
-	}
-
-	g.Go(r.goroutineRoot("orchestrator", func() error {
-		return r.orchestrator.Run(gctx)
-	}))
-
-	// Auto-resume a timestamp-import job that a prior process left incomplete
-	// (design Q-RESUME), but only after the steady-state writer is published:
-	// imports are steady-state-only and the resume path should not turn a boot
-	// ordering race into a terminal failed job. Best-effort: a resume failure is
-	// logged, not fatal — the archive still serves, and the operator can
-	// re-submit. The job's background run is rooted at importRunCtx (cancelled
-	// in Close), not gctx.
-	if r.importer != nil {
-		g.Go(r.goroutineRoot("import_resume", func() error {
-			select {
-			case <-r.steadyReady:
-			case <-gctx.Done():
-				return nil
-			}
-			if err := r.importer.ResumeIncomplete(r.importRunCtx); err != nil {
-				r.logger.Warn("resume incomplete import failed", "err", err)
-			}
-			return nil
 		}))
 	}
 
@@ -706,35 +642,56 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		return nil
 	}))
 
-	verifierLogger := r.processLogger.With(slog.String("component", "verifier"))
-	// Verifier async-error drain. Verification failures are
-	// diagnostic, not fatal -- they typically reflect adversarial or
-	// malformed PDS input, which is invalid user data, not a
-	// jetstream bug. We warn-log and the OnVerificationFailure hook
-	// fires for operator visibility, but never crash.
-	g.Go(r.goroutineRoot("verifier_async_errors", func() error {
-		for {
-			select {
-			case <-gctx.Done():
-				return nil
-			case err, ok := <-r.verifier.AsyncErrors():
-				if !ok {
-					return nil
-				}
-				verifierLogger.Warn("async error", "err", err)
-			}
-		}
-	}))
-
 	// Graceful shutdown surfaces as context.Canceled from the errgroup: the
-	// orchestrator's steady-state consumer and the HTTP server both return
-	// ctx.Err(). Suppress cancellation only when it came from the runtime's run
+	// HTTP server returns ctx.Err(). Suppress cancellation only when it came from the runtime's run
 	// context, either caller cancellation or Runtime.Close.
 	runErr = g.Wait()
 	if errors.Is(runErr, context.Canceled) && runCtx.Err() != nil {
 		runErr = nil
 	}
 	return runErr
+}
+
+// runLocal starts local mode's goroutines: the background manifest and
+// catalog loads, and writer sessions under the always-held local lock.
+func (r *Runtime) runLocal(gctx context.Context, g *errgroup.Group) {
+	g.Go(r.goroutineRoot("manifest_cancel", func() error {
+		<-gctx.Done()
+		r.cancelManifestLoad()
+		return nil
+	}))
+
+	g.Go(r.goroutineRoot("manifest_wait", func() error {
+		if err := r.manifest.Wait(gctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("manifest load: %w", err)
+		}
+		return nil
+	}))
+
+	g.Go(r.goroutineRoot("catalog_wait", func() error {
+		if err := r.catalogLoad.Wait(gctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("catalog load: %w", err)
+		}
+		return nil
+	}))
+
+	// Local mode always holds the lock, so the loop runs one session at a
+	// time until shutdown or a fatal error. A session error wrapping
+	// leader.ErrRestartSession starts a fresh session in-process instead.
+	g.Go(r.goroutineRoot("writer_sessions", func() error {
+		return leader.Run(gctx, leader.Config{
+			Locker:          leader.Local{},
+			AcquireInterval: r.opts.SessionRestartDelay,
+			Logger:          r.processLogger.With(slog.String("component", "leader")),
+			Metrics:         r.leaderMetrics,
+		}, r.runSession)
+	}))
 }
 
 func (r *Runtime) goroutineRoot(name string, fn func() error) func() error {
@@ -768,7 +725,6 @@ func (r *Runtime) goroutineRoot(name string, fn func() error) func() error {
 // fields.
 func (r *Runtime) Close(ctx context.Context) error {
 	r.cancelManifestLoad()
-	r.cancelImportRun()
 
 	var errs []error
 
@@ -782,57 +738,31 @@ func (r *Runtime) Close(ctx context.Context) error {
 	r.closeMu.Lock()
 	defer r.closeMu.Unlock()
 
-	// Drain any in-flight timestamp-import job BEFORE
-	// closing the metadata store: the manager writes job records + checkpoints
-	// to the store from its background run, and a write after Close would panic
-	// (pebble: closed). A cancelled run pauses (stays resumable), so the next
-	// boot picks it up.
-	importDrained := true
-	if r.importer != nil {
-		if err := r.importer.Wait(ctx); err != nil {
-			// The import goroutine may still be about to write a checkpoint.
-			// Closing pebble under it converts a slow shutdown into a panic,
-			// so we leave the store open and let process exit tear it down —
-			// pebble's WAL recovers cleanly on the next boot.
-			importDrained = false
-			r.logger.Error("import drain did not complete within budget; leaving metadata store open", "err", err)
-			errs = append(errs, fmt.Errorf("import drain: %w", err))
-		} else {
-			// Only forget the importer once it actually drained: a repeated
-			// Close must re-wait, not skip straight to closing the store.
-			r.importer = nil
-		}
-	}
-
-	if r.verifier != nil && runDrained {
-		if err := r.verifier.Close(); err != nil {
+	// A session that ran closed its own verifier before Run drained. The
+	// first session is still pending when Run never started.
+	if r.pending != nil && runDrained {
+		if err := r.pending.verifier.Close(); err != nil {
 			r.logger.Error("verifier close", "err", err)
 			errs = append(errs, fmt.Errorf("verifier close: %w", err))
 		}
-		r.verifier = nil
-	}
-	if r.importRules != nil && runDrained && importDrained {
-		if err := r.importRules.Close(); err != nil {
-			r.logger.Error("close timestamp import rule store", "err", err)
-			errs = append(errs, fmt.Errorf("close timestamp import rule store: %w", err))
-		}
-		r.importRules = nil
+		r.pending = nil
 	}
 	// Note: promoted sync state is NOT flushed here. The consumer's own
 	// Close flushes it after its writer has durably fsynced every
 	// appended row; flushing from Runtime.Close would commit promoted
 	// state even when the consumer's writer.Close failed, letting
-	// verifier state run ahead of the archive. Pending (unpromoted)
-	// entries are deliberately dropped — their events' rows were never
-	// archived and redelivery re-verifies them.
-	if r.metaStore != nil && runDrained && importDrained {
+	// verifier state run ahead of the archive.
+	if r.metaStore != nil && runDrained {
 		if err := r.metaStore.Close(); err != nil {
 			r.logger.Error("close metadata store", "err", err)
 			errs = append(errs, fmt.Errorf("close metadata store: %w", err))
 		}
 		r.metaStore = nil
 	}
-	if r.tracerShutdown != nil && runDrained && importDrained {
+	if runDrained {
+		r.closeDisaggregated()
+	}
+	if r.tracerShutdown != nil && runDrained {
 		if err := r.tracerShutdown(ctx); err != nil {
 			r.logger.Error("tracer shutdown failed", "err", err)
 			errs = append(errs, fmt.Errorf("tracer shutdown: %w", err))
@@ -861,16 +791,6 @@ func (r *Runtime) stopRun(ctx context.Context) error {
 	}
 }
 
-func (r *Runtime) cancelImportRun() {
-	r.closeMu.Lock()
-	cancel := r.cancelImport
-	r.cancelImport = nil
-	r.closeMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
 func (r *Runtime) closeWithLogging(ctx context.Context) {
 	if err := r.Close(ctx); err != nil {
 		r.logger.Error("runtime cleanup failed", "err", err)
@@ -887,43 +807,38 @@ func (r *Runtime) cancelManifestLoad() {
 	}
 }
 
-// importReporter adapts *importer.Manager to status.ImportReporter, translating
-// the importer's Record into the status package's rendering view so status
-// stays decoupled from the importer's concrete types.
-type importReporter struct{ mgr *importer.Manager }
-
-func (r importReporter) CurrentImport() (status.ImportInfo, bool) {
-	rec, ok := r.mgr.Current()
-	if !ok {
-		return status.ImportInfo{}, false
-	}
-	return status.ImportInfo{
-		JobID:                 rec.ID,
-		State:                 string(rec.State),
-		Phase:                 string(rec.Phase),
-		Error:                 rec.Error,
-		SubmittedAt:           rec.SubmittedAt,
-		FinishedAt:            rec.FinishedAt,
-		Bucketed:              rec.Bucketed,
-		SegmentsToApply:       rec.SegmentsToApply,
-		SegmentsApplied:       rec.SegmentsApplied,
-		RowsTotal:             rec.RowsTotal,
-		RowsValid:             rec.RowsValid,
-		RowsRejected:          rec.RowsRejected,
-		SegmentsExamined:      rec.SegmentsExamined,
-		SegmentsPatched:       rec.SegmentsPatched,
-		RowsMutated:           rec.RowsMutated,
-		RowsMatchedSpecific:   rec.RowsMatchedSpecific,
-		SpecificCIDsUnmatched: rec.SpecificCIDsUnmatched,
-		RowsCorruptOffset:     rec.RowsCorruptOffset,
-	}, true
-}
-
 func phaseBarrier(barrier PhaseBarrier) orchestrator.PhaseBarrier {
 	if barrier == nil {
 		return nil
 	}
 	return func(ctx context.Context) error {
 		return barrier(ctx)
+	}
+}
+
+// backgroundLoad is a startup load run off the critical path, such as the
+// catalog's initial directory scan. Wait is the readiness gate.
+type backgroundLoad struct {
+	done chan struct{}
+	err  error
+}
+
+func startBackgroundLoad(ctx context.Context, load func(context.Context) error) *backgroundLoad {
+	l := &backgroundLoad{done: make(chan struct{})}
+	go func() {
+		defer close(l.done)
+		l.err = load(ctx)
+	}()
+	return l
+}
+
+// Wait blocks until the load finishes and returns its error, or ctx.Err()
+// if the caller stops waiting first.
+func (l *backgroundLoad) Wait(ctx context.Context) error {
+	select {
+	case <-l.done:
+		return l.err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

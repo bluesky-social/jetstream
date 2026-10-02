@@ -41,8 +41,8 @@ func TestReadLog_AppendedEventVisibleBeforeDurabilityAndEvictedAfterFlush(t *tes
 func brutePinned(l *ReadableLog) int64 {
 	var sum int64
 	for _, e := range l.entries {
-		if e.event.Seq >= l.durable {
-			sum += e.bytes
+		if e.Event().Seq >= l.durable {
+			sum += e.ApproxBytes()
 		}
 	}
 	return sum

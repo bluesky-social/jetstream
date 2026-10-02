@@ -1,7 +1,7 @@
 // package live: events.go is the pure converter from atmos's
 // upstream streaming event shape to the segment.Event shape jetstream
-// writes to disk. No I/O, no allocation beyond the result slice and
-// CBOR marshalling. Safe to fuzz against arbitrary input — every
+// writes to disk. No I/O, no allocation beyond the result slice, CBOR
+// marshalling, and the record data-model check. Safe to fuzz against arbitrary input — every
 // branch returns an error rather than panicking on malformed bytes.
 //
 // All segment.Events derived from a single upstream event share the
@@ -15,6 +15,7 @@ package live
 import (
 	"fmt"
 
+	"github.com/bluesky-social/jetstream/internal/datamodel"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
@@ -127,6 +128,23 @@ func validateOp(op *streaming.Operation) *DroppedOp {
 	return validateOpPath(op)
 }
 
+// checkRecord applies the data-model half of the gate to a create/update
+// record block. Returns the DroppedOp to record, or nil if the record is
+// clean.
+func checkRecord(op *streaming.Operation, did string, block []byte) *DroppedOp {
+	if datamodel.CheckRecord(block) == nil {
+		return nil
+	}
+	return &DroppedOp{
+		Reason:     ingest.DropReasonInvalidDataModel,
+		DID:        did,
+		Collection: string(op.Collection),
+		RKey:       string(op.RKey),
+		Action:     string(op.Action),
+		CID:        opCIDString(op),
+	}
+}
+
 // opCIDString renders the op's CID for drop diagnostics; deletes have
 // no CID and render empty rather than a garbage zero-value encoding.
 func opCIDString(op *streaming.Operation) string {
@@ -192,6 +210,10 @@ func convertVerifiedOps(evt streaming.Event, witnessedAt int64) ([]segment.Event
 					Action:     string(op.Action),
 					CID:        op.CID.String(),
 				})
+				continue
+			}
+			if d := checkRecord(&op, string(op.Repo), block); d != nil {
+				dropped = append(dropped, *d)
 				continue
 			}
 			segEv.Payload = append([]byte(nil), block...)
@@ -267,6 +289,10 @@ func convertCommit(evt streaming.Event, witnessedAt int64) ([]segment.Event, err
 					Action:     string(op.Action),
 					CID:        op.CID.String(),
 				})
+				continue
+			}
+			if d := checkRecord(&op, commit.Repo, block); d != nil {
+				dropped = append(dropped, *d)
 				continue
 			}
 			segEv.Payload = append([]byte(nil), block...)
@@ -398,6 +424,10 @@ func convertSync(evt streaming.Event, witnessedAt int64) ([]segment.Event, error
 					Action:     string(op.Action),
 					CID:        op.CID.String(),
 				})
+				continue
+			}
+			if d := checkRecord(&op, string(op.Repo), block); d != nil {
+				dropped = append(dropped, *d)
 				continue
 			}
 			segEv.Payload = append([]byte(nil), block...)

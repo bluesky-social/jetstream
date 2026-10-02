@@ -10,15 +10,20 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/gt"
 	"github.com/klauspost/compress/zstd"
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,12 +31,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newSteadyStateStore(t *testing.T) *store.Store {
+func newSteadyStateStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 	return st
 }
 
@@ -67,10 +72,10 @@ func waitForOptionsUpdates(t *testing.T, m *Metrics, want float64) {
 func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	t.Parallel()
 
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseBootstrap, time.Now().UTC()))
+	require.NoError(t, lifecycle.WritePhase(t.Context(), st, lifecycle.PhaseBootstrap, time.Now().UTC()))
 
 	b, _ := newReadLogTail(t, 1<<20, noCold)
 
@@ -89,7 +94,32 @@ func TestHandler_RejectsWhenNotSteadyState(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
-	require.Contains(t, string(body), "service not ready")
+	require.Contains(t, string(body), "service not ready: bootstrap in progress")
+}
+
+// TestHandler_ReadyOverridesStore checks an explicit Readiness gates the
+// handler instead of the Store's phase, and its error text reaches the client.
+func TestHandler_ReadyOverridesStore(t *testing.T) {
+	t.Parallel()
+
+	b, _ := newReadLogTail(t, 1<<20, noCold)
+	h := NewHandler(Subscription{
+		Tail:   b,
+		Store:  newSteadyStateStore(t),
+		Ready:  lifecycle.ReadinessFunc(func(context.Context) error { return fmt.Errorf("catalog warming") }),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	require.Contains(t, string(body), "service not ready: catalog warming")
 }
 
 func TestHandler_HappyPath_DeliversIdentityEvent(t *testing.T) {
@@ -1905,4 +1935,121 @@ func TestHandler_CompressionSchemeMetrics(t *testing.T) {
 	_ = readOneFrame(t, ctx, connNone)
 	_ = readOneFrame(t, ctx, connDeflate)
 	_ = readOneZstdFrame(t, ctx, connZstd)
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// TestHandler_EncodeErrorsLoggedOncePerConnection: rows archived outside the
+// atproto data model are skipped and counted, and a replay through many of
+// them logs once per connection rather than once per row.
+func TestHandler_EncodeErrorsLoggedOncePerConnection(t *testing.T) {
+	t.Parallel()
+
+	b, _ := newReadLogTail(t, 1<<20, noCold)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	var logs lockedBuffer
+	srv := httptest.NewServer(NewHandler(Subscription{
+		Tail:    b,
+		Store:   newSteadyStateStore(t),
+		Metrics: metrics,
+		Logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	waitForTailBlocked(t, b)
+
+	float, err := cbor.Marshal(map[string]any{"v": 1.5})
+	require.NoError(t, err)
+	var seq uint64
+	const bad = 5
+	for i := range bad {
+		appendSeq(t, b, &seq, &segment.Event{
+			WitnessedAt: 1779719010267528,
+			Kind:        segment.KindCreate,
+			DID:         "did:plc:float",
+			Collection:  "net.anisota.x",
+			Rkey:        fmt.Sprintf("r%d", i),
+			Rev:         "3l3qo2vutsw2b",
+			Payload:     float,
+		})
+	}
+	publishIdentity(t, b, &seq, "did:plc:after", 1)
+
+	_, frame, err := conn.Read(ctx)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(frame, &got))
+	require.Equal(t, "did:plc:after", got["did"], "the unencodable rows must be skipped")
+	require.InDelta(t, float64(bad), testutil.ToFloat64(metrics.EncodeErrors), 0)
+	require.Equal(t, 1, strings.Count(logs.String(), `msg="encode error`), logs.String())
+}
+
+// An object store outage during a cold read closes the connection with an
+// error frame telling the client to come back later, without a log line per
+// connection: every cold reader hits it at once.
+func TestHandler_ColdStoreUnavailableErrorFrame(t *testing.T) {
+	t.Parallel()
+
+	cold := func(context.Context, uint64, int) ([]*Entry, uint64, error) {
+		return nil, 0, fmt.Errorf("follower: fetch block: %w", objstore.ErrUnavailable)
+	}
+	// The subscriber anchors live at 100, then the tip moves past it, so
+	// its next read goes cold as it would after falling behind.
+	var tip atomic.Uint64
+	tip.Store(100)
+	b := newTail(tailConfig{cold: cold, nextSeq: tip.Load, logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	var logs lockedBuffer
+	srv := httptest.NewServer(NewHandler(Subscription{
+		Tail:   b,
+		Store:  newSteadyStateStore(t),
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		V2:     true,
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
+	waitForTailBlocked(t, b)
+	tip.Store(200)
+	b.SetReadLogSource(func() *ingest.ReadableLog { return nil }) // wakes the parked reader
+
+	var got struct {
+		Type    string `json:"$type"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(readOneFrame(t, ctx, conn), &got))
+	require.Equal(t, "error", got.Type)
+	require.Equal(t, "InternalError", got.Error)
+	require.Contains(t, got.Message, "storage unavailable")
+	require.NotContains(t, logs.String(), "read error")
 }

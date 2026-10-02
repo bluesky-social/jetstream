@@ -447,10 +447,8 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		newAdversarialFilter(w.AdversarialLedger().Entries()))
 	assertIdentityArchived(t, cfg, bootstrapEventLog, steadyEventLog, identityDID(t, w, identityIdx))
 	accountStatusMaxSeq := assertAccountStatusLifecycleArchived(t, cfg, steadyEventLog, accountStatusDID)
-	// Quiesce the bubble before scraping: the whole-event sync lie
-	// produces no ack-visible row, so only drain() guarantees the
-	// consumer has processed it and settled the counters.
-	drain()
+	// The whole-event sync lie produces no ack-visible row; the assertion
+	// polls the counters under fake time until the consumer has dropped it.
 	assertAdversarialDropCounters(t, trace, w, cfg, debugClient, "steady-state")
 
 	// Verifier-owned rev lie (#204, layered-ownership contract): a
@@ -865,7 +863,10 @@ func bisectServedCompactedFailure(
 	// in-flight rewrite that a completed-only bracket would miss (#106).
 	completedBefore := compaction.Count()
 	startedBefore := compaction.StartedCount()
-	disk, err := ObserveSegments(dataDir)
+	// The server is still running, so the scan uses the live observer: its
+	// catalog/path cross-check tolerates appends, seals, and a racing
+	// rewrite, which passesDuringScan accounts for below.
+	disk, err := observeSegmentsLive(dataDir)
 	require.NoErrorf(t, err, "bisect: observe on-disk segments mode=%s seed=%d watermark=%d", cfg.Mode, cfg.Seed, watermark)
 	disk = EventsSortedBySeq(disk)
 	passesDuringScan := max(compaction.Count()-completedBefore, compaction.StartedCount()-startedBefore)

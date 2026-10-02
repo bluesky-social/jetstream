@@ -43,3 +43,23 @@ func gaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
 	t.Fatalf("missing metric %s", name)
 	return 0
 }
+
+func TestMetrics_SetTombstonesSwitchesGaugeSource(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := NewMetrics(reg, tombstone.New())
+
+	next := tombstone.New()
+	require.NoError(t, next.Observe(&segment.Event{
+		Seq:        1,
+		Kind:       segment.KindDelete,
+		DID:        "did:plc:a",
+		Collection: "app.bsky.feed.post",
+		Rkey:       "abc",
+	}))
+	m.SetTombstones(next)
+	require.InDelta(t, 1.0, gaugeValue(t, reg, "jetstream_compaction_tombstone_set_entries"), 0)
+
+	m.SetTombstones(nil)
+	require.InDelta(t, 0.0, gaugeValue(t, reg, "jetstream_compaction_tombstone_set_entries"), 0)
+}

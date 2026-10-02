@@ -1,20 +1,38 @@
 package syncstate
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
 )
 
-func newTestStore(t *testing.T) *store.Store {
+func newTestStore(t *testing.T, opts ...pebblestore.Option) metastore.Store {
 	t.Helper()
-	s, err := store.Open(t.TempDir(), nil)
+	s, err := pebblestore.Open(t.TempDir(), nil, append([]pebblestore.Option{pebblestore.WithFS(vfs.NewMem())}, opts...)...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// flush commits promoted state on its own: the consumer's durable batch minus
+// the relay cursor.
+func flush(t *testing.T, s *StateStore) error {
+	t.Helper()
+	b := s.s.NewBatch()
+	s.StageFlush(b)
+	if err := b.Commit(t.Context()); err != nil {
+		s.AbortStaged()
+		return err
+	}
+	s.CommitStaged()
+	return nil
 }
 
 func parseDID(t *testing.T, s string) atmos.DID {
@@ -53,13 +71,13 @@ func TestStateStore_ChainRoundTrip(t *testing.T) {
 	require.Nil(t, absent, "staged chain state must not be durable before promotion+Flush")
 
 	// Pending entries never flush — their event's rows are not durable.
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	stillAbsent, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.Nil(t, stillAbsent, "pending (unpromoted) chain state must not flush")
 
 	s.PromoteChain(did, want.Rev)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
@@ -76,7 +94,7 @@ func TestStateStore_PromoteChainRevGate(t *testing.T) {
 	// must not be promoted by an EARLIER event's group completion.
 	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev2", Data: fixedCID(t)}))
 	s.PromoteChain(did, "3lrev1")
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 
 	fresh := New(raw)
 	absent, err := fresh.LoadChain(t.Context(), did)
@@ -84,11 +102,162 @@ func TestStateStore_PromoteChainRevGate(t *testing.T) {
 	require.Nil(t, absent, "newer-rev pending entry must survive an older promotion")
 
 	s.PromoteChain(did, "3lrev2")
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
 	require.Equal(t, "3lrev2", durable.Rev)
+}
+
+// The verifier runs ahead of the appends: it saves a later commit's state
+// before the earlier commit's rows land. Promoting the earlier commit must
+// make its own state durable. Were it to wait for the later commit, a batch
+// could commit the earlier rows and a cursor past them with the DID's state
+// still older, and after a crash the redelivered commit would verify against
+// that older state and be archived twice.
+func TestStateStore_PipelinedSavesPromoteEach(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
+	fresh := New(raw)
+	durableRev := func() string {
+		t.Helper()
+		got, err := fresh.LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		if got == nil {
+			return ""
+		}
+		return got.Rev
+	}
+
+	for _, rev := range []string{"3lrev1", "3lrev2", "3lrev3"} {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+	}
+	live, err := s.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev3", live.Rev, "the verifier reads its newest save")
+
+	s.PromoteChain(did, "3lrev1")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev1", durableRev())
+
+	// A promotion past several entries makes the newest of them durable.
+	s.PromoteChain(did, "3lrev3")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev3", durableRev())
+	s.PromoteChain(did, "3lrev2")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev3", durableRev(), "a superseded entry is gone")
+
+	// A save at or below a queued rev supersedes it.
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev5", Data: fixedCID(t)}))
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev4", Data: fixedCID(t)}))
+	s.PromoteChain(did, "3lrev5")
+	require.NoError(t, flush(t, s))
+	require.Equal(t, "3lrev4", durableRev())
+}
+
+func TestStateStore_PipelinedHostingPromotesEach(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:ffffffffffffffffffffffff")
+	older := atmossync.HostingState{Active: false, Status: "takendown", Seq: 10}
+	newer := atmossync.HostingState{Active: true, Seq: 11}
+	require.NoError(t, s.SaveHosting(t.Context(), did, older))
+	require.NoError(t, s.SaveHosting(t.Context(), did, newer))
+
+	s.PromoteHosting(did, 10)
+	require.NoError(t, flush(t, s))
+	durable, err := New(raw).LoadHosting(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, durable, "promoting seq 10 must make its state durable")
+	require.Equal(t, older, *durable)
+	live, err := s.LoadHosting(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, newer, *live, "the newer event stays pending")
+}
+
+// The verifier can run thousands of events ahead of the appends, and a hot DID
+// can have all of them in flight. Each event's promotion must still find its
+// own entry: a drop-oldest cap lost it, so the batch committed the event's rows
+// and a cursor past it with the DID's durable state older than the archive.
+func TestStateStore_DeepPipelinePromotesOldest(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
+	const inFlight = 500
+	for i := range inFlight {
+		rev := fmt.Sprintf("3lrev%04d", i)
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+	}
+	for i := range inFlight {
+		rev := fmt.Sprintf("3lrev%04d", i)
+		s.Settle(did, rev, int64(i))
+		s.PromoteChain(did, rev)
+		require.NoError(t, flush(t, s))
+		got, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.NotNil(t, got, "rev %s", rev)
+		require.Equal(t, rev, got.Rev, "each event's promotion makes its own state durable")
+	}
+	require.Empty(t, s.pendingChain)
+}
+
+// Events that verify but never append (malformed after verification, say)
+// leave their entries pending. Settling at each later event's receipt drops
+// them without hiding the verifier's newest view or any later event's entry.
+func TestStateStore_SettleBoundsUnappendedEvents(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")
+	const n = 1000
+	rev := func(i int) string { return fmt.Sprintf("3lrev%04d", i) }
+	host := func(i int) atmossync.HostingState { return atmossync.HostingState{Active: i%2 == 0, Seq: int64(i)} }
+
+	// Two events are always in flight ahead of the one being received.
+	save := func(i int) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev(i), Data: fixedCID(t)}))
+		require.NoError(t, s.SaveHosting(t.Context(), did, host(i)))
+	}
+	save(0)
+	save(1)
+	for i := range n - 2 {
+		save(i + 2)
+		s.Settle(did, rev(i), int64(i))
+		require.LessOrEqual(t, len(s.pendingChain[did]), 3)
+		require.LessOrEqual(t, len(s.pendingHosting[did]), 3)
+	}
+	live, err := s.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, rev(n-1), live.Rev, "the verifier still reads its newest save")
+
+	// The received event's own entry and the in-flight ones still promote.
+	for i := n - 2; i < n; i++ {
+		s.Settle(did, rev(i), int64(i))
+		s.PromoteChain(did, rev(i))
+		s.PromoteHosting(did, int64(i))
+		require.NoError(t, flush(t, s))
+		got, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.Equal(t, rev(i), got.Rev)
+		gotHost, err := New(raw).LoadHosting(t.Context(), did)
+		require.NoError(t, err)
+		require.Equal(t, host(i), *gotHost)
+	}
+	require.Empty(t, s.pendingChain)
+	require.Empty(t, s.pendingHosting)
+
+	// A lone unappended entry older than the received event stays: it is the
+	// verifier's current view.
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev(n), Data: fixedCID(t)}))
+	s.Settle(did, rev(n+1), int64(n+1))
+	live, err = s.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, rev(n), live.Rev)
 }
 
 func TestStateStore_HostingRoundTrip(t *testing.T) {
@@ -114,13 +283,13 @@ func TestStateStore_HostingRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, absent, "staged hosting state must not be durable before promotion+Flush")
 
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	stillAbsent, err := fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
 	require.Nil(t, stillAbsent, "pending (unpromoted) hosting state must not flush")
 
 	s.PromoteHosting(did, want.Seq)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err := fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
@@ -145,7 +314,7 @@ func TestStateStore_HostingPromotionIsSeqGated(t *testing.T) {
 	// it must not promote the newer event's pending state — that
 	// event's row has not been appended yet.
 	s.PromoteHosting(did, 10)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	durable, err := fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
@@ -153,7 +322,7 @@ func TestStateStore_HostingPromotionIsSeqGated(t *testing.T) {
 
 	// The producing event's own row promotes it.
 	s.PromoteHosting(did, 11)
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	durable, err = fresh.LoadHosting(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
@@ -173,23 +342,55 @@ func TestStateStore_CommitStagedKeepsLatePromotions(t *testing.T) {
 	// batch, then — before CommitStaged — a newer promotion lands
 	// (resync worker finished and the consumer appended its group).
 	b := raw.NewBatch()
-	defer func() { _ = b.Close() }()
-	require.NoError(t, s.StageFlush(b))
+	s.StageFlush(b)
 
 	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev2", Data: fixedCID(t)}))
 	s.PromoteChain(did, "3lrev2")
 
-	require.NoError(t, raw.Commit(b, store.SyncWrites))
+	require.NoError(t, b.Commit(t.Context()))
 	s.CommitStaged()
 
 	// The late promotion must NOT have been discarded by CommitStaged:
 	// the next flush persists it.
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	durable, err := fresh.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.NotNil(t, durable)
 	require.Equal(t, "3lrev2", durable.Rev, "promotion landing between StageFlush and CommitStaged must survive")
+}
+
+// A pipelined durable batch persists the state promoted when it was cut,
+// not when it commits. A promotion in between belongs to rows in a later
+// batch; persisting it early lets a crash before that batch commits leave
+// verifier state newer than the archive, and the verifier then drops the
+// redelivered event as a rev replay (found by the layer 3 oracle).
+func TestStateStore_StageSnapshotExcludesLaterPromotions(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:hhhhhhhhhhhhhhhhhhhhhhhh")
+
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev1", Data: fixedCID(t)}))
+	s.PromoteChain(did, "3lrev1")
+	cut := s.Snapshot()
+
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev2", Data: fixedCID(t)}))
+	s.PromoteChain(did, "3lrev2")
+
+	b := raw.NewBatch()
+	s.StageSnapshot(b, cut)
+	require.NoError(t, b.Commit(t.Context()))
+	s.CommitStaged()
+	durable, err := New(raw).LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, durable)
+	require.Equal(t, "3lrev1", durable.Rev, "the batch persists only what was promoted when it was cut")
+
+	require.NoError(t, flush(t, s))
+	durable, err = New(raw).LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev2", durable.Rev, "the later promotion flushes with the next batch")
 }
 
 func TestStateStore_DistinctKeyspaces(t *testing.T) {
@@ -269,7 +470,7 @@ func TestStateStore_IdentitySeqRatchet(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(7), got, "ratchet must not regress")
 
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	got, err = fresh.LoadAppliedIdentitySeq(t.Context(), did)
 	require.NoError(t, err)
@@ -304,7 +505,7 @@ func TestStateStore_AccountSeqRatchet(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(7), got, "ratchet must not regress")
 
-	require.NoError(t, s.Flush())
+	require.NoError(t, flush(t, s))
 	fresh := New(raw)
 	got, err = fresh.LoadAppliedAccountSeq(t.Context(), did)
 	require.NoError(t, err)
@@ -314,4 +515,159 @@ func TestStateStore_AccountSeqRatchet(t *testing.T) {
 	got, err = fresh.LoadAppliedAccountSeq(t.Context(), did)
 	require.NoError(t, err)
 	require.Zero(t, got, "Delete must remove the ratchet")
+}
+
+// Pipelined hot batches each take a snapshot when they freeze and commit
+// later, in order. A snapshot holds only what was promoted since the one
+// before it: were it to restage everything still uncommitted, a commit
+// backlog would grow every batch and slow commits further (design §22.2).
+// Committing the batches in order still leaves the latest state durable.
+func TestStateStore_PipelinedSnapshotsStageDeltas(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	dids := make([]atmos.DID, 4)
+	for i := range dids {
+		dids[i] = parseDID(t, "did:plc:"+strings.Repeat(string(rune('p'+i)), 24))
+	}
+	promote := func(did atmos.DID, rev string) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+		s.PromoteChain(did, rev)
+	}
+
+	promote(dids[0], "3lrev1")
+	promote(dids[1], "3lrev1")
+	first := s.Snapshot()
+	promote(dids[2], "3lrev1")
+	promote(dids[0], "3lrev2")
+	second := s.Snapshot()
+	third := s.Snapshot()
+	promote(dids[3], "3lrev1")
+
+	var staged []int
+	for _, snap := range []*Snapshot{first, second, third} {
+		b := raw.NewBatch()
+		s.StageSnapshot(b, snap)
+		staged = append(staged, b.Len())
+		require.NoError(t, b.Commit(t.Context()))
+		s.CommitStaged()
+	}
+	require.Equal(t, []int{2, 2, 0}, staged, "each batch stages only its own promotions")
+
+	for i, want := range []string{"3lrev2", "3lrev1", "3lrev1", ""} {
+		durable, err := New(raw).LoadChain(t.Context(), dids[i])
+		require.NoError(t, err)
+		if want == "" {
+			require.Nil(t, durable, "promoted after the last snapshot, so not durable yet")
+			continue
+		}
+		require.NotNil(t, durable)
+		require.Equal(t, want, durable.Rev)
+	}
+	// The uncommitted promotion is still visible to the verifier.
+	got, err := s.LoadChain(t.Context(), dids[3])
+	require.NoError(t, err)
+	require.Equal(t, "3lrev1", got.Rev)
+}
+
+// A batch that fails to commit hands its entries to the next batch staged,
+// even though that batch's snapshot was taken before the failure.
+func TestStateStore_FailedPipelinedBatchCarriesForward(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	a := parseDID(t, "did:plc:tttttttttttttttttttttttt")
+	b := parseDID(t, "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu")
+	require.NoError(t, s.SaveChain(t.Context(), a, atmossync.ChainState{Rev: "3lrev1", Data: fixedCID(t)}))
+	s.PromoteChain(a, "3lrev1")
+	failed := s.Snapshot()
+	require.NoError(t, s.SaveChain(t.Context(), b, atmossync.ChainState{Rev: "3lrev1", Data: fixedCID(t)}))
+	s.PromoteChain(b, "3lrev1")
+	next := s.Snapshot()
+
+	s.StageSnapshot(raw.NewBatch(), failed) // never committed
+	s.AbortStaged()
+	batch := raw.NewBatch()
+	s.StageSnapshot(batch, next)
+	require.Equal(t, 2, batch.Len())
+	require.NoError(t, batch.Commit(t.Context()))
+	s.CommitStaged()
+	for _, did := range []atmos.DID{a, b} {
+		durable, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.NotNil(t, durable, "did=%s", did)
+	}
+}
+
+// A group commit stages several batches before committing them together.
+// None of them restages another's entries, and each CommitStaged clears
+// the oldest staged batch's captures.
+func TestStateStore_GroupCommitStagesEachBatchOnce(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	dids := []atmos.DID{
+		parseDID(t, "did:plc:vvvvvvvvvvvvvvvvvvvvvvvv"),
+		parseDID(t, "did:plc:wwwwwwwwwwwwwwwwwwwwwwww"),
+	}
+	promote := func(did atmos.DID, rev string) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+		s.PromoteChain(did, rev)
+	}
+	promote(dids[0], "3lrev1")
+	first := s.Snapshot()
+	promote(dids[1], "3lrev1")
+	promote(dids[0], "3lrev2")
+	second := s.Snapshot()
+
+	group := raw.NewBatch()
+	s.StageSnapshot(group, first)
+	require.Equal(t, 1, group.Len())
+	s.StageSnapshot(group, second)
+	require.Equal(t, 3, group.Len(), "the second batch stages only its own promotions")
+	require.NoError(t, group.Commit(t.Context()))
+	s.CommitStaged()
+	s.CommitStaged()
+
+	for i, want := range []string{"3lrev2", "3lrev1"} {
+		durable, err := New(raw).LoadChain(t.Context(), dids[i])
+		require.NoError(t, err)
+		require.NotNil(t, durable)
+		require.Equal(t, want, durable.Rev)
+	}
+	next := raw.NewBatch()
+	s.StageFlush(next)
+	require.Zero(t, next.Len(), "both batches' captures were cleared")
+}
+
+// A failed group takes every batch staged in it: the next batch restages
+// what they held that is still current, once.
+func TestStateStore_FailedGroupCarriesEveryBatch(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	a := parseDID(t, "did:plc:xxxxxxxxxxxxxxxxxxxxxxxx")
+	b := parseDID(t, "did:plc:yyyyyyyyyyyyyyyyyyyyyyyy")
+	promote := func(did atmos.DID, rev string) {
+		require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: fixedCID(t)}))
+		s.PromoteChain(did, rev)
+	}
+	promote(a, "3lrev1")
+	s.StageSnapshot(raw.NewBatch(), s.Snapshot())
+	promote(b, "3lrev1")
+	promote(a, "3lrev2")
+	s.StageSnapshot(raw.NewBatch(), s.Snapshot())
+	s.AbortStaged()
+
+	retry := raw.NewBatch()
+	s.StageFlush(retry)
+	require.Equal(t, 2, retry.Len())
+	require.NoError(t, retry.Commit(t.Context()))
+	s.CommitStaged()
+	for did, want := range map[atmos.DID]string{a: "3lrev2", b: "3lrev1"} {
+		durable, err := New(raw).LoadChain(t.Context(), did)
+		require.NoError(t, err)
+		require.NotNil(t, durable, "did=%s", did)
+		require.Equal(t, want, durable.Rev)
+	}
 }

@@ -1,21 +1,23 @@
 package ingest
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
 var errSeqLeaseInjected = errors.New("injected seq lease commit failure")
 
-func leaseTestConfig(dir string, st *store.Store, blockSize int) Config {
+func leaseTestConfig(dir string, st metastore.Store, blockSize int) Config {
 	return Config{
 		SegmentsDir:              filepath.Join(dir, "segments"),
 		Store:                    st,
@@ -142,12 +144,13 @@ func TestSeqLeaseLegacyMigrationAndPreServingAttestation(t *testing.T) {
 func TestSeqLeaseStartupCommitFailureFailsOpen(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	fault := &store.KeyPrefixFault{
-		Prefix: []byte("seq/"), Op: store.WriteOpBatchCommit, Ordinal: 1, Err: errSeqLeaseInjected,
+	fault := &metastore.KeyPrefixFault{
+		Prefix: []byte("seq/"), Op: metastore.WriteOpBatchCommit, Ordinal: 1, Err: errSeqLeaseInjected,
 	}
-	st, err := store.Open(dir, nil, store.WithFaultInjector(fault))
+	stRaw, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = stRaw.Close() })
+	st := metastore.WithFaults(stRaw, fault)
 
 	_, err = Open(leaseTestConfig(dir, st, 4))
 	require.ErrorIs(t, err, errSeqLeaseInjected)
@@ -159,12 +162,13 @@ func TestSeqLeaseStartupCommitFailureFailsOpen(t *testing.T) {
 func TestSeqLeaseRenewalFailureExhaustsOldLease(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	fault := &store.KeyPrefixFault{
-		Prefix: []byte("seq/"), Op: store.WriteOpBatchCommit, Ordinal: 2, Err: errSeqLeaseInjected,
+	fault := &metastore.KeyPrefixFault{
+		Prefix: []byte("seq/"), Op: metastore.WriteOpBatchCommit, Ordinal: 2, Err: errSeqLeaseInjected,
 	}
-	st, err := store.Open(dir, nil, store.WithFaultInjector(fault))
+	stRaw, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = stRaw.Close() })
+	st := metastore.WithFaults(stRaw, fault)
 	w, err := Open(leaseTestConfig(dir, st, 4))
 	require.NoError(t, err)
 
@@ -190,7 +194,7 @@ func TestSeqLeaseRejectsMalformedAndOverlappingGapRecords(t *testing.T) {
 	t.Run("malformed", func(t *testing.T) {
 		dir := t.TempDir()
 		st := newTestStore(t)
-		require.NoError(t, st.Set([]byte(seqGapPrefix+"bad"), []byte{gapVersion}, store.SyncWrites))
+		require.NoError(t, st.Set(context.Background(), []byte(seqGapPrefix+"bad"), []byte{gapVersion}))
 		_, err := Open(leaseTestConfig(dir, st, 4))
 		require.ErrorContains(t, err, "malformed seq gap record")
 	})
@@ -210,9 +214,8 @@ func TestSeqLeaseRejectsMalformedAndOverlappingGapRecords(t *testing.T) {
 		require.NoError(t, err)
 		b := st.NewBatch()
 		require.NoError(t, stageSeqGaps(b, gaps))
-		require.NoError(t, stageNextSeq(b, seqReservedKey, 2))
-		require.NoError(t, st.Commit(b, store.SyncWrites))
-		require.NoError(t, b.Close())
+		stageNextSeq(b, seqReservedKey, 2)
+		require.NoError(t, b.Commit(context.Background()))
 
 		_, err = Open(leaseTestConfig(dir, st, 4))
 		require.ErrorContains(t, err, "overlaps durable block")
@@ -225,8 +228,7 @@ func TestSeqLeaseRejectsMalformedAndOverlappingGapRecords(t *testing.T) {
 		require.NoError(t, err)
 		b := st.NewBatch()
 		require.NoError(t, stageSeqGaps(b, gaps))
-		require.NoError(t, st.Commit(b, store.SyncWrites))
-		require.NoError(t, b.Close())
+		require.NoError(t, b.Commit(context.Background()))
 
 		_, err = Open(leaseTestConfig(dir, st, 4))
 		require.ErrorContains(t, err, "exceeds durable coverage frontier")
@@ -380,7 +382,7 @@ func TestSeqLeaseCrashSequenceModelNeverReusesOrLeavesUnregisteredVacancies(t *t
 	require.NoError(t, w.Close())
 }
 
-func mustLoadSeq(t *testing.T, st *store.Store, key string) uint64 {
+func mustLoadSeq(t *testing.T, st metastore.Store, key string) uint64 {
 	t.Helper()
 	v, err := loadNextSeq(st, key)
 	require.NoError(t, err)

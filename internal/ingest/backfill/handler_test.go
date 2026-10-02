@@ -8,10 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/storagefake"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -28,7 +31,7 @@ import (
 func newTestIngest(t *testing.T) *ingest.Writer {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -116,10 +119,10 @@ func TestSegmentHandler_HandleRepoQueuesCompletionWithoutFlush(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 
 	segmentsDir := filepath.Join(dir, "segments")
 	cb := NewCompletionBatcher(bs, nil)
@@ -170,10 +173,10 @@ func TestSegmentHandler_MultiBlockRepoCompletesOnlyWithFinalBlock(t *testing.T) 
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	cb := NewCompletionBatcher(bs, nil)
 
 	const perBlock = 2
@@ -229,10 +232,10 @@ func TestSegmentHandler_HandleEmptyRepoRecordsEmptyWatermark(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	cb := NewCompletionBatcher(bs, nil)
 
 	w, err := ingest.Open(ingest.Config{
@@ -272,10 +275,10 @@ func TestSegmentHandler_QueuedCompletionBecomesDurableOnWriterClose(t *testing.T
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	bs := NewStore(st, nil)
+	bs := newSeededStore(t, st, nil)
 	cb := NewCompletionBatcher(bs, nil)
 
 	w, err := ingest.Open(ingest.Config{
@@ -441,6 +444,44 @@ func TestSegmentHandler_ResyncDropsInvalidPathOnceKeepsSiblings(t *testing.T) {
 		"the drop must be counted exactly once across pre-check and append walks")
 }
 
+// TestSegmentHandler_InvalidDataModelDropsRecordKeepsSiblings: a record
+// outside the atproto data model is dropped and counted once, on both the
+// full-repo and resync paths, and its siblings archive.
+func TestSegmentHandler_InvalidDataModelDropsRecordKeepsSiblings(t *testing.T) {
+	t.Parallel()
+
+	float, err := cbor.Marshal(map[string]any{"v": 1.5})
+	require.NoError(t, err)
+	str, err := cbor.Marshal(`{"$type":"app.bsky.feed.post"}`)
+	require.NoError(t, err)
+
+	for _, resync := range []bool{false, true} {
+		for name, bad := range map[string][]byte{"float": float, "string": str} {
+			w := newTestIngest(t)
+			dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())
+			h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			h.dropMetrics = dropMetrics
+
+			did := atmos.DID("did:plc:badmodel")
+			r, commit := buildHostileKeyRepo(t, did, "app.bsky.feed.post/good")
+			cid := cbor.ComputeCID(cbor.CodecDagCBOR, bad)
+			require.NoError(t, r.Store.PutBlock(cid, bad))
+			require.NoError(t, r.Tree.Insert("app.bsky.feed.post/bad", cid))
+
+			want := uint64(2)
+			if resync {
+				require.NoError(t, h.HandleRepoResync(t.Context(), did, r, commit), name)
+				want = 3 // the KindSync tombstone plus the good record
+			} else {
+				require.NoError(t, h.HandleRepo(t.Context(), did, r, commit), name)
+			}
+			require.Equal(t, want, w.NextSeq(), "%s resync=%v", name, resync)
+			require.InDelta(t, 1.0, testutil.ToFloat64(dropMetrics.Counter(ingest.DropSourceBackfill, ingest.DropReasonInvalidDataModel)), 0,
+				"%s resync=%v", name, resync)
+		}
+	}
+}
+
 // TestSegmentHandler_MissingDownloadedRecordBlockSurfacesError pins the
 // handler's post-fix contract for a missing record block. Completeness of a
 // downloaded full repo is now verified UPSTREAM, before HandleRepo runs:
@@ -515,4 +556,55 @@ func TestSplitRecordPath(t *testing.T) {
 		_, _, reason := splitRecordPath(tc.in)
 		require.Equal(t, tc.reason, reason, "input %q", tc.in)
 	}
+}
+
+// unfoldingSink never folds a closed block, so a hot writer stops admitting
+// appends once MaxUnfoldedEvents events have committed.
+type unfoldingSink struct{}
+
+func (unfoldingSink) BlockClosed(ingest.ClosedBlock) {}
+func (unfoldingSink) Rotate(context.Context) error   { return nil }
+
+// TestSegmentHandler_CancelledAppendIsNoWriterError pins the fix for a
+// disaggregated serve that died when the MaxRepos cap cancelled repos
+// blocked on writer backpressure: an append that stops waiting for room
+// because its repo's ctx ended abandons the repo without reporting a
+// writer failure, which would end the whole backfill run.
+func TestSegmentHandler_CancelledAppendIsNoWriterError(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		db := storagefake.New(storagefake.Config{})
+		lock := db.NewLease()
+		require.NoError(t, lock.Acquire(t.Context(), time.Hour))
+		s := catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: lock.Epoch()})
+		_, err := s.InitNamespace(t.Context(), catalog.Main, nil)
+		require.NoError(t, err)
+		w, err := ingest.Open(ingest.Config{
+			Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MaxEventsPerBlock: 4,
+			Hot:               &ingest.HotConfig{Session: s, Sink: unfoldingSink{}, MaxUnfoldedEvents: 4},
+		})
+		require.NoError(t, err)
+
+		h := NewSegmentHandler(w, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		var writerErr error
+		h.onWriterError = func(err error) { writerErr = err }
+
+		r, commit := buildMultiRecordRepo(t, "did:plc:fill", "app.bsky.feed.post", 8)
+		require.NoError(t, h.HandleRepo(t.Context(), "did:plc:fill", r, commit))
+		require.NoError(t, w.Flush(t.Context()))
+
+		r, commit = buildSingleRecordRepo(t, "did:plc:capped", "app.bsky.feed.post", "a", map[string]any{"text": "a"})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- h.HandleRepo(ctx, "did:plc:capped", r, commit) }()
+		synctest.Wait() // blocked over the unfolded cap
+		cancel()
+		err = <-done
+		require.ErrorIs(t, err, ingest.ErrAppendCancelled)
+		require.NoError(t, writerErr, "a cancelled wait must not abort the writer")
+		require.Equal(t, uint64(9), w.NextSeq(), "the cancelled repo appended nothing")
+		require.NoError(t, w.Close())
+		require.NoError(t, s.Err())
+	})
 }

@@ -1,0 +1,32 @@
+mutant: m072_sync_state_newest_pending_only
+target: internal/ingest/syncstate/store.go
+failure-mode: |
+  Promotion only considers a DID's newest pending state, as the one-slot
+  store did before specs/oracle/2026-09-26-disagg-pipelined-chain-state-hidden.md.
+  When the verifier has already saved state for a later event, the earlier
+  event's promotion makes nothing durable, so a batch commits its rows and a
+  cursor past it with the DID's state behind. After a crash the successor
+  resyncs needlessly or archives the event twice.
+expected-detection: |
+  TestStateStore_PipelinedSavesPromoteEach promotes the older of two pending
+  revs and requires it durable. The layer 3 lifecycle oracle found the bug
+  in about 4% of full and short runs, which is too rare for eight seeds to
+  kill reliably, so the unit test is the executioner.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/ingest/syncstate/store.go b/internal/ingest/syncstate/store.go
+index e851eaf..78a1671 100644
+--- a/internal/ingest/syncstate/store.go
++++ b/internal/ingest/syncstate/store.go
+@@ -138,8 +138,8 @@ func latestPending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID) (
+ func takePending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, max K) ([]byte, bool) {
+ 	q := m[did]
+ 	i := len(q) - 1
+-	for i >= 0 && q[i].key > max {
+-		i--
++	if i >= 0 && q[i].key > max {
++		i = -1
+ 	}
+ 	if i < 0 {
+ 		return nil, false

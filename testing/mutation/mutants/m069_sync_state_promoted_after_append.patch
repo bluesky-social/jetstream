@@ -1,0 +1,39 @@
+mutant: m069_sync_state_promoted_after_append
+target: internal/ingest/live/consumer.go
+failure-mode: |
+  Verifier sync state is promoted after Append returns instead of in the
+  writer's OnAppend hook for the event's last row (the S2.18 fix, see
+  specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md). A batch cut
+  between the append and the promotion holds the rows without their chain
+  state; if the leader dies before the next batch commits, the event is
+  redelivered and archived twice.
+expected-detection: |
+  TestConsumer_Hot_ChainStateCommitsWithLastRow cuts a batch at exactly
+  that point. The layer 3 oracle found the bug on full seeds 1, 2, 3, 5
+  and 6 (a whole event archived twice), but that depends on a batch cut
+  landing in the gap, so the unit test is the reliable executioner.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/ingest/live/consumer.go b/internal/ingest/live/consumer.go
+--- a/internal/ingest/live/consumer.go
++++ b/internal/ingest/live/consumer.go
+@@ -123,9 +123,6 @@ func Open(cfg Config) (*Consumer, error) {
+ 				case segment.KindIdentity:
+ 					ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+ 				}
+-				if m := c.promoteAt.Load(); m != nil && m.row == ev {
+-					c.promoteSyncState(m.group)
+-				}
+ 			}
+ 			return nil
+ 		}
+@@ -750,7 +747,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
+ 				}
+ 			}
+ 
+-			if lastKept < 0 {
++			if lastKept >= -1 {
+ 				// No row to carry it: nothing of this event can be
+ 				// durable, so the promotion's timing does not matter.
+ 				c.promoteSyncState(segEvts)

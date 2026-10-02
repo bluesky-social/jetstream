@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -41,15 +42,16 @@ func TestCompaction_StoreFaultOnWatermarkSave_FailsLoudNoAdvance(t *testing.T) {
 	require.NoError(t, os.MkdirAll(segmentsDir, 0o755))
 
 	injected := errors.New("injected: compaction watermark save failed")
-	fault := &store.KeyPrefixFault{
+	fault := &metastore.KeyPrefixFault{
 		Prefix:  []byte(compactionWatermarkKey),
-		Op:      store.WriteOpSet,
+		Op:      metastore.WriteOpSet,
 		Ordinal: 1,
 		Err:     injected,
 	}
-	st, err := store.Open(dataDir, nil, store.WithFaultInjector(fault))
+	stRaw, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = stRaw.Close() })
+	st := metastore.WithFaults(stRaw, fault)
 
 	// A create superseded by a delete: the merge-tail pass rewrites the segment
 	// (dropping the create) and then advances the watermark to seq 2 — the Set

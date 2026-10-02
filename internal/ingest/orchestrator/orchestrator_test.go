@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,7 +31,7 @@ func TestRun_EndToEnd_BootstrapToSteadyState(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -57,7 +57,7 @@ func TestRun_EndToEnd_BootstrapToSteadyState(t *testing.T) {
 
 	// Wait for the transition to steady_state.
 	require.Eventually(t, func() bool {
-		got, err := lifecycle.ReadPhase(st)
+		got, err := lifecycle.ReadPhase(t.Context(), st)
 		return err == nil && got == lifecycle.PhaseSteadyState
 	}, 10*time.Second, 50*time.Millisecond, "phase did not reach steady_state")
 
@@ -89,7 +89,7 @@ func TestRun_SteadyState_WithFailedRepoRetryWired(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -115,7 +115,7 @@ func TestRun_SteadyState_WithFailedRepoRetryWired(t *testing.T) {
 	go func() { done <- o.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
-		got, err := lifecycle.ReadPhase(st)
+		got, err := lifecycle.ReadPhase(t.Context(), st)
 		return err == nil && got == lifecycle.PhaseSteadyState
 	}, 10*time.Second, 50*time.Millisecond, "phase did not reach steady_state")
 
@@ -132,7 +132,7 @@ func TestRun_BarrierAfterBootstrapBlocksBeforeMerge(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -170,13 +170,13 @@ func TestRun_BarrierAfterBootstrapBlocksBeforeMerge(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("barrier not reached")
 	}
-	phase, err := lifecycle.ReadPhase(st)
+	phase, err := lifecycle.ReadPhase(t.Context(), st)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle.PhaseMerging, phase)
 
 	close(release)
 	require.Eventually(t, func() bool {
-		phase, err := lifecycle.ReadPhase(st)
+		phase, err := lifecycle.ReadPhase(t.Context(), st)
 		return err == nil && phase == lifecycle.PhaseSteadyState
 	}, 5*time.Second, 20*time.Millisecond)
 	cancel()

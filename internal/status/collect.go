@@ -4,23 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/version"
-	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/identity"
 )
@@ -55,28 +52,28 @@ func collectProcess(now time.Time, startedAt time.Time) ProcessInfo {
 	}
 }
 
-func collectPhase(s *store.Store) (PhaseInfo, error) {
-	p, err := lifecycle.ReadPhase(s)
+func collectPhase(s metastore.Store) (PhaseInfo, error) {
+	p, err := lifecycle.ReadPhase(context.Background(), s)
 	if err != nil {
 		return PhaseInfo{}, err
 	}
-	at, err := lifecycle.ReadPhaseEnteredAt(s)
+	at, err := lifecycle.ReadPhaseEnteredAt(context.Background(), s)
 	if err != nil {
 		return PhaseInfo{}, err
 	}
 	return PhaseInfo{Phase: p, PhaseEnteredAt: at}, nil
 }
 
-func collectLive(s *store.Store, now time.Time, lastSeen func() time.Time, writer func() *ingest.Writer) (LiveStats, error) {
+func collectLive(s metastore.Store, now time.Time, lastSeen func() time.Time, writer func() *ingest.Writer) (LiveStats, error) {
 	cur, err := live.LoadUpstreamCursor(s, live.CursorKey)
 	if err != nil {
 		return LiveStats{}, err
 	}
-	nextSeq, _, err := s.GetUint64LE(live.SteadySeqKey)
+	nextSeq, _, err := metastore.GetUint64LE(context.Background(), s, live.SteadySeqKey)
 	if err != nil {
 		return LiveStats{}, err
 	}
-	bootSeq, _, err := s.GetUint64LE(live.BootstrapSeqKey)
+	bootSeq, _, err := metastore.GetUint64LE(context.Background(), s, live.BootstrapSeqKey)
 	if err != nil {
 		return LiveStats{}, err
 	}
@@ -99,7 +96,7 @@ func collectLive(s *store.Store, now time.Time, lastSeen func() time.Time, write
 	return stats, nil
 }
 
-func collectBackfill(s *store.Store) (BackfillStats, error) {
+func collectBackfill(s metastore.Store) (BackfillStats, error) {
 	counts, err := backfill.CountStatuses(s)
 	if err != nil {
 		return BackfillStats{}, err
@@ -108,7 +105,7 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	if err != nil {
 		return BackfillStats{}, err
 	}
-	timing, err := lifecycle.ReadBackfillTiming(s)
+	timing, err := lifecycle.ReadBackfillTiming(context.Background(), s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -134,12 +131,12 @@ func collectBackfill(s *store.Store) (BackfillStats, error) {
 	}, nil
 }
 
-func collectBackfillFast(s *store.Store) (BackfillStats, error) {
+func collectBackfillFast(s metastore.Store) (BackfillStats, error) {
 	fleet, err := collectBackfillFleet(s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
-	timing, err := lifecycle.ReadBackfillTiming(s)
+	timing, err := lifecycle.ReadBackfillTiming(context.Background(), s)
 	if err != nil {
 		return BackfillStats{}, err
 	}
@@ -174,7 +171,7 @@ func collectBackfillFast(s *store.Store) (BackfillStats, error) {
 
 const backfillTopRemainingHosts = 10
 
-func collectBackfillFleet(s *store.Store) (BackfillStats, error) {
+func collectBackfillFleet(s metastore.Store) (BackfillStats, error) {
 	hosts, err := backfill.ListPDSHosts(s)
 	if err != nil {
 		return BackfillStats{}, err
@@ -261,7 +258,7 @@ func normalizeRequest(req Request) Request {
 	return req
 }
 
-func collectHosts(s *store.Store, sortBy string) (HostDiagnostics, error) {
+func collectHosts(s metastore.Store, sortBy string) (HostDiagnostics, error) {
 	statuses, err := backfill.ListHostStatuses(s)
 	if err != nil {
 		return HostDiagnostics{}, err
@@ -335,7 +332,7 @@ func hostRowFromBackfill(hs *backfill.HostStatus) HostRow {
 	return row
 }
 
-func collectAccount(ctx context.Context, s *store.Store, resolver identity.Resolver, req Request) AccountLookup {
+func collectAccount(ctx context.Context, s metastore.Store, resolver identity.Resolver, req Request) AccountLookup {
 	acct := AccountLookup{}
 	var did atmos.DID
 	var ok bool
@@ -503,82 +500,48 @@ func collectionsFromManifest(ms manifest.SegmentTreeStats) map[string]*Collectio
 	return out
 }
 
-func collectManifestSegmentAggregate(ms manifest.SegmentTreeStats, roots []string) (*SegmentAggregate, error) {
-	tree := treeFromManifest(ms)
-	collections := collectionsFromManifest(ms)
-
-	activeTail, tailWarnings, err := scanActiveTail(roots[0], collections)
-	if err != nil {
-		return nil, err
+// collectSegmentAggregate builds the two segment trees, main then
+// bootstrap_live. Main's sealed segments come from the manifest when there
+// is one, which keeps their stats resident; everything else is read
+// through the archive's catalog view.
+func collectSegmentAggregate(ctx context.Context, opts Options) (*SegmentAggregate, error) {
+	mainDir, liveDir := string(catalog.Main), string(catalog.BootstrapLive)
+	if opts.DataDir != "" {
+		mainDir = filepath.Join(opts.DataDir, "segments")
+		liveDir = filepath.Join(opts.DataDir, "backfill", "live_segments")
 	}
-	mergeTree(&tree, activeTail)
+	mainTree := TreeAggregate{Dir: mainDir}
+	liveTree := TreeAggregate{Dir: liveDir}
+	collections := make(map[string]*CollectionAggregate)
+	if opts.Manifest != nil {
+		ms := opts.Manifest.SegmentStats()
+		mainTree = treeFromManifest(ms)
+		collections = collectionsFromManifest(ms)
+	}
 
-	liveTree, liveWarnings, err := scanTree(roots[1], InspectAllOptions{}, collections)
-	if err != nil {
-		return nil, err
+	var warnings []string
+	if opts.Archive != nil {
+		view := opts.Archive.Snapshot()
+		tail, mainWarnings, err := treeFromView(ctx, opts.Archive, view, catalog.Main, mainDir, opts.Manifest != nil, collections)
+		if err != nil {
+			return nil, err
+		}
+		mergeTree(&mainTree, tail)
+		live, liveWarnings, err := treeFromView(ctx, opts.Archive, view, catalog.BootstrapLive, liveDir, false, collections)
+		if err != nil {
+			return nil, err
+		}
+		liveTree = live
+		warnings = append(mainWarnings, liveWarnings...)
 	}
 
 	agg := &SegmentAggregate{
-		Trees: []TreeAggregate{
-			tree,
-			liveTree,
-		},
-		Warnings: append(tailWarnings, liveWarnings...),
+		Trees:    []TreeAggregate{mainTree, liveTree},
+		Warnings: warnings,
 	}
 	agg.Collections = materializeCollections(collections)
 	agg.Network = computeNetworkTotals(agg.Trees, len(agg.Collections))
 	return agg, nil
-}
-
-func scanActiveTail(root string, collections map[string]*CollectionAggregate) (TreeAggregate, []string, error) {
-	tree := TreeAggregate{Dir: root}
-	files, err := ingest.SegmentFiles(root)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return tree, nil, nil
-		}
-		return TreeAggregate{}, nil, err
-	}
-	if len(files) == 0 {
-		return tree, nil, nil
-	}
-
-	tail := files[len(files)-1]
-	info, err := os.Stat(tail.Path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return tree, nil, nil
-		}
-		return TreeAggregate{}, nil, fmt.Errorf("status: stat %s: %w", tail.Path, err)
-	}
-	ins, inspectErr := segment.Inspect(tail.Path)
-	if inspectErr != nil {
-		// Same tolerance as InspectAll: the tail can be mid-rotation.
-		return tree, nil, nil //nolint:nilerr
-	}
-	if ins.Sealed {
-		return tree, nil, nil
-	}
-
-	tree.OldestMTime = info.ModTime()
-	tree.NewestMTime = info.ModTime()
-	tree.ActiveCount = 1
-	tree.DiskBytes = ins.FileSize
-	tree.LatestSegment = &SegmentSummary{
-		Index:           tail.Idx,
-		Sealed:          false,
-		EventCount:      ins.TotalEvents,
-		UniqueDIDCount:  ins.UniqueDIDCount,
-		BlockCount:      uint32(len(ins.Blocks)),
-		CollectionCount: len(ins.Collections),
-		MinSeq:          ins.MinSeq,
-		MaxSeq:          ins.MaxSeq,
-		MinWitnessedAt:  microsToTime(ins.MinWitnessedAt),
-		MaxWitnessedAt:  microsToTime(ins.MaxWitnessedAt),
-		SizeBytes:       ins.FileSize,
-	}
-	foldInspection(&tree, ins, collections)
-	return tree, nil, nil
 }
 
 func mergeTree(dst *TreeAggregate, src TreeAggregate) {
@@ -615,29 +578,16 @@ func mergeTree(dst *TreeAggregate, src TreeAggregate) {
 	}
 }
 
-func collectPebble(s *store.Store, dataDir string) (PebbleStats, error) {
+func collectPebble(s metastore.Store) (PebbleStats, error) {
 	stats := PebbleStats{KeyspaceCounts: make(map[string]uint64, len(keyspacePrefixes))}
 
-	// On-disk size of meta.pebble/.
-	pebbleDir := filepath.Join(dataDir, store.PebbleSubdir)
-	if err := filepath.WalkDir(pebbleDir, func(_ string, d fs.DirEntry, err error) error {
+	// On-disk size of meta.pebble/; zero for stores without a local footprint.
+	if d, ok := metastore.DiskStatsOf(s); ok {
+		n, err := d.DiskBytes()
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return fs.SkipAll
-			}
-			return err
+			return PebbleStats{}, fmt.Errorf("status: metadata disk bytes: %w", err)
 		}
-		if d.IsDir() {
-			return nil
-		}
-		fi, err := d.Info()
-		if err != nil {
-			return err
-		}
-		stats.DiskBytes += fi.Size()
-		return nil
-	}); err != nil {
-		return PebbleStats{}, fmt.Errorf("status: walk %s: %w", pebbleDir, err)
+		stats.DiskBytes = n
 	}
 
 	// Per-prefix key counts.
@@ -655,24 +605,19 @@ func collectPebbleFast() PebbleStats {
 	return PebbleStats{KeyspaceCounts: make(map[string]uint64, len(keyspacePrefixes))}
 }
 
-func countKeysWithPrefix(s *store.Store, prefix string) (uint64, error) {
+func countKeysWithPrefix(s metastore.Store, prefix string) (uint64, error) {
 	lower := []byte(prefix)
-	upper := store.PrefixUpperBound(lower)
-
-	it, err := s.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
+	it, err := s.NewIter(context.Background(), lower, metastore.PrefixUpperBound(lower))
 	if err != nil {
 		return 0, fmt.Errorf("status: open iter %q: %w", prefix, err)
 	}
 	defer func() { _ = it.Close() }()
 
 	var n uint64
-	for it.First(); it.Valid(); it.Next() {
+	for it.Next() {
 		n++
 	}
-	if err := it.Error(); err != nil {
+	if err := it.Err(); err != nil {
 		return 0, fmt.Errorf("status: iter %q: %w", prefix, err)
 	}
 	return n, nil
@@ -706,19 +651,26 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		pdb PebbleStats
 	)
 
-	roots := []string{
-		filepath.Join(opts.DataDir, "segments"),
-		filepath.Join(opts.DataDir, "backfill", "live_segments"),
+	// A disaggregated archive loads its manifest on the first steady-state
+	// catalog tick (design §11.3), so during bootstrap and merge waiting on
+	// it would never return. The archive view holds every segment then.
+	fast := opts.Manifest != nil
+	archiveReady := true
+	if opts.ArchiveReady != nil {
+		if err := opts.ArchiveReady(ctx); errors.Is(err, lifecycle.ErrBootstrapInProgress) {
+			opts.Manifest = nil
+		} else if err != nil {
+			archiveReady = false
+		}
 	}
-	if opts.Manifest != nil {
-		if err := opts.Manifest.Wait(ctx); err != nil {
-			return nil, err
+
+	if fast {
+		if opts.Manifest != nil {
+			if err := opts.Manifest.Wait(ctx); err != nil {
+				return nil, err
+			}
 		}
 		bf, err = collectBackfillFast(opts.Store)
-		if err != nil {
-			return nil, err
-		}
-		agg, err = collectManifestSegmentAggregate(opts.Manifest.SegmentStats(), roots)
 		if err != nil {
 			return nil, err
 		}
@@ -728,14 +680,19 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		if err != nil {
 			return nil, err
 		}
-		agg, err = InspectAll(roots, InspectAllOptions{})
+		pdb, err = collectPebble(opts.Store)
 		if err != nil {
 			return nil, err
 		}
-		pdb, err = collectPebble(opts.Store, opts.DataDir)
-		if err != nil {
+	}
+	if !archiveReady {
+		if err := opts.ArchiveReady(ctx); err != nil {
 			return nil, err
 		}
+	}
+	agg, err = collectSegmentAggregate(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
 	if len(agg.Trees) != 2 {
 		return nil, fmt.Errorf("status: segment aggregate has %d trees, expected 2 (segments + backfill/live_segments); the /status template assumes this shape", len(agg.Trees))
@@ -749,12 +706,6 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 		Live:             liveStats,
 		SegmentAggregate: agg,
 		Pebble:           pdb,
-	}
-
-	if opts.ImportReporter != nil {
-		if info, ok := opts.ImportReporter.CurrentImport(); ok {
-			snap.Import = &info
-		}
 	}
 
 	snap.CursorLookback.ConfiguredLookback = opts.CursorLookback

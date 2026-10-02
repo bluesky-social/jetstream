@@ -36,11 +36,19 @@ type Config struct {
 	SlowWindow       time.Duration // 0 -> DefaultSlowWindow
 	SlowMinRate      float64       // 0 -> DefaultSlowMinRate
 	SlowLagThreshold uint64        // 0 -> DefaultSlowLagThreshold
+
+	// ColdEventsPerSec caps the events per second this process serves from
+	// cold reads, summed over all subscribers, so that replays cannot starve
+	// the live tail of CPU. 0 means unlimited.
+	ColdEventsPerSec float64
 }
 
 func (c *Config) validate() error {
 	if c.Logger == nil {
 		return fmt.Errorf("%w: Logger is required", ErrInvalidConfig)
+	}
+	if c.ColdEventsPerSec < 0 {
+		return fmt.Errorf("%w: ColdEventsPerSec must not be negative", ErrInvalidConfig)
 	}
 	return nil
 }

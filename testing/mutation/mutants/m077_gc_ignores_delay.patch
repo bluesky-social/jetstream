@@ -1,0 +1,27 @@
+mutant: m077_gc_ignores_delay
+target: internal/objstore/protocol/gc.go
+failure-mode: |
+  The collector claims objects as soon as they are unreferenced instead
+  of after GC_DELAY (design §13). A reader that planned from a
+  generation just before compaction replaced it, or a follower whose view
+  is a few seconds old, finds the objects gone mid-download: the archive
+  handshake the client was promised fails.
+expected-detection: |
+  The layer 3 oracle's held reader re-reads every replaced generation
+  just before GC_DELAY runs out and requires the same rows.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/objstore/protocol/gc.go b/internal/objstore/protocol/gc.go
+index a8906f9..cd6f6bf 100644
+--- a/internal/objstore/protocol/gc.go
++++ b/internal/objstore/protocol/gc.go
+@@ -123,7 +123,7 @@ func (c *Collector) Run(ctx context.Context, s *catalog.Session, db catalog.DB)
+ 	}
+ 
+ 	for {
+-		rows, err := s.GCClaim(ctx, c.cfg.Delay, c.cfg.OrphanAge, c.cfg.ClaimLimit)
++		rows, err := s.GCClaim(ctx, 0, c.cfg.OrphanAge, c.cfg.ClaimLimit)
+ 		if err != nil {
+ 			return res, fmt.Errorf("protocol: gc claim: %w", err)
+ 		}

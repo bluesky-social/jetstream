@@ -26,3 +26,5 @@ profile.cov
 # Docker bookkeeping
 Dockerfile
 .dockerignore
+compose.yaml
+compose.override.yaml

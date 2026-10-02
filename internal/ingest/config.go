@@ -5,25 +5,17 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/segment"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
-// DurableBatchHook stages block-specific metadata into the same synced Pebble
+// DurableBatchHook stages block-specific metadata into the same metadata
 // batch that persists the writer's next sequence after a segment block is
 // durable. prepareValue is the value sampled by DurableBatchPrepareValue before
 // the block was detached/flushed.
-type DurableBatchHook func(ctx context.Context, b *pebble.Batch, nextSeq uint64, force bool, prepareValue any) (afterCommit func(), afterDone func(error), err error)
-
-// TimestampStamper applies imported display timestamps to materialization rows
-// before they are buffered into a segment. Implementations must be cheap for
-// collections with no imported rules and must return lookup failures instead
-// of silently falling back to witnessed_at.
-type TimestampStamper interface {
-	Stamp(ctx context.Context, ev *segment.Event) error
-}
+type DurableBatchHook func(ctx context.Context, b metastore.Batch, nextSeq uint64, force bool, prepareValue any) (afterCommit func(), afterDone func(error), err error)
 
 // defaultMaxSegmentBytes is the rotation threshold. docs/README.md §3.1.1
 // names ~256MB as the target sealed-segment size. Operator-tunable
@@ -48,8 +40,13 @@ type Config struct {
 	// filesystem.
 	FS vfs.FS
 
-	// Store is the shared metadata pebble db. Required.
-	Store *store.Store
+	// Store is the shared metadata store. Required.
+	//
+	// The writer also keeps its sequence lease here (seq/max_reserved and the
+	// seq/gap/ registry, docs/README.md §10.1). The lease is a local-mode
+	// mechanism: it assumes this process is the only writer of SeqKey, which
+	// disaggregated mode guarantees differently (fenced leader epochs).
+	Store metastore.Store
 
 	// MaxSegmentBytes is the rotation threshold in compressed bytes
 	// after the 256-byte reserved header. Default 256<<20 when zero.
@@ -70,11 +67,6 @@ type Config struct {
 	// this budget. Zero is legal and means "retain only pinned events". Negative
 	// values are rejected.
 	ReadLogRetentionBytes int64
-
-	// TimestampStamper applies imported display timestamps before
-	// materialization rows enter the segment or readable log. Timestamps
-	// must be persisted with the event, not overlaid during reads.
-	TimestampStamper TimestampStamper
 
 	// SeqKey is the pebble key holding the writer's seq counter.
 	// Default "seq/next" preserves backfill-writer behavior. The
@@ -97,6 +89,12 @@ type Config struct {
 	// after either outcome. All three run under the writer mutex: do not
 	// call Writer methods or perform unbounded I/O.
 	//
+	// In hot mode one transaction may commit several consecutive batches
+	// (group commit, design §10.5): the hook runs for each, in order, before
+	// the transaction; then each batch's afterCommit runs in order, then
+	// each afterDone. A hook must not assume that the next hook call means
+	// the previous batch failed; afterDone reports that.
+	//
 	// force requests a checkpoint without a new block on DrainDurability,
 	// Close, or SealActiveAndClose. It does not make pending events
 	// durable. Metadata tied to events must still be gated by nextSeq.
@@ -109,33 +107,37 @@ type Config struct {
 	// metadata that must be tied to the block's prepare-time view, such as the
 	// live relay cursor watermark.
 	//
+	// Every sample reaches OnDurableBatch, in sample order, unless the writer
+	// fails first, so a sampler may hand out deltas.
+	//
 	// The sampler must not call back into the Writer and must be cheap.
 	DurableBatchPrepareValue func() any
 
 	// OnAppend runs under the writer mutex after seq assignment and
 	// before any flush or seal. Observers therefore see every event
-	// before a sealed header can expose its seq. An error fails Append.
+	// before a sealed header can expose its seq. An error fails Append;
+	// in hot mode it also fails the writer before the event is buffered,
+	// so the event never commits.
 	// The hook runs per event: keep it cheap and do not call Writer
 	// methods.
 	OnAppend func(ev *segment.Event) error
 
-	// OnAfterSeal, if non-nil, runs after a successful segment seal
-	// during rotation or SealActiveAndClose: segment.Writer.Seal has
-	// fsynced the footer and finalized the fixed header before this
-	// hook fires. The hook receives the just-sealed segment's numeric
-	// index and on-disk path. Errors propagate up through the caller;
-	// the segment file is sealed and closed by Seal before this hook
-	// runs, so a hook failure leaves the writer with no usable active
-	// segment. Callers that want to recover should Close the writer
-	// and reopen.
+	// Catalog, if non-nil, is attached to the active segment at Open and
+	// receives each sealed segment's view after segment.Writer.Seal has
+	// fsynced its footer and finalized header. A publish error propagates
+	// up through the caller; the segment is already sealed and closed, so
+	// the writer has no usable active segment and callers that want to
+	// recover should Close and reopen.
 	//
-	// Used by internal/manifest to publish the newly-sealed segment
-	// into its in-memory bounds slice without polling the directory.
-	//
-	// Hooks must not call back into the Writer (that would deadlock
-	// on the writer mutex) or perform unbounded I/O (that would stall
-	// every Append in the active worker pool).
-	OnAfterSeal func(idx uint64, path string) error
+	// catalog/local implements it for the serving catalog and the manifest.
+	// Implementations must not call back into the Writer (that would
+	// deadlock on the writer mutex) or perform unbounded I/O (that would
+	// stall every Append).
+	Catalog SegmentCatalog
+
+	// Namespace labels this writer's segments in Catalog. Default
+	// catalog.Main.
+	Namespace catalog.Namespace
 
 	// Logger is required (no sensible default for an ingestion
 	// component whose failure modes need visibility).
@@ -151,9 +153,28 @@ type Config struct {
 	// SegmentIOFaultInjector is a test-only seam forwarded to segment.Writer.
 	// Nil in production.
 	SegmentIOFaultInjector segment.IOFaultInjector
+
+	// Hot, if non-nil, opens the writer in disaggregated hot mode (design
+	// §10.3): events commit to the catalog as hot batches instead of going to
+	// a local segment file. SegmentsDir, FS, Store, MaxSegmentBytes,
+	// AsyncFlushWorkers, and Catalog are unused, and the seq lease is off.
+	Hot *HotConfig
+
+	// Direct, if non-nil, opens the writer in disaggregated direct mode
+	// (design §10.6): full blocks commit to the catalog's active segment in
+	// Namespace, as bootstrap and merge write. The same local-only fields
+	// as Hot's are unused, SeqKey is the namespace's, and the seq lease is
+	// off. Hot and Direct are exclusive.
+	Direct *DirectConfig
 }
 
 func (c *Config) validate() error {
+	if c.Direct != nil {
+		return c.validateDirect()
+	}
+	if c.Hot != nil {
+		return c.validateHot()
+	}
 	if c.SegmentsDir == "" {
 		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
 	}
@@ -184,6 +205,9 @@ func (c *Config) validate() error {
 	if c.UnreservedSeqsUnobservable && !c.ReserveClientVisibleSeqs {
 		return fmt.Errorf("%w: UnreservedSeqsUnobservable requires ReserveClientVisibleSeqs", ErrInvalidConfig)
 	}
+	if c.Namespace != "" && !c.Namespace.Valid() {
+		return fmt.Errorf("%w: unknown Namespace %q", ErrInvalidConfig, c.Namespace)
+	}
 	if c.ReadLogRetentionBytes < 0 {
 		return fmt.Errorf("%w: ReadLogRetentionBytes must be >= 0 (got %d)",
 			ErrInvalidConfig, c.ReadLogRetentionBytes)
@@ -200,5 +224,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SeqKey == "" {
 		c.SeqKey = "seq/next"
+	}
+	if c.Namespace == "" {
+		c.Namespace = catalog.Main
 	}
 }

@@ -98,7 +98,7 @@ The driver uses phase gates, durable append callbacks, sequence acknowledgers, a
 
 Observers collect what Jetstream produced through different surfaces:
 
-- filesystem segment observer: reads active and sealed segment files directly;
+- storage segment observer (`internal/oracle/segments.go`, `catalog_observer.go`): reads each namespace through the storage-neutral read path — a fresh `catalog/local` catalog, `CatalogView.RefsFrom`, and its `Fetcher` — and cross-checks the result against a direct path walk of the segment files, which also runs the sealed structure and footer-metadata checks. In local mode the two must agree segment by segment; a disagreement fails the observation rather than picking one side. Observations taken while the server runs (the over-drop recorder's sealed-only scans, the compaction bisection) use a live cross-check that allows only what a running writer explains: newer segments, a grown or newly sealed tail, and, where a compaction pass may race the scan, rows removed from a sealed segment;
 - event-log recorder: captures lifecycle hook events keyed by upstream relay cursor;
 - `/subscribe` replay observer: reads public websocket replay and live-tail behavior;
 - XRPC segment observer: downloads public archive segments and decodes bytes as a client would;
@@ -205,11 +205,11 @@ The first coverage lives in `TestOracle_PowerLossStrictMemDropsUnsyncedState` pl
 
 The default lifecycle also installs a durable-operation recorder: segment operations are observed through the storage VFS and metadata commits through the store write seam. Its checker requires active-segment data writes to be followed by a sync of the same segment file before the covering `seq/next` / `live_segments/seq/next` Pebble commit, and requires segment rewrites to be followed by a parent-directory sync before `compaction/seq` can claim the rewrite. The focused ingest test uses the same important distinction: an initial empty-header fsync is not evidence that a later block write reached the durability boundary.
 
-Mutation coverage for this tier is catalogued as m046-m050: block fsync deletion, Rewrite parent-dir fsync deletion, Patch parent-dir fsync deletion, inverted ingest flush ordering, and Linux `store.SyncWrites` downgraded to `pebble.NoSync`. The `powerloss` mutation tier runs the strict-mem and operation-order tests; Rewrite/Patch parent-dir fsync omissions are also covered by the existing `segmentfault` seam-count sweeps.
+Mutation coverage for this tier is catalogued as m046-m050: block fsync deletion, Rewrite parent-dir fsync deletion, inverted ingest flush ordering, and Linux `store.SyncWrites` downgraded to `pebble.NoSync` (m048, the Patch parent-dir fsync deletion, was retired when `segment.Patch` was removed with timestamp import). The `powerloss` mutation tier runs the strict-mem and operation-order tests; the Rewrite parent-dir fsync omission is also covered by the existing `segmentfault` seam-count sweep.
 
 `TestOracle_PowerLossCrashPointsStrictMem` drives the full runtime in-process with `jetstreamd.Options.StorageFS`, resets the shared strict FS at enumerated lifecycle crashpoints, reopens the runtime, and reuses the FS-aware segment observers to prove convergence. Runtime-level coverage spans repo completion (including seeded non-first ordinals), bootstrap-live close before seal, merge destination flush before source cursor commit, merge destination seal before discovery, merge discovery before cleanup, and steady-phase commit before the steady-state consumer starts. `TestOracle_PowerLossSeededRandomCrashPointsStrictMem` adds deterministic random selection over that lifecycle matrix so fixed case order is not the only exercised shape.
 
-Compaction and timestamp-import use caller-level strict-FS tests because those crashpoints are owned by orchestrator paths rather than the normal lifecycle runtime. `TestRunDeleteCompaction_StrictMemPowerLossRewriteCrashpoints` covers every `segment.Rewrite` temp-write/temp-fsync/rename/dir-fsync seam through merge-tail delete compaction, while `TestRunDeleteCompaction_StrictMemPowerLossCompactionCrashpoints` covers the compaction watermark checkpoints before and after the durable metadata commit. `TestRunImport_StrictMemPowerLossPatchCrashpoints` covers every `segment.Patch` temp-write/temp-fsync/rename/dir-fsync seam through `RunImport`, the production timestamp-import path. Keep the real filesystem restart tier in place; the strict tier models power loss, not process isolation, OS locks, or syscall-boundary behavior.
+Compaction uses caller-level strict-FS tests because its crashpoints are owned by orchestrator paths rather than the normal lifecycle runtime. `TestRunDeleteCompaction_StrictMemPowerLossRewriteCrashpoints` covers every `segment.Rewrite` temp-write/temp-fsync/rename/dir-fsync seam through merge-tail delete compaction, while `TestRunDeleteCompaction_StrictMemPowerLossCompactionCrashpoints` covers the compaction watermark checkpoints before and after the durable metadata commit. Keep the real filesystem restart tier in place; the strict tier models power loss, not process isolation, OS locks, or syscall-boundary behavior.
 
 ### Store-Fault Tier
 
@@ -224,18 +224,52 @@ into a real restart-child runtime, with the same fail-loud observed-marker
 protocol and recovery-convergence bundle. It proves fail-loud on the active
 writer's open/flush paths, ENOSPC end-to-end including the disk-full operator
 message on `rt.Run`'s error, and the compaction-rewrite path (rename faults
-are deterministic — only Patch/Rewrite rename, and the restart child's only
+are deterministic — only Rewrite renames, and the restart child's only
 rewrite driver is merge-tail compaction). A companion torn-tail sweep
 SIGKILLs a child mid-backfill, mutates the active segment's un-fsynced tail
 (truncated length prefix / torn frame with hostile garbage body), and
 requires strict recovery convergence through the torn-tail walk.
-Import-patch faults are covered at the orchestrator level (RunImport drives
-the identical Patch seam; the restart child never runs an operator-submitted
-XRPC import), and the segment package pins every seam consult with
-exhaustive (op, ordinal) sweeps over Patch and Rewrite. Gated by the
+The segment package pins every seam consult with an exhaustive
+(op, ordinal) sweep over Rewrite. Gated by the
 `segmentfault` mutation tier (m044, m045). The tier's first run flushed out
 the pre-existing #262 data-loss bug; its deterministic repro is the skipped
 `write-shortwrite-first-flush` case.
+
+### Disaggregated Storage Tier
+
+Layer 3 of the disaggregated-storage design (`specs/notes/2026-09-25-disaggregated-storage-v2-design.md` §20). It lives in `internal/oracle/disagg_oracle_test.go`, `disagg_lifecycle_test.go`, and `disagg_compaction_test.go`. It runs several real `jetstreamd` runtimes in disaggregated mode, on in-process pipe listeners, against one `storagefake` catalog and one `memblob` store. Leader pods compete for the lease. Reader pods never acquire it and serve v1 and v2 websockets and archive downloads. Every storage and blob call passes through the seeded scheduler (`storagefake.Seeded`). Each pod has its own `storagefake.Client`, so a killed pod's connections die at once. The whole run lives in the process's one synctest bubble, so each seed runs as a re-executed child of `TestDisagg_Oracle`.
+
+The run starts from a catalog that `jetstream storage init` just created and takes it through the whole lifecycle (plan S3.5), killing the leader in each phase:
+
+- **Bootstrap.** A kill after a repo completes, then, in seeded order: kills at each direct-mode block seam (after cut, after upload before commit, after commit before ack), a block commit applied but reported failed, a kill after a seal footer upload, and lease expiry. A listRepos gate (`disaggListGate`) lets backfill list only its first PDS until the faults have fired, so bootstrap cannot finish under them. The oracle then releases the gate and holds the leader at the cutover barrier while it generates more traffic. It checks that `main` and `bootstrap_live` together reconstruct the world, less the repos a kill deferred to merge's pending pass.
+- **Merging.** A kill between closing `bootstrap_live` and sealing it, then one at each merge crashpoint in order. After merge, `main` alone must reconstruct the world with dense seqs and a matching `seq/next`, `bootstrap_live` and its keys must be gone, and every row generated after backfill must survive. A kill between a source's flush and its cursor commit re-drains that source at new seqs (at-least-once), so the rev-order check is then skipped over the merged prefix.
+- **Steady state.** `main` as merge left it becomes the model's prefix. Then waves of simulator traffic play, and each wave arms one fault from the seed's plan: a leader killed at one of five crash seams (after cut, after upload, after commit, after fold upload, after seal footer upload), commit applied but reported failed, lease expiry, a stale leader writing after its successor, an S3 PUT error, S3 PUT or GET returning wrong bytes, a lost NOTIFY, a slow reader, or a leader killed in compaction or GC (after a rewrite's upload, after its publish, after a chunk's watermark, and after each GC step: mark, claim, delete). A fault must be proven to have fired. A wave that has not fired its fault gets extra traffic, bounded, and then fails. A crashed leader is replaced by a fresh pod. The catalog invariants run after every transaction, and any recorded violation fails the run.
+
+Every pod runs delete compaction and GC with fake-clock intervals of seconds (plan S4.4), so sealed segments are rewritten under the readers while the waves run. Compaction removes rows, so no single read of the catalog holds the whole model. The harness keeps an **archive union** instead: every `main` row it has ever read, by seq. The leader's `OnBeforeCompactionPass` hook reads the catalog before each pass rewrites anything, so no row is dropped before the union holds it, and a seq read twice must hold the same row both times.
+
+Checks, after each wave converges and again at the end:
+
+- The archive union is checked against the model. Seqs are dense from 1. Each DID's events are exactly the model's, in order. The union also passes `CheckInvariants`, and its reconstruction matches `GroundTruthFromWorld`.
+- Every reader's stream is checked against the union with the **drop rule**: a create, update, or resync create may be missing once a later record or DID tombstone in (merge floor, W] supersedes it. Seqs strictly increase, every row served is the union's row at that seq (payload and witness time included), and every seq skipped is droppable. A v2 stream must also fold to what the union folds to (`CheckFoldConvergence`) and reconstruct the world. A v1 stream must be an in-order subsequence of the union's v1 projection that skips only droppable rows.
+- After the last wave, the oracle waits until W reaches `main`'s last seq. Then `main`, and a fresh client download from every live pod, must hold exactly the union's non-droppable rows (`CheckCompacted`, the `assertCompacted` analog).
+- A **held reader** with its own follower reads each replaced generation again just before `GC_DELAY` runs out, and it must still decode to the union's rows. At least one late read must happen.
+- At the end, once GC has had time, every object row must be available and referenced, and the object store must hold exactly their keys (no leak, no early delete).
+- Two leader sessions with the same or decreasing epoch fail the run.
+
+Two rules shape the model check:
+
+- **Per-DID order only.** Live ingest processes DIDs in parallel, so the archive promises order per DID and no global order (docs/README.md §2). The model's global order is the simulator's generation order, which a successor's replay does not reproduce.
+- **Commit-prefix re-archival.** Design §10.4 makes the relay cursor at least once. A hot batch can be cut between two rows of one upstream commit. If the leader dies after that batch commits, the commit's prefix is durable but the cursor and verifier state still sit before it, so the successor archives the whole commit again. `disaggCover` allows exactly this: a DID's stream may restart the upstream commit in progress from its first row, at most once per leader change. Anything else fails: a lost row, a reorder, or a whole event archived twice.
+
+Determinism follows the D4 fallback. The seed fixes the pod counts, the fault plan, the traffic, and the order in which faults fire, and `TestDisagg_Determinism` checks those. The interleaving is not replayable. Pipe I/O and pod goroutines run outside the scheduler, so where a batch cut falls relative to a crash, and so which commit prefixes get re-archived, varies between runs of one seed. The scheduler trace and the stream digest are logged, not compared. Reproduce a failure by rerunning its seed a few times (see `TestDisagg_OracleChild`).
+
+This tier does not prove real PostgreSQL or S3 semantics: isolation levels, `COMMIT`-result loss on a real connection, LISTEN/NOTIFY delivery, S3 consistency, or 403-versus-404 responses. `storagefake` models the catalog contract, and layer 4 (the `pgtest`/`s3test` contract suites under `just test-storage`) checks the real services against the same contract. The drop rule checks which rows a compacted archive holds, not when: a pass may leave a droppable row in place, and only the settled end state must be fully compacted.
+
+Recipes: `-short` runs one small seed (2 readers, 2 leaders, one bootstrap fault, one merge fault, a catalog fault, a compaction or GC kill, and a lost NOTIFY). The child's result line reports compaction passes, the rows `main` kept, and the held reader's late reads, so a run whose compaction did nothing is visible. `just oracle-disagg` runs the full fault mix on seeds 1-3 plus the determinism test. `just oracle-disagg-sweep COUNT` runs fresh random seeds.
+
+The tier has found three production bugs, all fixed. The first two are in verifier sync state and affect local mode as well. First, the state did not become durable in the same batch as its rows (`specs/oracle/2026-09-25-disagg-syncstate-batch-boundary.md`). Second, once the lifecycle harness landed, a later event's pending state hid an earlier event's, so the earlier event's promotion made nothing durable (`specs/oracle/2026-09-26-disagg-pipelined-chain-state-hidden.md`). Third, once compaction ran, a follower that fell behind across a seal and a compaction pass read a sealed block missing seqs, reported storage corruption, and stopped advancing (`specs/oracle/2026-09-26-disagg-follower-compaction-hole.md`).
+
+The harness has to work around two synctest limits and one crash-seam hazard; `specs/gotchas.md` describes each. A goroutine waiting on a `sync.Mutex` does not count as durably blocked, hence the backfill `Store`'s `chanMutex` and `BackfillMaxActiveHosts = 1`. A deposed leader can still reach a crash seam, hence `newestSession`.
 
 ### Simulator Fidelity Tier
 
@@ -276,6 +310,31 @@ This tier explores `testing/synctest`, in-process transport, fake time, and in-m
 Do not move public serving or crash durability checks into fake I/O modes.
 
 ## Requirements For Future Changes
+
+### Preserve Local Coverage When Adding Storage Backends
+
+The local-storage oracle remains a first-class correctness suite. Adding a
+disaggregated backend must preserve its existing properties: independent
+expected state and event history, physical storage and public replay checks,
+real-process restart coverage, strict-filesystem power-loss checks, Pebble and
+segment fault injection, proof that injected faults fired, and mutation-backed
+detection of applicable failure modes. Shared-code refactors must not weaken
+those assertions, skip local tiers, or make local tests require PostgreSQL,
+S3, or cloud credentials.
+
+`durable_order_test.go` stays local-only by design: it checks fsync and
+rename ordering against `vfs.WithLogging` operations and metastore commit
+boundaries, which are local committer rules. Its backend-neutral form (a block
+is durable before the metadata batch describing it is visible) needs its own
+observation of remote commits and cannot be proven with a local filesystem.
+
+Disaggregated coverage is additional. Reuse simulator scenarios, independent
+models, checkers, and public observers where practical, and follow the same
+principles where the harness must differ. Use real database/object-store
+observations and failure tests for remote durability; a local fsync test cannot
+establish remote commit safety. Backend-specific tests can remain separate
+when that keeps them clearer and stronger. Sharing a harness is useful only
+when it preserves the assertions each backend needs.
 
 ### Adding Oracle Coverage
 

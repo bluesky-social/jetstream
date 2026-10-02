@@ -1,23 +1,22 @@
 package backfill
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos"
 )
 
-// repoKeyPrefix is the pebble key prefix for per-DID rows. docs/README.md
+// repoKeyPrefix is the metadata key prefix for per-DID rows. docs/README.md
 // §3.5 pins this layout so the on-disk format is stable across
 // replicas.
 const repoKeyPrefix = "repo/"
 const pdsHostKeyPrefix = "pdshost/"
 
-// repoKey returns the pebble key for a DID's RepoStatus row.
+// repoKey returns the metadata key for a DID's RepoStatus row.
 func repoKey(did atmos.DID) []byte {
 	return []byte(repoKeyPrefix + string(did))
 }
@@ -63,19 +62,16 @@ func decodePDSHost(b []byte) (*PDSHost, error) {
 
 // ListPDSHosts returns the durable control-plane roster ordered by hostname.
 // A malformed row is Jetstream-owned metadata corruption and aborts the scan.
-func ListPDSHosts(db *store.Store) ([]PDSHost, error) {
+func ListPDSHosts(db metastore.Store) ([]PDSHost, error) {
 	prefix := []byte(pdsHostKeyPrefix)
-	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	it, err := db.NewIter(context.Background(), prefix, metastore.PrefixUpperBound(prefix))
 	if err != nil {
 		return nil, fmt.Errorf("backfill: open PDS roster: %w", err)
 	}
 	defer func() { _ = it.Close() }()
 	var hosts []PDSHost
-	for it.First(); it.Valid(); it.Next() {
-		value, err := it.ValueAndErr()
-		if err != nil {
-			return nil, fmt.Errorf("backfill: read PDS roster: %w", err)
-		}
+	for it.Next() {
+		value := it.Value()
 		host, err := decodePDSHost(value)
 		if err != nil {
 			return nil, err
@@ -85,7 +81,7 @@ func ListPDSHosts(db *store.Store) ([]PDSHost, error) {
 		}
 		hosts = append(hosts, *host)
 	}
-	if err := it.Error(); err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err := it.Err(); err != nil {
 		return nil, fmt.Errorf("backfill: iterate PDS roster: %w", err)
 	}
 	return hosts, nil
@@ -240,7 +236,7 @@ func EncodeRepoStatus(s *RepoStatus) ([]byte, error) {
 	return encodeRepoStatus(s)
 }
 
-// RepoKey returns the pebble key for a DID's RepoStatus row. Mirror
+// RepoKey returns the metadata key for a DID's RepoStatus row. Mirror
 // of the unexported repoKey; exported for cross-package writers.
 func RepoKey(did string) []byte {
 	return []byte(repoKeyPrefix + did)

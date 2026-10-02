@@ -6,8 +6,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -208,10 +209,10 @@ func (c *chainCoordinator) recordedOps() []world.GeneratedChainOp {
 // missing key means no pass ran → W=0 (nothing compacted yet).
 func readCompactionWatermark(t *testing.T, dataDir string) uint64 {
 	t.Helper()
-	st, err := store.Open(dataDir, nil)
+	st, err := pebblestore.Open(dataDir, nil)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, st.Close()) }()
-	w, ok, err := st.GetVersionedUint64LE("compaction/seq", 0x01)
+	w, ok, err := metastore.GetVersionedUint64LE(context.Background(), st, "compaction/seq", 0x01)
 	require.NoError(t, err)
 	if !ok {
 		return 0

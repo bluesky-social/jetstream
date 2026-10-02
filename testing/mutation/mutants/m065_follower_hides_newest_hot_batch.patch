@@ -1,0 +1,30 @@
+mutant: m065_follower_hides_newest_hot_batch
+target: internal/catalog/follower/tick.go
+failure-mode: |
+  The follower builds Main's tail view without its newest hot batch. The
+  batch is committed and acknowledged, but no pod serves it until a later
+  commit or fold covers it, and the archive's last events stay invisible
+  once traffic stops.
+expected-detection: |
+  Predicted: the layer 3 oracle waits for every pod's live observers to
+  reach the catalog tip, and the hidden tail batch never reaches them.
+  First run: the oracle missed it. Once traffic stops, BlockMaxAge (30s)
+  folds the open block, which reveals the batch within the 2-minute
+  convergence wait. The oracle now requires pods to serve a quiescent,
+  complete catalog within disaggServeTimeout (10s), and kills it on every
+  seed. TestFollower_LogMatchesCommittedStream pins the follower alone.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/follower/tick.go b/internal/catalog/follower/tick.go
+--- a/internal/catalog/follower/tick.go
++++ b/internal/catalog/follower/tick.go
+@@ -513,7 +513,7 @@ func (m *mirror) tails(objects objIndex) (map[catalog.Namespace]catalog.SegmentV
+ 			idx = last.Index + 1
+ 		}
+ 		v := add(catalog.Main, idx)
+-		for _, h := range m.hot {
++		for _, h := range m.hot[:len(m.hot)-1] {
+ 			var loc catalog.Locator
+ 			var n int64
+ 			if h.Inline {

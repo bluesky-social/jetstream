@@ -6,9 +6,9 @@ type IOOp string
 const (
 	IOOpWrite IOOp = "write"
 	IOOpSync  IOOp = "sync"
-	// IOOpRename covers the tmp-over-original rename that commits a Patch or
-	// Rewrite. The active-writer path never renames, so this op fires only on
-	// those two paths.
+	// IOOpRename covers the tmp-over-original rename that commits a Rewrite.
+	// The active-writer path never renames, so this op fires only on that
+	// path.
 	IOOpRename IOOp = "rename"
 )
 
@@ -18,8 +18,8 @@ type IOFaultInjector interface {
 	BeforeSegmentIO(path string, op IOOp) error
 }
 
-// beforeSegmentIO checks for an injected failure before I/O. Config, Patch,
-// and Rewrite share this helper.
+// beforeSegmentIO checks for an injected failure before I/O. Config and
+// Rewrite share this helper.
 func beforeSegmentIO(faults IOFaultInjector, path string, op IOOp) error {
 	if faults == nil {
 		return nil

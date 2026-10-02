@@ -1,9 +1,8 @@
-// Package store manages the pebble database at <data-dir>/meta.pebble
-// (docs/README.md §3.5). Each consumer owns its keyspace and uses the
-// embedded *pebble.DB for batches, iterators, and snapshots.
-//
-// Store instruments Get, Set, Delete, and Commit with duration metrics.
-// NewBatch, NewIter, and Snapshot use the embedded methods directly.
+// Package store opens the pebble database at <data-dir>/meta.pebble
+// (docs/README.md §3.5) and instruments Get, Set, Delete, and Commit with
+// duration metrics. Only internal/metastore/pebblestore uses it; everything
+// else reaches metadata through metastore.Store (enforced by
+// TestOnlyPebblestoreImportsStore).
 package store
 
 import (
@@ -28,18 +27,14 @@ const PebbleSubdir = "meta.pebble"
 type Store struct {
 	*pebble.DB
 	metrics *Metrics
-	// faults is a test-only write-fault seam. nil in production (Open
-	// installs nothing); see fault.go.
-	faults FaultInjector
 }
 
 type openOptions struct {
-	faults FaultInjector
-	fs     vfs.FS
+	fs vfs.FS
 }
 
 // Option configures a Store at Open time. Production callers normally pass
-// no options; tests can install fault injection or an alternate Pebble VFS.
+// no options; tests can install an alternate Pebble VFS.
 type Option func(*openOptions)
 
 // WithFS opens Pebble on fs instead of the process filesystem. Passing nil is
@@ -106,7 +101,7 @@ func Open(dataDir string, m *Metrics, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("store: open pebble at %s: %w", path, err)
 	}
 
-	s := &Store{DB: db, metrics: m, faults: openOpts.faults}
+	s := &Store{DB: db, metrics: m}
 	return s, nil
 }
 
@@ -146,9 +141,6 @@ func (s *Store) Get(key []byte) ([]byte, io.Closer, error) {
 
 // Set is the instrumented version of *pebble.DB.Set.
 func (s *Store) Set(key, value []byte, opts *pebble.WriteOptions) error {
-	if err := s.faultBeforeWrite(WriteOpSet, key); err != nil {
-		return err
-	}
 	start := time.Now()
 	err := s.DB.Set(key, value, opts)
 	s.metrics.ObserveSet(start, err)
@@ -157,9 +149,6 @@ func (s *Store) Set(key, value []byte, opts *pebble.WriteOptions) error {
 
 // Delete is the instrumented version of *pebble.DB.Delete.
 func (s *Store) Delete(key []byte, opts *pebble.WriteOptions) error {
-	if err := s.faultBeforeWrite(WriteOpDelete, key); err != nil {
-		return err
-	}
 	start := time.Now()
 	err := s.DB.Delete(key, opts)
 	s.metrics.ObserveDelete(start, err)
@@ -170,9 +159,6 @@ func (s *Store) Delete(key []byte, opts *pebble.WriteOptions) error {
 // it in place of b.Commit(opts) so the duration histogram captures
 // batch commits alongside single-key writes.
 func (s *Store) Commit(b *pebble.Batch, opts *pebble.WriteOptions) error {
-	if err := s.faultBeforeCommit(b); err != nil {
-		return err
-	}
 	start := time.Now()
 	err := b.Commit(opts)
 	s.metrics.ObserveBatchCommit(start, err)

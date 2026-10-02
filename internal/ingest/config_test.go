@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,9 +23,9 @@ func TestConfigValidate_RequiresFields(t *testing.T) {
 		cfg  Config
 		want string
 	}{
-		{"missing SegmentsDir", Config{Store: &store.Store{}, Logger: logger}, "SegmentsDir"},
+		{"missing SegmentsDir", Config{Store: memstore.New(), Logger: logger}, "SegmentsDir"},
 		{"missing Store", Config{SegmentsDir: "/tmp/x", Logger: logger}, "Store"},
-		{"missing Logger", Config{SegmentsDir: "/tmp/x", Store: &store.Store{}}, "Logger"},
+		{"missing Logger", Config{SegmentsDir: "/tmp/x", Store: memstore.New()}, "Logger"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,7 +41,7 @@ func TestConfigValidate_RequiresFields(t *testing.T) {
 func TestConfigValidate_AppliesDefaults(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := Config{SegmentsDir: "/tmp/x", Store: &store.Store{}, Logger: logger}
+	cfg := Config{SegmentsDir: "/tmp/x", Store: memstore.New(), Logger: logger}
 	require.NoError(t, cfg.validate())
 
 	cfg.applyDefaults()
@@ -56,7 +56,7 @@ func TestConfigValidate_RejectsNegativeBytes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
 		SegmentsDir:     "/tmp/x",
-		Store:           &store.Store{},
+		Store:           memstore.New(),
 		Logger:          logger,
 		MaxSegmentBytes: -1,
 	}
@@ -69,7 +69,7 @@ func TestConfigValidate_RejectsNegativeAsyncFlushWorkers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
 		SegmentsDir:       "/tmp/x",
-		Store:             &store.Store{},
+		Store:             memstore.New(),
 		Logger:            logger,
 		AsyncFlushWorkers: -1,
 	}
@@ -84,10 +84,10 @@ func TestConfigValidate_AllowsAsyncFlushWithDurableBatchHook(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := Config{
 		SegmentsDir:       "/tmp/x",
-		Store:             &store.Store{},
+		Store:             memstore.New(),
 		Logger:            logger,
 		AsyncFlushWorkers: 1,
-		OnDurableBatch: func(context.Context, *pebble.Batch, uint64, bool, any) (func(), func(error), error) {
+		OnDurableBatch: func(context.Context, metastore.Batch, uint64, bool, any) (func(), func(error), error) {
 			return nil, nil, nil
 		},
 	}
@@ -100,7 +100,7 @@ func TestConfigValidate_SeqLeaseConstraints(t *testing.T) {
 	t.Parallel()
 	base := Config{
 		SegmentsDir: "/tmp/x",
-		Store:       &store.Store{},
+		Store:       memstore.New(),
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 

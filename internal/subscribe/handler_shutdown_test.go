@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/coder/websocket"
 	"github.com/prometheus/client_golang/prometheus"
@@ -28,7 +28,7 @@ func TestHandler_GracefulShutdownSendsGoingAway(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	makeSteadyState(t, st)
@@ -97,7 +97,7 @@ func TestHandler_RejectsConnectionsDuringDrain(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	st, err := store.Open(dir, nil)
+	st, err := pebblestore.Open(dir, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	makeSteadyState(t, st)

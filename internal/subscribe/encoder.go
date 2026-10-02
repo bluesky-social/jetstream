@@ -138,9 +138,16 @@ func v2Commit(evt *segment.Event) (jetstream.JetstreamSubscribeEvents_Commit, er
 	}
 
 	if evt.Kind != segment.KindDelete {
-		recordVal, err := cbor.NewDecoder(bytes.NewReader(evt.Payload)).ReadValue()
+		// The lexicon's unknown type must be an object, and the Go client
+		// rejects trailing bytes, so v2 holds records to the ingest gate's
+		// rule (internal/datamodel). Rows archived before that gate can
+		// fail here and are skipped. v1 keeps its frozen, looser decode.
+		recordVal, err := cbor.UnmarshalNoCopy(evt.Payload)
 		if err != nil {
 			return commit, fmt.Errorf("subscribe: decode record cbor: %w", err)
+		}
+		if _, ok := recordVal.(map[string]any); !ok {
+			return commit, fmt.Errorf("subscribe: record is a %T, not a map", recordVal)
 		}
 		recordJSON, err := cbor.ToJSON(recordVal)
 		if err != nil {

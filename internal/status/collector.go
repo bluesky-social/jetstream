@@ -8,15 +8,26 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/manifest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos/identity"
 	"golang.org/x/sync/singleflight"
 )
 
-// Options configures a Collector. Store and DataDir are required.
+// Options configures a Collector. Store is required.
 type Options struct {
-	Store   *store.Store
+	Store metastore.Store
+
+	// DataDir labels the segment trees with their local directories.
+	// Optional; with no local data dir the trees are labeled by namespace.
 	DataDir string
+
+	// Archive is the segment catalog the segment trees are read through.
+	// Optional; when nil the trees hold only what Manifest reports.
+	Archive Archive
+
+	// ArchiveReady, when set, blocks until Archive has loaded, so an early
+	// snapshot does not render a partial archive as the whole of it.
+	ArchiveReady func(context.Context) error
 
 	// Now overrides the wall clock; tests pin it for determinism.
 	// Default time.Now.
@@ -34,10 +45,6 @@ type Options struct {
 	// IdentityResolver resolves one operator-supplied handle on the accounts
 	// tab. Optional; nil means handle lookup is limited to the local index.
 	IdentityResolver identity.Resolver
-
-	// ImportReporter yields the current/most-recent timestamp-import job for
-	// the status page. Optional; nil means the import panel is omitted.
-	ImportReporter ImportReporter
 
 	// LastSeenUpstreamEvent returns the last steady-state subscribeRepos event
 	// observation time. Optional; nil means the live freshness fields are empty.
@@ -61,9 +68,6 @@ type Collector struct {
 func New(opts Options) (*Collector, error) {
 	if opts.Store == nil {
 		return nil, fmt.Errorf("status: Options.Store is required")
-	}
-	if opts.DataDir == "" {
-		return nil, fmt.Errorf("status: Options.DataDir is required")
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now

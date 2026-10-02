@@ -22,13 +22,24 @@ var (
 // for the segment-size knob without giving an attacker a runway.
 const maxDecodedBlockBytes uint64 = 1 << 30 // 1 GiB
 
+// maxBlockEncoders caps the block encoder pool; see init.
+const maxBlockEncoders = 4
+
 func init() {
 	var err error
 
+	// WithEncoderConcurrency sizes the pool of encoders EncodeAll draws from,
+	// and each one keeps about 16MB of match history once it has encoded a
+	// block. klauspost defaults the pool to GOMAXPROCS, which retained 512MB
+	// on a 32-core leader and would retain 1.5GB on 96 cores. Few callers
+	// encode blocks at once (hot and direct batch prepare, the maintainer,
+	// seal and compaction), and one encoder at SpeedDefault handles hundreds
+	// of MB/s, far above ingest, so extra callers briefly queue instead.
 	blockEncoder, err = zstd.NewWriter(
 		nil,
 		zstd.WithEncoderLevel(zstd.SpeedDefault),
 		zstd.WithEncoderCRC(true),
+		zstd.WithEncoderConcurrency(min(runtime.GOMAXPROCS(0), maxBlockEncoders)),
 	)
 	if err != nil {
 		panic(fmt.Sprintf("segment: zstd encoder init failed: %v", err))

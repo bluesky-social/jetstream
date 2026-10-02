@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
-	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/prometheus/client_golang/prometheus"
@@ -23,16 +23,16 @@ func TestWalkFromCursor_SingleSealedSegment(t *testing.T) {
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenManifest(t, segDir)
 
 	st, w := openWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	var got []uint64
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 5,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -48,10 +48,10 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenManifest(t, segDir)
 
 	st, w := openWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	// 5 events appended into the active segment and flushed so cold replay can
 	// serve them from the active file without reading pending memory.
@@ -66,8 +66,8 @@ func TestWalkFromCursor_SealedThenActive(t *testing.T) {
 	var got []uint64
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 8,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -83,16 +83,16 @@ func TestWalkFromCursor_HaltsOnCallbackError(t *testing.T) {
 	mustWriteSealedSegment(t, filepath.Join(segDir, "seg_0000000000.jss"), sealedFixture{
 		minSeq: 0, maxSeq: 9, minWitnessedAt: 1_000, maxWitnessedAt: 9_999, eventCount: 10,
 	})
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 10)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	stop := errors.New("stop")
 	count := 0
 	err := subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
 		StartSeq: 0,
-		Manifest: m,
-		Writer:   w,
+		Catalog:  cat,
+		Fetcher:  cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		count++
 		if count == 3 {
@@ -107,14 +107,14 @@ func TestWalkFromCursor_HaltsOnCallbackError(t *testing.T) {
 // openWriterAtTip is a test helper that opens a fresh ingest.Writer
 // with seq/next preset to the given value (so the next Append starts
 // allocating from there).
-func openWriterAtTip(t *testing.T, dir string, nextSeq uint64) (*store.Store, *ingest.Writer) {
+func openWriterAtTip(t *testing.T, dir string, nextSeq uint64) (*pebblestore.Store, *ingest.Writer) {
 	t.Helper()
-	st, err := store.Open(dir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 
 	// Seed seq/next BEFORE opening the writer; ingest.Open reads it
 	// during its reconciliation pass.
-	require.NoError(t, st.Set([]byte("seq/next"), encodeUint64LE(nextSeq), store.SyncWrites))
+	require.NoError(t, st.Set(context.Background(), []byte("seq/next"), encodeUint64LE(nextSeq)))
 
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir: filepath.Join(dir, "segments"),
@@ -161,14 +161,14 @@ func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Rewritten)
 
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 20)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	// Walk across the gap.
 	var got []uint64
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: 0, Manifest: m, Writer: w,
+		StartSeq: 0, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -179,7 +179,7 @@ func TestWalkFromCursor_CompactedTrailingGapTerminates(t *testing.T) {
 	// Cursor landing inside the trailing gap.
 	got = got[:0]
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: 9, Manifest: m, Writer: w,
+		StartSeq: 9, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil
@@ -203,13 +203,13 @@ func TestWalkFromCursor_FullyEmptiedSegmentTerminates(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Rewritten)
 
-	m := mustOpenManifest(t, segDir)
 	st, w := openWriterAtTip(t, dir, 20)
 	t.Cleanup(func() { _ = w.Close(); _ = st.Close() })
+	cat := mustCatalog(t, segDir, w)
 
 	var got []uint64
 	err = subscribe.WalkFromCursor(context.Background(), subscribe.WalkInput{
-		StartSeq: 0, Manifest: m, Writer: w,
+		StartSeq: 0, Catalog: cat, Fetcher: cat.Fetcher(),
 	}, func(e *subscribe.Entry) error {
 		got = append(got, e.Event.Seq)
 		return nil

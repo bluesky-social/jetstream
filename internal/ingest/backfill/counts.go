@@ -1,12 +1,12 @@
 package backfill
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 
-	"github.com/bluesky-social/jetstream/internal/store"
-	"github.com/cockroachdb/pebble"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 )
 
 // Counts is the per-status row count produced by CountStatuses.
@@ -26,15 +26,14 @@ const countsKey = "backfill/counts"
 // LoadCounts reads a precomputed aggregate count. Missing counts are
 // expected for data dirs that have not been repaired or migrated to
 // include this optional operator-facing summary.
-func LoadCounts(s *store.Store) (Counts, bool, error) {
-	val, closer, err := s.Get([]byte(countsKey))
-	if errors.Is(err, store.ErrNotFound) {
+func LoadCounts(s metastore.Store) (Counts, bool, error) {
+	val, err := s.Get(context.Background(), []byte(countsKey))
+	if errors.Is(err, metastore.ErrNotFound) {
 		return Counts{}, false, nil
 	}
 	if err != nil {
 		return Counts{}, false, fmt.Errorf("backfill: load counts: %w", err)
 	}
-	defer func() { _ = closer.Close() }()
 
 	c, err := decodeCounts(val)
 	if err != nil {
@@ -63,12 +62,12 @@ func encodeCounts(c Counts) ([]byte, error) {
 // production or repair tooling: normal backfill state transitions maintain
 // the counts row via Store's write paths. Tests call this to seed a counts
 // row directly.
-func SaveCounts(s *store.Store, c Counts) error {
+func SaveCounts(s metastore.Store, c Counts) error {
 	enc, err := encodeCounts(c)
 	if err != nil {
 		return err
 	}
-	if err := s.Set([]byte(countsKey), enc, store.SyncWrites); err != nil {
+	if err := s.Set(context.Background(), []byte(countsKey), enc); err != nil {
 		return fmt.Errorf("backfill: write counts: %w", err)
 	}
 	return nil
@@ -82,27 +81,21 @@ func SaveCounts(s *store.Store, c Counts) error {
 //
 // At full network scale this scans tens of millions of keys; cost
 // scales linearly with row count. Use behind a TTL cache.
-func CountStatuses(s *store.Store) (Counts, error) {
+func CountStatuses(s metastore.Store) (Counts, error) {
 	var c Counts
 
 	prefix := []byte(repoKeyPrefix)
-	upper := store.PrefixUpperBound(prefix)
+	upper := metastore.PrefixUpperBound(prefix)
 
-	it, err := s.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: upper,
-	})
+	it, err := s.NewIter(context.Background(), prefix, upper)
 	if err != nil {
 		return Counts{}, fmt.Errorf("backfill: open iter: %w", err)
 	}
 	defer func() { _ = it.Close() }()
 
-	for it.First(); it.Valid(); it.Next() {
+	for it.Next() {
 		c.Total++
-		val, err := it.ValueAndErr()
-		if err != nil {
-			return Counts{}, fmt.Errorf("backfill: read value: %w", err)
-		}
+		val := it.Value()
 		rs, err := decodeRepoStatus(val)
 		if err != nil {
 			// Don't fail the whole count for one bad row — the row is
@@ -123,7 +116,7 @@ func CountStatuses(s *store.Store) (Counts, error) {
 			c.Unavailable++
 		}
 	}
-	if err := it.Error(); err != nil {
+	if err := it.Err(); err != nil {
 		return Counts{}, fmt.Errorf("backfill: iter error: %w", err)
 	}
 	return c, nil

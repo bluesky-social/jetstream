@@ -14,10 +14,10 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
 	simhttp "github.com/bluesky-social/jetstream/internal/simulator/http"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/identity"
 	"github.com/jcalabro/atmos/streaming"
@@ -85,7 +85,7 @@ func newLiveTailHarness(t *testing.T, ctx context.Context) *liveTailHarness {
 	srv.Config.Handler = simhttp.NewHandlerWithOptions(w, srv.URL, simhttp.HandlerOptions{Faults: faults})
 	t.Cleanup(srv.Close)
 
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := pebblestore.Open(t.TempDir(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	stateStore := syncstate.New(st)
@@ -119,7 +119,7 @@ func newLiveTailHarness(t *testing.T, ctx context.Context) *liveTailHarness {
 	return h
 }
 
-func (h *liveTailHarness) openConsumer(t *testing.T, st *store.Store, stateStore *syncstate.PebbleStateStore) {
+func (h *liveTailHarness) openConsumer(t *testing.T, st *pebblestore.Store, stateStore *syncstate.StateStore) {
 	t.Helper()
 	reg := prometheus.NewRegistry()
 	h.Metrics = live.NewMetrics(reg)

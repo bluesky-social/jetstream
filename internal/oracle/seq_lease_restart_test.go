@@ -17,10 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
+	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/seqspace"
-	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -95,7 +97,7 @@ func TestOracle_ObservedSeqIsNotReusedAfterSIGKILL(t *testing.T) {
 	require.True(t, wasSIGKILL(err), "child should die by SIGKILL: %v\n%s", err, output.String())
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, err := store.Open(dataDir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dataDir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	w, err := ingest.Open(ingest.Config{
@@ -124,28 +126,39 @@ func runSeqLeaseSubscriberChild() {
 		os.Exit(2)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, err := store.Open(dataDir, store.NewMetrics(prometheus.NewRegistry()))
+	st, err := pebblestore.Open(dataDir, pebblestore.NewMetrics(prometheus.NewRegistry()))
 	if err != nil {
 		fail(err)
 	}
+	segDir := filepath.Join(dataDir, "segments")
+	cat, err := localcatalog.New(localcatalog.Config{Dirs: map[catalog.Namespace]string{catalog.Main: segDir}})
+	if err != nil {
+		fail(err)
+	}
+	if err := cat.Refresh(context.Background()); err != nil {
+		fail(err)
+	}
 	w, err := ingest.Open(ingest.Config{
-		SegmentsDir:              filepath.Join(dataDir, "segments"),
+		SegmentsDir:              segDir,
 		Store:                    st,
 		Logger:                   logger,
 		MaxEventsPerBlock:        4,
 		ReserveClientVisibleSeqs: true,
+		Catalog:                  cat,
 	})
 	if err != nil {
 		fail(err)
 	}
-	if err := lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()); err != nil {
+	if err := lifecycle.WritePhase(context.Background(), st, lifecycle.PhaseSteadyState, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 
 	var writerRef atomic.Pointer[ingest.Writer]
 	writerRef.Store(w)
 	metrics := subscribe.NewMetrics(prometheus.NewRegistry())
-	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{WriterRef: &writerRef, Metrics: metrics})
+	cold := subscribe.NewColdReader(subscribe.ColdReaderConfig{
+		Catalog: cat, Fetcher: cat.Fetcher(), WriterRef: &writerRef, Metrics: metrics,
+	})
 	tail, err := subscribe.New(subscribe.Config{Logger: logger, Metrics: metrics}, cold.Read, w.NextSeq)
 	if err != nil {
 		fail(err)
