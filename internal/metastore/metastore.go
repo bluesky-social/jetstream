@@ -33,6 +33,13 @@ var ErrReadOnly = errors.New("metastore: store is read-only")
 type Store interface {
 	// Get returns a copy of the value stored under key, or ErrNotFound.
 	Get(ctx context.Context, key []byte) ([]byte, error)
+	// GetMany is Get for every key in one call, which the PostgreSQL
+	// implementation serves in one round trip. It returns one value per
+	// key, in order: a copy of the stored value, which is non-nil even
+	// when empty, or nil for an absent key. Keys may repeat. Like an
+	// iterator it is not a snapshot: a commit landing during the call may
+	// be visible to some keys and not others.
+	GetMany(ctx context.Context, keys [][]byte) ([][]byte, error)
 	// NewBatch returns an empty write batch. Nothing it stages is visible
 	// until Commit returns nil.
 	NewBatch() Batch
@@ -159,4 +166,24 @@ func clone(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
+}
+
+// GetEach implements GetMany with one Get per key, for backends where a point
+// read is cheap.
+func GetEach(ctx context.Context, s Store, keys [][]byte) ([][]byte, error) {
+	out := make([][]byte, len(keys))
+	for i, key := range keys {
+		v, err := s.Get(ctx, key)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			v = []byte{}
+		}
+		out[i] = v
+	}
+	return out, nil
 }

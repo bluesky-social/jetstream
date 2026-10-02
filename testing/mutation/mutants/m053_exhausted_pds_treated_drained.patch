@@ -1,7 +1,8 @@
 mutant: m053_exhausted_pds_treated_drained
 target: internal/ingest/backfill/store.go
 failure-mode: |
-  HostCursor projects an exhausted PDS as drained. Future process runs then
+  The bootstrap roster projection (bootstrapHostCursor) reports an
+  exhausted PDS as drained. Future process runs then
   skip that host permanently instead of retrying it after external recovery,
   leaving every repo on the host absent while the fleet reports completion.
 expected-detection: |
@@ -13,16 +14,15 @@ expected-tier: pdsbackfill
 tiers: pdsbackfill
 
 diff --git a/internal/ingest/backfill/store.go b/internal/ingest/backfill/store.go
-index 0cf5b63..e567715 100644
 --- a/internal/ingest/backfill/store.go
 +++ b/internal/ingest/backfill/store.go
-@@ -1035,7 +1035,8 @@ func (s *Store) HostCursor(ctx context.Context, hostname string) (string, bool,
- 	if err != nil {
- 		return "", false, err
- 	}
--	return host.ListReposCursor, host.Enumerated, nil
+@@ -1307,7 +1307,8 @@
+ // from the last checkpoint, and skip only a host a prior run fully
+ // enumerated.
+ func bootstrapHostCursor(host *PDSHost) atmosbackfill.HostCursorState {
+-	return atmosbackfill.HostCursorState{Cursor: host.ListReposCursor, Drained: host.Enumerated}
 +	drained := host.Enumerated || host.State == string(atmosbackfill.HostStateExhausted)
-+	return host.ListReposCursor, drained, nil
++	return atmosbackfill.HostCursorState{Cursor: host.ListReposCursor, Drained: drained}
  }
  
- func (s *Store) SaveHostCursor(ctx context.Context, hostname, cursor string) error {
+ // recordHosts upserts each host's relay metadata in one group-committed

@@ -66,6 +66,22 @@ func (m *metaStore) Delete(ctx context.Context, key []byte) error {
 	return b.Commit(ctx)
 }
 
+// GetMany reads every key from one committed state, which is stronger than
+// the interface promises. Like Get it takes no scheduler turn.
+func (m *metaStore) GetMany(_ context.Context, keys [][]byte) ([][]byte, error) {
+	if err := m.cl.alive(); err != nil {
+		return nil, err
+	}
+	s := m.db.current()
+	out := make([][]byte, len(keys))
+	for i, key := range keys {
+		if v, ok := s.meta.get(string(key)); ok {
+			out[i] = append([]byte{}, v...)
+		}
+	}
+	return out, nil
+}
+
 // NewIter reads the range from one committed state, which is stronger than
 // the interface promises.
 func (m *metaStore) NewIter(_ context.Context, lower, upper []byte) (metastore.Iterator, error) {

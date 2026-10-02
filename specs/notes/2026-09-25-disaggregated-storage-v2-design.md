@@ -1895,7 +1895,7 @@ identity, instance role). There is no `JETSTREAM_S3_*` credential variable.
 |---|---|---|
 | `JETSTREAM_STORAGE` | `local` | `local` or `disaggregated` |
 | `JETSTREAM_PG_URL` | — | PostgreSQL connection string (secret; never in `.env`) |
-| `JETSTREAM_PG_MAX_CONNS` | 16 | pgx pool size |
+| `JETSTREAM_PG_MAX_CONNS` | 32 | pgx pool size (raised from 16 on 2026-10-02: the live verifier alone runs 32 concurrent reads) |
 | `JETSTREAM_S3_ENDPOINT` | — | endpoint URL; empty means AWS default |
 | `JETSTREAM_S3_REGION` | — | region |
 | `JETSTREAM_S3_BUCKET` | — | bucket |

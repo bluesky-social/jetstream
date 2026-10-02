@@ -152,11 +152,13 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 	store.SetCompletionBatcher(completions)
 	crawl := store.AtmosStore()
 	hosts := make([]string, stats.hosts)
+	infos := make([]atmosbackfill.HostInfo, stats.hosts)
 	for i := range hosts {
 		hosts[i] = fmt.Sprintf("pds%d.storagebench.invalid", i)
-		if err := crawl.OnHost(ctx, atmosbackfill.HostInfo{Hostname: hosts[i], RelayStatus: "active"}); err != nil {
-			return err
-		}
+		infos[i] = atmosbackfill.HostInfo{Hostname: hosts[i], RelayStatus: "active"}
+	}
+	if err := crawl.OnHost(ctx, infos); err != nil {
+		return err
 	}
 
 	gctx, cancel := context.WithCancelCause(ctx)
@@ -284,12 +286,14 @@ func driveBootstrap(ctx context.Context, cmd *cli.Command, stats *bootstrapStats
 			for gctx.Err() == nil {
 				did := atmos.DID(didFor(next.Add(1)))
 				start := time.Now()
-				rec, err := crawl.Lookup(gctx, did)
+				// One DID per call: the bench measures per-repo discovery
+				// latency, not the engine's page batching.
+				recs, err := crawl.Lookup(gctx, []atmos.DID{did})
 				if err != nil {
 					return done(err)
 				}
-				if rec.State == atmosbackfill.StateUnknown {
-					if err := crawl.OnDiscover(gctx, host, atmossync.ListReposEntry{DID: did, Active: true}); err != nil {
+				if recs[0].State == atmosbackfill.StateUnknown {
+					if err := crawl.OnDiscover(gctx, host, []atmossync.ListReposEntry{{DID: did, Active: true}}); err != nil {
 						return done(err)
 					}
 				}

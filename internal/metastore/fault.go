@@ -54,6 +54,10 @@ func (s *faultStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 	return s.inner.Get(ctx, key)
 }
 
+func (s *faultStore) GetMany(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	return s.inner.GetMany(ctx, keys)
+}
+
 func (s *faultStore) NewIter(ctx context.Context, lower, upper []byte) (Iterator, error) {
 	return s.inner.NewIter(ctx, lower, upper)
 }

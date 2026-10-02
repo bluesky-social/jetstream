@@ -56,6 +56,11 @@ func (s *Store) Get(ctx context.Context, key []byte) ([]byte, error) {
 	return v, nil
 }
 
+// GetMany implements metastore.Store in one query.
+func (s *Store) GetMany(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	return s.cfg.DB.MetaGetMany(ctx, keys)
+}
+
 // NewBatch implements metastore.Store. The ops reach PostgreSQL through
 // catalog's Tx.ApplyMeta, which coalesces runs into set-based statements
 // (pgstore.MetaBatch).

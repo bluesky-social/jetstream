@@ -47,6 +47,8 @@ type Metrics struct {
 	RosterCapHits            prometheus.Counter
 	DownloadSlotWait         prometheus.Histogram
 	EngineActiveHosts        prometheus.Gauge
+	GroupCommitWrites        prometheus.Histogram
+	GroupCommitOps           prometheus.Histogram
 }
 
 // NewMetrics registers the backfill counters against reg. Pass the
@@ -191,6 +193,18 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "engine_active_hosts", Help: "PDS host producer loops currently active.",
 		}),
+		GroupCommitWrites: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "group_commit_writes",
+			Help:    "Store writes (a listRepos or listHosts page each) folded into one group-committed metadata transaction.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
+		}),
+		GroupCommitOps: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "group_commit_ops",
+			Help:    "Metadata key writes in one group-committed transaction.",
+			Buckets: prometheus.ExponentialBuckets(1, 4, 10),
+		}),
 	}
 	reg.MustRegister(
 		m.Discovered, m.Completed, m.Failed, m.ActiveFlips, m.OnFailErrors,
@@ -202,6 +216,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.RetrySucceeded, m.RetryFailed, m.RetrySkippedHostParked,
 		m.HostsTotal, m.HostEnumeratedRepos, m.HostAttempts,
 		m.HostnameRejected, m.RosterCapHits, m.DownloadSlotWait, m.EngineActiveHosts,
+		m.GroupCommitWrites, m.GroupCommitOps,
 	)
 	return m
 }
@@ -318,6 +333,13 @@ func (m *Metrics) incFailed() {
 func (m *Metrics) incActiveFlips() {
 	if m != nil {
 		m.ActiveFlips.Inc()
+	}
+}
+
+func (m *Metrics) observeGroupCommit(writes, ops int) {
+	if m != nil {
+		m.GroupCommitWrites.Observe(float64(writes))
+		m.GroupCommitOps.Observe(float64(ops))
 	}
 }
 

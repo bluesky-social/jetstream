@@ -24,6 +24,8 @@ func Run(t *testing.T, newStore func(t *testing.T) metastore.Store) {
 		{"GetSetDelete", testGetSetDelete},
 		{"EmptyValue", testEmptyValue},
 		{"GetReturnsCopy", testGetReturnsCopy},
+		{"GetMany", testGetMany},
+		{"GetManyEmpty", testGetManyEmpty},
 		{"BatchInvisibleUntilCommit", testBatchInvisibleUntilCommit},
 		{"BatchOrderedSameKey", testBatchOrderedSameKey},
 		{"BatchDeleteRangeEndsRun", testBatchDeleteRangeEndsRun},
@@ -112,6 +114,40 @@ func testGetReturnsCopy(t *testing.T, s metastore.Store) {
 	require.NoError(t, err)
 	got[0] = 'X'
 	requireValue(t, s, "k", "value")
+}
+
+func testGetMany(t *testing.T, s metastore.Store) {
+	ctx := context.Background()
+	b := s.NewBatch()
+	b.Set([]byte("a"), []byte("1"))
+	b.Set([]byte("b"), []byte("2"))
+	b.Set([]byte("empty"), nil)
+	b.Set([]byte("bin\x00"), []byte{0, 1})
+	require.NoError(t, b.Commit(ctx))
+
+	keys := [][]byte{[]byte("b"), []byte("missing"), []byte("a"), []byte("empty"), []byte("b"), []byte("bin\x00"), []byte("bin")}
+	got, err := s.GetMany(ctx, keys)
+	require.NoError(t, err)
+	require.Len(t, got, len(keys), "one value per key, in order")
+	require.Equal(t, []byte("2"), got[0])
+	require.Nil(t, got[1], "an absent key is nil")
+	require.Equal(t, []byte("1"), got[2])
+	require.NotNil(t, got[3], "an empty value is present, not absent")
+	require.Empty(t, got[3])
+	require.Equal(t, []byte("2"), got[4], "a repeated key answers at every position")
+	require.Equal(t, []byte{0, 1}, got[5])
+	require.Nil(t, got[6], "keys match bytewise, not by prefix")
+
+	// Each value is the caller's own copy, even for a repeated key.
+	got[0][0] = 'X'
+	require.Equal(t, []byte("2"), got[4])
+	requireValue(t, s, "b", "2")
+}
+
+func testGetManyEmpty(t *testing.T, s metastore.Store) {
+	got, err := s.GetMany(context.Background(), nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 func testBatchInvisibleUntilCommit(t *testing.T, s metastore.Store) {

@@ -34,6 +34,11 @@ func (s *sessionStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 	return v, s.end(ctx, "metadata read", err)
 }
 
+func (s *sessionStore) GetMany(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	v, err := s.Store.GetMany(ctx, keys)
+	return v, s.end(ctx, "metadata read", err)
+}
+
 func (s *sessionStore) NewIter(ctx context.Context, lower, upper []byte) (metastore.Iterator, error) {
 	it, err := s.Store.NewIter(ctx, lower, upper)
 	if err != nil {

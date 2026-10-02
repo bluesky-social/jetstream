@@ -6,6 +6,15 @@
 // OnFail) commit durably to satisfy atmos's durability
 // contract: the engine treats a successful return as durable.
 //
+// atmos's Store takes its enumeration callbacks a page at a time, so the
+// engine reconciles a listRepos page and records a listHosts page in a
+// constant number of metadata round trips. In disaggregated mode each round
+// trip crosses the network to PostgreSQL and each commit is a fenced catalog
+// transaction, so per-entry callbacks would bound a large PDS's enumeration
+// at a few repos a second. Concurrent page writes from different hosts also share one
+// transaction (groupCommitter), and every locked read-modify-write reads
+// through a prefetched metaView rather than one key at a time.
+//
 // Whole-row read-modify-write paths preserve fields a future PR may
 // add to RepoStatus (e.g. RecordCount). They serialize through countsMu
 // with aggregate writes and deferred completion staging so a stale
@@ -38,19 +47,35 @@ type Store struct {
 	crashInjector      crashpoint.Injector
 	countsMu           chanMutex
 	rosterMu           chanMutex
+	group              groupCommitter
 	completions        *completionBatcher
 	runMu              sync.Mutex
 	discoveredThisRun  map[atmos.DID]struct{}
 }
 
+// atmosStoreAdapter is the atmos backfill.Store view of Store. atmos's
+// enumeration callbacks take a page at a time; Store's own same-named
+// methods are the per-item forms Jetstream's other callers use.
 type atmosStoreAdapter struct{ *Store }
 
-func (a atmosStoreAdapter) OnDiscover(ctx context.Context, host string, entry atmossync.ListReposEntry) error {
-	return a.onDiscover(ctx, host, entry)
+func (a atmosStoreAdapter) Lookup(ctx context.Context, dids []atmos.DID) ([]atmosbackfill.StoreEntry, error) {
+	return a.LookupBatch(ctx, dids)
 }
 
-func (a atmosStoreAdapter) OnUpdate(ctx context.Context, host string, entry atmossync.ListReposEntry) error {
-	return a.onUpdate(ctx, host, entry)
+func (a atmosStoreAdapter) OnDiscover(ctx context.Context, host string, entries []atmossync.ListReposEntry) error {
+	return a.reconcileBatch(ctx, host, entries, nil, discoverBootstrap)
+}
+
+func (a atmosStoreAdapter) OnUpdate(ctx context.Context, host string, entries []atmossync.ListReposEntry) error {
+	return a.reconcileBatch(ctx, host, nil, entries, discoverBootstrap)
+}
+
+func (a atmosStoreAdapter) OnHost(ctx context.Context, hosts []atmosbackfill.HostInfo) error {
+	return a.recordHosts(ctx, hosts)
+}
+
+func (a atmosStoreAdapter) HostCursor(ctx context.Context, hostnames []string) ([]atmosbackfill.HostCursorState, error) {
+	return a.hostCursors(ctx, hostnames, bootstrapHostCursor)
 }
 
 var _ atmosbackfill.Store = atmosStoreAdapter{}
@@ -116,7 +141,12 @@ func (s *Store) SeedCounts(ctx context.Context) error {
 // loadCountsLocked reads backfill/counts for an incremental update. The
 // caller holds countsMu.
 func (s *Store) loadCountsLocked() (Counts, error) {
-	counts, ok, err := LoadCounts(s.db)
+	return loadCountsFrom(s.db)
+}
+
+// loadCountsFrom is loadCountsLocked reading through db, normally a metaView.
+func loadCountsFrom(db metastore.Store) (Counts, error) {
+	counts, ok, err := LoadCounts(db)
 	if err != nil {
 		return Counts{}, err
 	}
@@ -144,13 +174,64 @@ func (s *Store) Lookup(ctx context.Context, did atmos.DID) (atmosbackfill.StoreE
 	if err != nil {
 		return atmosbackfill.StoreEntry{}, fmt.Errorf("backfill: lookup %s: %w", did, err)
 	}
+	entry, interrupted, err := s.lookupEntry(did, val)
+	if err != nil {
+		return atmosbackfill.StoreEntry{}, err
+	}
+	if interrupted {
+		if err := s.deferInterruptedBootstrapRepos(ctx, []atmos.DID{did}); err != nil {
+			return atmosbackfill.StoreEntry{}, err
+		}
+	}
+	return entry, nil
+}
 
+// LookupBatch is Lookup for a listRepos page in one metadata read, deferring
+// every interrupted row it finds in one write. It backs atmos's Store.Lookup.
+func (s *Store) LookupBatch(ctx context.Context, dids []atmos.DID) ([]atmosbackfill.StoreEntry, error) {
+	keys := make([][]byte, len(dids))
+	for i, did := range dids {
+		keys[i] = repoKey(did)
+	}
+	vals, err := s.db.GetMany(context.Background(), keys)
+	if err != nil {
+		return nil, fmt.Errorf("backfill: lookup batch (%d dids): %w", len(dids), err)
+	}
+	out := make([]atmosbackfill.StoreEntry, len(dids))
+	var interrupted []atmos.DID
+	for i, did := range dids {
+		if vals[i] == nil {
+			out[i] = atmosbackfill.StoreEntry{State: atmosbackfill.StateUnknown}
+			continue
+		}
+		entry, deferRow, err := s.lookupEntry(did, vals[i])
+		if err != nil {
+			return nil, err
+		}
+		if deferRow {
+			interrupted = append(interrupted, did)
+		}
+		out[i] = entry
+	}
+	if len(interrupted) > 0 {
+		if err := s.deferInterruptedBootstrapRepos(ctx, interrupted); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// lookupEntry projects a stored RepoStatus into atmos's StoreEntry.
+// interrupted reports a not_started row from an earlier run, which the caller
+// must defer (deferInterruptedBootstrapRepos) before returning the entry.
+func (s *Store) lookupEntry(did atmos.DID, val []byte) (atmosbackfill.StoreEntry, bool, error) {
 	rs, err := decodeRepoStatus(val)
 	if err != nil {
-		return atmosbackfill.StoreEntry{}, fmt.Errorf("backfill: lookup %s: %w", did, err)
+		return atmosbackfill.StoreEntry{}, false, fmt.Errorf("backfill: lookup %s: %w", did, err)
 	}
 
 	var st atmosbackfill.State
+	interrupted := false
 	switch rs.Backfill.Status {
 	case StatusNotStarted:
 		if s.discoveredInThisRun(did) {
@@ -163,9 +244,7 @@ func (s *Store) Lookup(ctx context.Context, did atmos.DID) (atmosbackfill.StoreE
 		// then merge above those rows and erase them (#262). Defer it to the
 		// post-merge pending retry pass instead, where the whole-repo
 		// replacement lands above the captured live tail.
-		if err := s.deferInterruptedBootstrapRepo(ctx, did); err != nil {
-			return atmosbackfill.StoreEntry{}, err
-		}
+		interrupted = true
 		st = atmosbackfill.StateComplete
 	case StatusPending:
 		// Pending rows are handled only by the explicit post-merge retry pass.
@@ -185,10 +264,10 @@ func (s *Store) Lookup(ctx context.Context, did atmos.DID) (atmosbackfill.StoreE
 		// preserved on disk via Backfill.Status for diagnostics.
 		st = atmosbackfill.StateComplete
 	default:
-		return atmosbackfill.StoreEntry{}, fmt.Errorf("backfill: lookup %s: unknown status %q", did, rs.Backfill.Status)
+		return atmosbackfill.StoreEntry{}, false, fmt.Errorf("backfill: lookup %s: unknown status %q", did, rs.Backfill.Status)
 	}
 
-	return atmosbackfill.StoreEntry{State: st, Active: rs.Active}, nil
+	return atmosbackfill.StoreEntry{State: st, Active: rs.Active}, interrupted, nil
 }
 
 func (s *Store) markDiscoveredThisRun(did atmos.DID) {
@@ -207,11 +286,11 @@ func (s *Store) discoveredInThisRun(did atmos.DID) bool {
 	return ok
 }
 
-func (s *Store) deferInterruptedBootstrapRepo(ctx context.Context, did atmos.DID) error {
+func (s *Store) deferInterruptedBootstrapRepos(ctx context.Context, dids []atmos.DID) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, old Status) (func(*HostStatus), error) {
+	return s.updateRepoStatusesAndCounts(dids, func(rs *RepoStatus, _ bool, old Status) (func(*HostStatus), error) {
 		if old != StatusNotStarted {
 			return nil, nil
 		}
@@ -227,8 +306,7 @@ func (s *Store) deferInterruptedBootstrapRepo(ctx context.Context, did atmos.DID
 // putRepoStatus writes the value durably. It is a test-only setter that
 // writes the repo/<did> row in isolation, skipping the counts and host
 // aggregate maintenance that production write paths perform; production
-// code goes through putRepoStatusAndCounts (and the RMW helpers built on
-// it) instead.
+// code goes through reconcileBatch and updateRepoStatusesAndCounts instead.
 func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {
@@ -240,92 +318,59 @@ func (s *Store) putRepoStatus(did atmos.DID, rs *RepoStatus) error {
 	return nil
 }
 
-func (s *Store) putRepoStatusAndCounts(
-	did atmos.DID,
-	rs *RepoStatus,
-	hadRow bool,
-	old Status,
-	updateHost func(*HostStatus),
-	rosterHostname string,
-) error {
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
-	s.rosterMu.Lock()
-	defer s.rosterMu.Unlock()
-	return s.putRepoStatusAndCountsLocked(did, rs, hadRow, old, updateHost, rosterHostname)
-}
-
-// putRepoStatusAndCountsLocked is putRepoStatusAndCounts's body with the
-// caller already holding countsMu.
-func (s *Store) putRepoStatusAndCountsLocked(
-	did atmos.DID,
-	rs *RepoStatus,
-	hadRow bool,
-	old Status,
-	updateHost func(*HostStatus),
-	rosterHostname string,
-) error {
-	enc, err := encodeRepoStatus(rs)
-	if err != nil {
-		return err
-	}
-
-	counts, err := s.loadCountsLocked()
-	if err != nil {
-		return err
-	}
-	applyCountTransition(&counts, hadRow, old, rs.Backfill.Status)
-	countsEnc, err := encodeCounts(counts)
-	if err != nil {
-		return err
-	}
-
-	batch := s.db.NewBatch()
-	batch.Set(repoKey(did), enc)
-	batch.Set([]byte(countsKey), countsEnc)
-	if rs.Host != "" {
-		hs, _, err := loadHostStatus(s.db, rs.Host)
-		if err != nil {
-			return err
-		}
-		// putRepoStatusAndCounts is the create path (OnDiscover): the
-		// caller passes a freshly built rs, so any host present is a
-		// first sighting for that bucket.
-		applyHostStatusTransition(hs, firstInHostBucket(hadRow, "", rs.Host), rs.Active, old, rs.Backfill.Status)
-		if updateHost != nil {
-			updateHost(hs)
-		}
-		if err := stageHostStatus(batch, hs); err != nil {
-			return err
-		}
-	}
-	if rosterHostname != "" {
-		roster, _, err := s.loadPDSHost(rosterHostname)
-		if err != nil {
-			return err
-		}
-		roster.ActualAccounts++
-		roster.UpdatedAt = timeNow()
-		rosterEnc, err := encodePDSHost(roster)
-		if err != nil {
-			return err
-		}
-		batch.Set(pdsHostKey(rosterHostname), rosterEnc)
-	}
-	if err := batch.Commit(context.Background()); err != nil {
-		return fmt.Errorf("backfill: write repo/%s and counts: %w", did, err)
-	}
-	return nil
-}
-
+// updateRepoStatusAndCounts read-modify-writes one repo row and the
+// aggregates its status change moves, in one commit.
 func (s *Store) updateRepoStatusAndCounts(
 	did atmos.DID,
+	mutate func(*RepoStatus, bool, Status) (func(*HostStatus), error),
+) error {
+	return s.updateRepoStatusesAndCounts([]atmos.DID{did}, mutate)
+}
+
+// updateRepoStatusesAndCounts is updateRepoStatusAndCounts for several DIDs
+// in one commit. Each DID's update reads the aggregates the previous one
+// staged, so the result equals one commit per DID in order.
+func (s *Store) updateRepoStatusesAndCounts(
+	dids []atmos.DID,
 	mutate func(*RepoStatus, bool, Status) (func(*HostStatus), error),
 ) error {
 	s.countsMu.Lock()
 	defer s.countsMu.Unlock()
 
-	rs, err := s.readRepoStatus(did)
+	ctx := context.Background()
+	view := newMetaView(s.db)
+	keys := [][]byte{[]byte(countsKey)}
+	for _, did := range dids {
+		keys = append(keys, repoKey(did))
+	}
+	if err := view.prefetch(ctx, keys); err != nil {
+		return err
+	}
+	batch := view.batch(s.db.NewBatch())
+	for _, did := range dids {
+		if err := s.stageRepoStatusUpdate(ctx, view, batch, did, mutate); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(ctx); err != nil {
+		if len(dids) == 1 {
+			return fmt.Errorf("backfill: write repo/%s and counts: %w", dids[0], err)
+		}
+		return fmt.Errorf("backfill: write %d repo rows and counts: %w", len(dids), err)
+	}
+	return nil
+}
+
+// stageRepoStatusUpdate stages one repo row's read-modify-write and the
+// aggregate transitions it implies, reading through view.
+func (s *Store) stageRepoStatusUpdate(
+	ctx context.Context,
+	view *metaView,
+	batch metastore.Batch,
+	did atmos.DID,
+	mutate func(*RepoStatus, bool, Status) (func(*HostStatus), error),
+) error {
+	rs, err := readRepoStatusFrom(view, did)
 	if err != nil {
 		return err
 	}
@@ -344,8 +389,11 @@ func (s *Store) updateRepoStatusAndCounts(
 	if err != nil {
 		return err
 	}
+	if err := prefetchHostStatuses(ctx, view, oldHost, rs.Host); err != nil {
+		return err
+	}
 
-	counts, err := s.loadCountsLocked()
+	counts, err := loadCountsFrom(view)
 	if err != nil {
 		return err
 	}
@@ -359,7 +407,6 @@ func (s *Store) updateRepoStatusAndCounts(
 		return err
 	}
 
-	batch := s.db.NewBatch()
 	batch.Set(repoKey(did), enc)
 	batch.Set([]byte(countsKey), countsEnc)
 	// A steady-state retry can re-attribute a DID to a different host than
@@ -370,7 +417,7 @@ func (s *Store) updateRepoStatusAndCounts(
 	// bootstrap path never moves a host post-terminal, so this is a no-op
 	// there.)
 	if oldHost != "" && oldHost != rs.Host {
-		oldHS, _, err := loadHostStatus(s.db, oldHost)
+		oldHS, _, err := loadHostStatus(view, oldHost)
 		if err != nil {
 			return err
 		}
@@ -386,7 +433,7 @@ func (s *Store) updateRepoStatusAndCounts(
 		}
 	}
 	if rs.Host != "" {
-		hs, _, err := loadHostStatus(s.db, rs.Host)
+		hs, _, err := loadHostStatus(view, rs.Host)
 		if err != nil {
 			return err
 		}
@@ -398,10 +445,39 @@ func (s *Store) updateRepoStatusAndCounts(
 			return err
 		}
 	}
-	if err := batch.Commit(context.Background()); err != nil {
-		return fmt.Errorf("backfill: write repo/%s and counts: %w", did, err)
-	}
 	return nil
+}
+
+// prefetchRepoHosts loads, in one read, the host aggregates that the
+// entries' existing repo rows are attributed to.
+func prefetchRepoHosts(ctx context.Context, view *metaView, entries []atmossync.ListReposEntry) error {
+	hosts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		rs, err := readRepoStatusFrom(view, entry.DID)
+		if err != nil {
+			return err
+		}
+		if rs != nil {
+			hosts = append(hosts, rs.Host)
+		}
+	}
+	return prefetchHostStatuses(ctx, view, hosts...)
+}
+
+// prefetchHostStatuses loads the aggregates for the given hosts in one read.
+// Empty and unnormalizable hosts are skipped; loadHostStatus reports the
+// latter when the caller reaches it.
+func prefetchHostStatuses(ctx context.Context, view *metaView, hosts ...string) error {
+	keys := make([][]byte, 0, len(hosts))
+	for _, host := range hosts {
+		if host == "" {
+			continue
+		}
+		if _, key, err := normalizeHostStatusKey(host); err == nil {
+			keys = append(keys, key)
+		}
+	}
+	return view.prefetch(ctx, keys)
 }
 
 func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, completions []queuedCompletion, cursors []queuedHostCursor) (func(error), error) {
@@ -428,7 +504,38 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		return nil, nil
 	}
 
-	counts, err := s.loadCountsLocked()
+	// Read everything the staging below touches in two round trips — the
+	// rows named up front, then the host buckets those rows were attributed
+	// to — rather than one per completion while holding countsMu.
+	view := newMetaView(s.db)
+	keys := [][]byte{[]byte(countsKey)}
+	for _, c := range completions {
+		keys = append(keys, repoKey(c.did))
+	}
+	for _, cursor := range cursors {
+		keys = append(keys, pdsHostKey(cursor.host))
+	}
+	if err := view.prefetch(context.Background(), keys); err != nil {
+		return fail(err)
+	}
+	hosts := make([]string, 0, 2*len(completions))
+	for _, c := range completions {
+		rs, err := readRepoStatusFrom(view, c.did)
+		if err != nil {
+			return fail(err)
+		}
+		if rs != nil {
+			hosts = append(hosts, rs.Host)
+		}
+		if bucket, ok := hostBucketFromAuthority(c.host); ok {
+			hosts = append(hosts, bucket)
+		}
+	}
+	if err := prefetchHostStatuses(context.Background(), view, hosts...); err != nil {
+		return fail(err)
+	}
+
+	counts, err := loadCountsFrom(view)
 	if err != nil {
 		return fail(err)
 	}
@@ -452,7 +559,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		hadRow := cached.hadRow
 		if !ok {
 			var err error
-			rs, err = s.readRepoStatus(c.did)
+			rs, err = readRepoStatusFrom(view, c.did)
 			if err != nil {
 				return fail(err)
 			}
@@ -488,7 +595,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 			if oldHost != "" && oldHost != bucket {
 				oldHS := hostCache[oldHost]
 				if oldHS == nil {
-					oldHS, _, err = loadHostStatus(s.db, oldHost)
+					oldHS, _, err = loadHostStatus(view, oldHost)
 					if err != nil {
 						return fail(err)
 					}
@@ -516,7 +623,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 			hs := hostCache[rs.Host]
 			if hs == nil {
 				var err error
-				hs, _, err = loadHostStatus(s.db, rs.Host)
+				hs, _, err = loadHostStatus(view, rs.Host)
 				if err != nil {
 					return fail(err)
 				}
@@ -532,7 +639,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		}
 	}
 	for _, cursor := range cursors {
-		host, _, err := s.loadPDSHost(cursor.host)
+		host, _, err := loadPDSHostFrom(view, cursor.host)
 		if err != nil {
 			return fail(err)
 		}
@@ -710,7 +817,13 @@ func applyHostActiveTransition(h *HostStatus, oldActive, nextActive bool) {
 // It returns (nil, nil) when the row doesn't exist so callers can
 // decide whether absence is an error in their context.
 func (s *Store) readRepoStatus(did atmos.DID) (*RepoStatus, error) {
-	val, err := s.db.Get(context.Background(), repoKey(did))
+	return readRepoStatusFrom(s.db, did)
+}
+
+// readRepoStatusFrom is readRepoStatus reading through db, normally a
+// metaView.
+func readRepoStatusFrom(db metastore.Store, did atmos.DID) (*RepoStatus, error) {
+	val, err := db.Get(context.Background(), repoKey(did))
 	if errors.Is(err, metastore.ErrNotFound) {
 		return nil, nil
 	}
@@ -724,7 +837,25 @@ func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) err
 	s.countsMu.Lock()
 	defer s.countsMu.Unlock()
 
-	rs, err := s.readRepoStatus(did)
+	ctx := context.Background()
+	view := newMetaView(s.db)
+	if err := view.prefetch(ctx, [][]byte{repoKey(did)}); err != nil {
+		return err
+	}
+	batch := view.batch(s.db.NewBatch())
+	if err := stageRepoHostActive(ctx, view, batch, did, pds, active); err != nil {
+		return err
+	}
+	if err := batch.Commit(ctx); err != nil {
+		return fmt.Errorf("backfill: write repo/%s and host active: %w", did, err)
+	}
+	return nil
+}
+
+// stageRepoHostActive stages an Active flip (and, given a pds, a PDS
+// re-stamp) for an existing repo row, reading through view.
+func stageRepoHostActive(ctx context.Context, view *metaView, batch metastore.Batch, did atmos.DID, pds string, active bool) error {
+	rs, err := readRepoStatusFrom(view, did)
 	if err != nil {
 		return err
 	}
@@ -743,16 +874,18 @@ func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) err
 			rs.Host = newHost
 		}
 	}
+	if err := prefetchHostStatuses(ctx, view, oldHost, rs.Host); err != nil {
+		return err
+	}
 
 	enc, err := encodeRepoStatus(rs)
 	if err != nil {
 		return err
 	}
 
-	batch := s.db.NewBatch()
 	batch.Set(repoKey(did), enc)
 	if oldHost != "" && oldHost != rs.Host {
-		hs, _, err := loadHostStatus(s.db, oldHost)
+		hs, _, err := loadHostStatus(view, oldHost)
 		if err != nil {
 			return err
 		}
@@ -768,7 +901,7 @@ func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) err
 		}
 	}
 	if rs.Host != "" {
-		hs, _, err := loadHostStatus(s.db, rs.Host)
+		hs, _, err := loadHostStatus(view, rs.Host)
 		if err != nil {
 			return err
 		}
@@ -784,9 +917,6 @@ func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) err
 		if err := stageHostStatus(batch, hs); err != nil {
 			return err
 		}
-	}
-	if err := batch.Commit(context.Background()); err != nil {
-		return fmt.Errorf("backfill: write repo/%s and host active: %w", did, err)
 	}
 	return nil
 }
@@ -909,24 +1039,33 @@ func handleIndexChanged(a, b string) bool {
 	return string(ak) != string(bk)
 }
 
-// OnDiscover writes a fresh RepoStatus at status=not_started for a
-// DID the engine has never seen. atmos guarantees this fires at most
-// once per DID per Lookup-StateUnknown path.
-func (s *Store) onDiscover(_ context.Context, host string, entry atmossync.ListReposEntry) error {
-	bucket, _ := hostBucketFromAuthority(host)
-	rs := &RepoStatus{
-		Backfill: RepoBackfillStatus{
-			Status:    StatusNotStarted,
-			StartedAt: timeNow(),
-		},
-		PDS: host, Host: bucket, Active: entry.Active,
+// discoverMode selects the row a reconcile writes for a DID it discovers.
+type discoverMode int
+
+const (
+	// discoverBootstrap records a not_started row this run downloads.
+	discoverBootstrap discoverMode = iota
+	// discoverForRetry records a failed marker that steady-state retry
+	// downloads (merge discovery, after bootstrap's downloads are done).
+	discoverForRetry
+)
+
+func (m discoverMode) newRow(host, bucket string, entry atmossync.ListReposEntry, now time.Time) *RepoStatus {
+	rs := &RepoStatus{PDS: host, Host: bucket, Active: entry.Active}
+	switch m {
+	case discoverForRetry:
+		rs.Backfill = RepoBackfillStatus{Status: StatusFailed, LastError: "discovered post-bootstrap; queued for retry"}
+	default:
+		rs.Backfill = RepoBackfillStatus{Status: StatusNotStarted, StartedAt: now}
 	}
-	if err := s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil, host); err != nil {
-		return err
-	}
-	s.markDiscoveredThisRun(entry.DID)
-	s.metrics.incDiscovered()
-	return nil
+	return rs
+}
+
+// onDiscover writes a fresh RepoStatus at status=not_started for a DID the
+// engine has never seen. atmos guarantees discovery fires at most once per
+// DID per Lookup-StateUnknown path.
+func (s *Store) onDiscover(ctx context.Context, host string, entry atmossync.ListReposEntry) error {
+	return s.reconcileBatch(ctx, host, []atmossync.ListReposEntry{entry}, nil, discoverBootstrap)
 }
 
 // OnDiscover is retained for Jetstream's selected-repo and focused store
@@ -935,30 +1074,182 @@ func (s *Store) OnDiscover(ctx context.Context, entry atmossync.ListReposEntry) 
 	return s.onDiscover(ctx, "", entry)
 }
 
-// OnDiscoverForRetry records a merge-discovery-only marker for an unknown DID.
-// Steady-state retry owns the eventual direct-PDS download.
-func (s *Store) OnDiscoverForRetry(_ context.Context, host string, entry atmossync.ListReposEntry) error {
-	bucket, _ := hostBucketFromAuthority(host)
-	rs := &RepoStatus{
-		Backfill: RepoBackfillStatus{Status: StatusFailed, LastError: "discovered post-bootstrap; queued for retry"},
-		PDS:      host, Host: bucket, Active: entry.Active,
+// OnDiscoverForRetry records merge-discovery-only markers for unknown DIDs,
+// all listed by host, in one write. Steady-state retry owns the eventual
+// direct-PDS downloads.
+func (s *Store) OnDiscoverForRetry(ctx context.Context, host string, entries []atmossync.ListReposEntry) error {
+	return s.reconcileBatch(ctx, host, entries, nil, discoverForRetry)
+}
+
+// reconcileBatch records one listRepos page's reconcile outcome in one
+// group-committed transaction: a new row per discovered DID, with the counts,
+// host aggregate, and roster moves they imply applied once for the page, then
+// the Active flips. It returns once the write is durable.
+func (s *Store) reconcileBatch(ctx context.Context, host string, discovered, updated []atmossync.ListReposEntry, mode discoverMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return s.putRepoStatusAndCounts(entry.DID, rs, false, "", nil, host)
+	if len(discovered) == 0 && len(updated) == 0 {
+		return nil
+	}
+	bucket, _ := hostBucketFromAuthority(host)
+	keys := [][]byte{[]byte(countsKey)}
+	if bucket != "" {
+		if _, key, err := normalizeHostStatusKey(bucket); err == nil {
+			keys = append(keys, key)
+		}
+	}
+	if host != "" {
+		keys = append(keys, pdsHostKey(host))
+	}
+	for _, entry := range updated {
+		keys = append(keys, repoKey(entry.DID))
+	}
+	return s.commitGrouped(&groupWrite{
+		keys: keys,
+		apply: func(ctx context.Context, view *metaView, batch metastore.Batch) error {
+			if err := stageDiscovered(view, batch, host, bucket, discovered, mode); err != nil {
+				return err
+			}
+			if err := prefetchRepoHosts(ctx, view, updated); err != nil {
+				return err
+			}
+			for _, entry := range updated {
+				if err := stageRepoHostActive(ctx, view, batch, entry.DID, host, entry.Active); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		committed: func() {
+			for _, entry := range discovered {
+				if mode == discoverBootstrap {
+					s.markDiscoveredThisRun(entry.DID)
+					s.metrics.incDiscovered()
+				}
+			}
+			for range updated {
+				s.metrics.incActiveFlips()
+			}
+		},
+	})
+}
+
+// stageDiscovered stages a fresh row for every entry, which atmos guarantees
+// has none, and moves the counts row, the host aggregate, and the roster
+// row's ActualAccounts once for all of them.
+func stageDiscovered(view *metaView, batch metastore.Batch, host, bucket string, entries []atmossync.ListReposEntry, mode discoverMode) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	counts, err := loadCountsFrom(view)
+	if err != nil {
+		return err
+	}
+	var hs *HostStatus
+	if bucket != "" {
+		if hs, _, err = loadHostStatus(view, bucket); err != nil {
+			return err
+		}
+	}
+	var roster *PDSHost
+	if host != "" {
+		if roster, _, err = loadPDSHostFrom(view, host); err != nil {
+			return err
+		}
+	}
+	now := timeNow()
+	for _, entry := range entries {
+		rs := mode.newRow(host, bucket, entry, now)
+		enc, err := encodeRepoStatus(rs)
+		if err != nil {
+			return err
+		}
+		batch.Set(repoKey(entry.DID), enc)
+		applyCountTransition(&counts, false, "", rs.Backfill.Status)
+		if hs != nil {
+			applyHostStatusTransition(hs, firstInHostBucket(false, "", bucket), rs.Active, "", rs.Backfill.Status)
+		}
+		if roster != nil {
+			roster.ActualAccounts++
+		}
+	}
+	countsEnc, err := encodeCounts(counts)
+	if err != nil {
+		return err
+	}
+	batch.Set([]byte(countsKey), countsEnc)
+	if hs != nil {
+		if err := stageHostStatus(batch, hs); err != nil {
+			return err
+		}
+	}
+	if roster != nil {
+		roster.UpdatedAt = now
+		rosterEnc, err := encodePDSHost(roster)
+		if err != nil {
+			return err
+		}
+		batch.Set(pdsHostKey(host), rosterEnc)
+	}
+	return nil
+}
+
+// commitGrouped commits w in a group transaction (see groupCommitter).
+func (s *Store) commitGrouped(w *groupWrite) error {
+	return s.group.commit(w, s.commitGroup)
+}
+
+// commitGroup runs one group's transaction under the aggregate locks every
+// member's apply expects: one prefetch for every member's keys, each apply in
+// queue order against a shared view, one commit.
+func (s *Store) commitGroup(group []*groupWrite) error {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+
+	ctx := context.Background()
+	view := newMetaView(s.db)
+	var keys [][]byte
+	for _, w := range group {
+		keys = append(keys, w.keys...)
+	}
+	if err := view.prefetch(ctx, keys); err != nil {
+		return err
+	}
+	batch := view.batch(s.db.NewBatch())
+	for _, w := range group {
+		if err := w.apply(ctx, view, batch); err != nil {
+			return err
+		}
+	}
+	ops := batch.Len()
+	if ops == 0 {
+		return nil
+	}
+	if err := batch.Commit(ctx); err != nil {
+		return fmt.Errorf("backfill: group commit of %d writes: %w", len(group), err)
+	}
+	s.metrics.observeGroupCommit(len(group), ops)
+	return nil
 }
 
 // HostDiscoveryCursor reopens a drained/exhausted host at its last non-empty
 // bootstrap cursor so merge discovery scans only tail pages.
 func (s *Store) HostDiscoveryCursor(ctx context.Context, hostname string) (string, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return "", false, err
-	}
-	s.rosterMu.Lock()
-	defer s.rosterMu.Unlock()
-	host, _, err := s.loadPDSHost(hostname)
+	states, err := s.HostDiscoveryCursors(ctx, []string{hostname})
 	if err != nil {
 		return "", false, err
 	}
-	return host.LastNonEmptyCursor, false, nil
+	return states[0].Cursor, states[0].Drained, nil
+}
+
+// HostDiscoveryCursors is HostDiscoveryCursor for many hosts in one read.
+func (s *Store) HostDiscoveryCursors(ctx context.Context, hostnames []string) ([]atmosbackfill.HostCursorState, error) {
+	return s.hostCursors(ctx, hostnames, func(host *PDSHost) atmosbackfill.HostCursorState {
+		return atmosbackfill.HostCursorState{Cursor: host.LastNonEmptyCursor}
+	})
 }
 
 // OnUpdate flips the Active flag on an existing row. The lifecycle
@@ -978,7 +1269,12 @@ func (s *Store) OnUpdate(ctx context.Context, entry atmossync.ListReposEntry) er
 }
 
 func (s *Store) loadPDSHost(hostname string) (*PDSHost, bool, error) {
-	val, err := s.db.Get(context.Background(), pdsHostKey(hostname))
+	return loadPDSHostFrom(s.db, hostname)
+}
+
+// loadPDSHostFrom is loadPDSHost reading through db, normally a metaView.
+func loadPDSHostFrom(db metastore.Store, hostname string) (*PDSHost, bool, error) {
+	val, err := db.Get(context.Background(), pdsHostKey(hostname))
 	if errors.Is(err, metastore.ErrNotFound) {
 		return &PDSHost{Hostname: hostname}, false, nil
 	}
@@ -992,50 +1288,95 @@ func (s *Store) loadPDSHost(hostname string) (*PDSHost, bool, error) {
 	return host, true, nil
 }
 
-func (s *Store) savePDSHost(host *PDSHost) error {
-	enc, err := encodePDSHost(host)
-	if err != nil {
-		return err
-	}
-	if err := s.db.Set(context.Background(), pdsHostKey(host.Hostname), enc); err != nil {
-		return fmt.Errorf("backfill: write pdshost/%s: %w", host.Hostname, err)
-	}
-	return nil
-}
-
+// OnHost upserts one host's relay metadata.
 func (s *Store) OnHost(ctx context.Context, info atmosbackfill.HostInfo) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	s.rosterMu.Lock()
-	defer s.rosterMu.Unlock()
-	host, exists, err := s.loadPDSHost(info.Hostname)
-	if err != nil {
-		return err
-	}
-	now := timeNow()
-	if !exists {
-		host.FirstSeenAt = now
-		host.State = string(atmosbackfill.HostStatePending)
-	}
-	host.RelayStatus = info.RelayStatus
-	host.RelayAccounts = info.RelayAccounts
-	host.Seq = info.Seq
-	host.UpdatedAt = now
-	return s.savePDSHost(host)
+	return s.recordHosts(ctx, []atmosbackfill.HostInfo{info})
 }
 
+// HostCursor returns the host's resume cursor and whether a prior run fully
+// enumerated it.
 func (s *Store) HostCursor(ctx context.Context, hostname string) (string, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return "", false, err
-	}
-	s.rosterMu.Lock()
-	defer s.rosterMu.Unlock()
-	host, _, err := s.loadPDSHost(hostname)
+	states, err := s.hostCursors(ctx, []string{hostname}, bootstrapHostCursor)
 	if err != nil {
 		return "", false, err
 	}
-	return host.ListReposCursor, host.Enumerated, nil
+	return states[0].Cursor, states[0].Drained, nil
+}
+
+// bootstrapHostCursor is the bootstrap projection of a roster row: resume
+// from the last checkpoint, and skip only a host a prior run fully
+// enumerated.
+func bootstrapHostCursor(host *PDSHost) atmosbackfill.HostCursorState {
+	return atmosbackfill.HostCursorState{Cursor: host.ListReposCursor, Drained: host.Enumerated}
+}
+
+// recordHosts upserts each host's relay metadata in one group-committed
+// transaction.
+func (s *Store) recordHosts(ctx context.Context, hosts []atmosbackfill.HostInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(hosts) == 0 {
+		return nil
+	}
+	keys := make([][]byte, len(hosts))
+	for i, info := range hosts {
+		keys[i] = pdsHostKey(info.Hostname)
+	}
+	return s.commitGrouped(&groupWrite{
+		keys: keys,
+		apply: func(_ context.Context, view *metaView, batch metastore.Batch) error {
+			now := timeNow()
+			for _, info := range hosts {
+				host, exists, err := loadPDSHostFrom(view, info.Hostname)
+				if err != nil {
+					return err
+				}
+				if !exists {
+					host.FirstSeenAt = now
+					host.State = string(atmosbackfill.HostStatePending)
+				}
+				host.RelayStatus = info.RelayStatus
+				host.RelayAccounts = info.RelayAccounts
+				host.Seq = info.Seq
+				host.UpdatedAt = now
+				enc, err := encodePDSHost(host)
+				if err != nil {
+					return err
+				}
+				batch.Set(pdsHostKey(info.Hostname), enc)
+			}
+			return nil
+		},
+	})
+}
+
+// hostCursors reads every host's roster row in one round trip and returns
+// project's answer for each, in order. An unseen host projects from an empty
+// row.
+func (s *Store) hostCursors(ctx context.Context, hostnames []string, project func(*PDSHost) atmosbackfill.HostCursorState) ([]atmosbackfill.HostCursorState, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+	view := newMetaView(s.db)
+	keys := make([][]byte, len(hostnames))
+	for i, hostname := range hostnames {
+		keys[i] = pdsHostKey(hostname)
+	}
+	if err := view.prefetch(context.Background(), keys); err != nil {
+		return nil, err
+	}
+	out := make([]atmosbackfill.HostCursorState, len(hostnames))
+	for i, hostname := range hostnames {
+		host, _, err := loadPDSHostFrom(view, hostname)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = project(host)
+	}
+	return out, nil
 }
 
 func (s *Store) SaveHostCursor(ctx context.Context, hostname, cursor string) error {

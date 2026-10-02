@@ -325,6 +325,47 @@ func TestTxnMetrics(t *testing.T) {
 	require.InDelta(t, 0, testutil.ToFloat64(m.TxnErrors.WithLabelValues("read")), 0)
 }
 
+// The pool keeps a warm floor of connections and exports its statistics,
+// so a saturated pool shows on /metrics instead of only in a goroutine dump.
+func TestPoolTuningAndMetrics(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := pgstore.NewMetrics(reg)
+	// Nothing is exported before a pool is opened.
+	require.Zero(t, testutil.CollectAndCount(reg, "jetstream_pg_pool_conns"))
+
+	_, u := pgtest.Open(t, nil)
+	s := pgtest.OpenURL(t, u, m)
+	cfg := s.Pool().Config()
+	require.Equal(t, int32(8), cfg.MaxConns)
+	require.Equal(t, int32(1), cfg.MinIdleConns)
+	require.Equal(t, int32(1), cfg.MinConns)
+	require.Positive(t, cfg.MaxConnLifetimeJitter)
+
+	getMeta(t, s, "k")
+	require.Equal(t, 4, testutil.CollectAndCount(reg, "jetstream_pg_pool_conns"))
+	gauge, err := reg.Gather()
+	require.NoError(t, err)
+	var maxConns, acquires float64
+	for _, mf := range gauge {
+		for _, metric := range mf.GetMetric() {
+			for _, l := range metric.GetLabel() {
+				switch {
+				case mf.GetName() == "jetstream_pg_pool_conns" && l.GetValue() == "max":
+					maxConns = metric.GetGauge().GetValue()
+				case mf.GetName() == "jetstream_pg_pool_acquires_total" && l.GetValue() != "canceled":
+					acquires += metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	require.InDelta(t, 8, maxConns, 0)
+	require.Positive(t, acquires)
+
+	// The default pool is sized for a leader's concurrent readers.
+	require.Equal(t, 32, pgstore.DefaultMaxConns)
+}
+
 // A follower connects as the read-only role (design §24). It can LISTEN,
 // check versions, and load the whole catalog in one read snapshot, and it
 // cannot write anything: reader pods need no write privilege.
