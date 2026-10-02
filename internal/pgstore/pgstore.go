@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -35,8 +36,28 @@ const (
 	idleInTxSessionTimeout = 30 * time.Second
 )
 
-// DefaultMaxConns is JETSTREAM_PG_MAX_CONNS's default (design §18).
-const DefaultMaxConns = 16
+// DefaultMaxConns is JETSTREAM_PG_MAX_CONNS's default (design §18). A leader
+// runs the live verifier's per-commit chain reads (up to 32 at once), the
+// backfill's batched metadata reads and group commits, and archive serving
+// reads concurrently; 32 keeps those from queueing on the pool while staying
+// far below what PostgreSQL handles comfortably per pod.
+const DefaultMaxConns = 32
+
+// Pool tuning (design §9.1 keeps transactions short, so connections turn
+// over quickly and reuse is high). Over a WAN link a new connection costs a
+// TCP, TLS, and auth handshake — several round trips — so the pool keeps a
+// warm floor of idle connections instead of opening them on a burst, and
+// recycles old connections with jitter so they do not all reconnect at once.
+const (
+	// One minIdleFraction of MaxConns stays connected and idle. Busier
+	// stretches keep their working set warm anyway (maxConnIdleTime); the
+	// floor covers the burst after a quiet period.
+	minIdleFraction       = 8
+	maxConnLifetime       = time.Hour
+	maxConnLifetimeJitter = 10 * time.Minute
+	maxConnIdleTime       = 30 * time.Minute
+	healthCheckPeriod     = 30 * time.Second
+)
 
 // Config configures Open.
 type Config struct {
@@ -99,10 +120,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	pcfg.MaxConns = cfg.MaxConns
-	if pcfg.MaxConns <= 0 {
-		pcfg.MaxConns = DefaultMaxConns
-	}
+	tunePool(pcfg, cfg.MaxConns)
 	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: open pool: %w", err)
@@ -111,7 +129,23 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("pgstore: connect: %w", err)
 	}
+	cfg.Metrics.watchPool(pool)
 	return &Store{pool: pool, connCfg: pcfg.ConnConfig.Copy(), metrics: cfg.Metrics}, nil
+}
+
+// tunePool applies the pool tuning above. maxConns <= 0 means
+// DefaultMaxConns.
+func tunePool(pcfg *pgxpool.Config, maxConns int32) {
+	pcfg.MaxConns = maxConns
+	if pcfg.MaxConns <= 0 {
+		pcfg.MaxConns = DefaultMaxConns
+	}
+	pcfg.MinIdleConns = max(1, pcfg.MaxConns/minIdleFraction)
+	pcfg.MinConns = pcfg.MinIdleConns
+	pcfg.MaxConnLifetime = maxConnLifetime
+	pcfg.MaxConnLifetimeJitter = maxConnLifetimeJitter
+	pcfg.MaxConnIdleTime = maxConnIdleTime
+	pcfg.HealthCheckPeriod = healthCheckPeriod
 }
 
 // Close closes the pool.
@@ -126,6 +160,8 @@ type Metrics struct {
 	TxnDuration      *prometheus.HistogramVec
 	TxnErrors        *prometheus.CounterVec
 	ListenReconnects prometheus.Counter
+
+	pool poolCollector
 }
 
 // NewMetrics registers the series against reg. Construct exactly once per
@@ -146,8 +182,65 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help: "Times the LISTEN jetstream_catalog connection was lost and re-established.",
 		}),
 	}
-	reg.MustRegister(m.TxnDuration, m.TxnErrors, m.ListenReconnects)
+	reg.MustRegister(m.TxnDuration, m.TxnErrors, m.ListenReconnects, &m.pool)
 	return m
+}
+
+// watchPool exports pool's statistics. A process opens one pool per Metrics;
+// a later pool replaces an earlier one.
+func (m *Metrics) watchPool(pool *pgxpool.Pool) {
+	if m != nil {
+		m.pool.pool.Store(pool)
+	}
+}
+
+// poolCollector reads pgxpool statistics at scrape time.
+type poolCollector struct {
+	pool atomic.Pointer[pgxpool.Pool]
+}
+
+var (
+	poolConnsDesc = prometheus.NewDesc("jetstream_pg_pool_conns",
+		"PostgreSQL pool connections by state (acquired, idle, constructing) and the max.", []string{"state"}, nil)
+	poolAcquiresDesc = prometheus.NewDesc("jetstream_pg_pool_acquires_total",
+		"PostgreSQL pool acquires by outcome: immediate (an idle connection was ready), waited (none was), canceled.", []string{"outcome"}, nil)
+	poolAcquireSecondsDesc = prometheus.NewDesc("jetstream_pg_pool_acquire_wait_seconds_total",
+		"Total time acquires spent waiting for a connection because none was idle.", nil, nil)
+	poolNewConnsDesc = prometheus.NewDesc("jetstream_pg_pool_new_conns_total",
+		"PostgreSQL connections the pool opened.", nil, nil)
+	poolDestroyedDesc = prometheus.NewDesc("jetstream_pg_pool_destroyed_conns_total",
+		"PostgreSQL connections the pool closed for age, by reason (max_lifetime, max_idle).", []string{"reason"}, nil)
+)
+
+func (c *poolCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- poolConnsDesc
+	ch <- poolAcquiresDesc
+	ch <- poolAcquireSecondsDesc
+	ch <- poolNewConnsDesc
+	ch <- poolDestroyedDesc
+}
+
+func (c *poolCollector) Collect(ch chan<- prometheus.Metric) {
+	pool := c.pool.Load()
+	if pool == nil {
+		return
+	}
+	st := pool.Stat()
+	gauge := func(v int32, state string) {
+		ch <- prometheus.MustNewConstMetric(poolConnsDesc, prometheus.GaugeValue, float64(v), state)
+	}
+	gauge(st.AcquiredConns(), "acquired")
+	gauge(st.IdleConns(), "idle")
+	gauge(st.ConstructingConns(), "constructing")
+	gauge(st.MaxConns(), "max")
+	waited := st.EmptyAcquireCount()
+	ch <- prometheus.MustNewConstMetric(poolAcquiresDesc, prometheus.CounterValue, float64(st.AcquireCount()-waited), "immediate")
+	ch <- prometheus.MustNewConstMetric(poolAcquiresDesc, prometheus.CounterValue, float64(waited), "waited")
+	ch <- prometheus.MustNewConstMetric(poolAcquiresDesc, prometheus.CounterValue, float64(st.CanceledAcquireCount()), "canceled")
+	ch <- prometheus.MustNewConstMetric(poolAcquireSecondsDesc, prometheus.CounterValue, st.EmptyAcquireWaitTime().Seconds())
+	ch <- prometheus.MustNewConstMetric(poolNewConnsDesc, prometheus.CounterValue, float64(st.NewConnsCount()))
+	ch <- prometheus.MustNewConstMetric(poolDestroyedDesc, prometheus.CounterValue, float64(st.MaxLifetimeDestroyCount()), "max_lifetime")
+	ch <- prometheus.MustNewConstMetric(poolDestroyedDesc, prometheus.CounterValue, float64(st.MaxIdleDestroyCount()), "max_idle")
 }
 
 func (m *Metrics) observe(kind string, start time.Time, failed bool) {
