@@ -1,6 +1,6 @@
 # Disaggregated backfill: batch metadata round trips
 
-2026-10-02. Branch `jc/pg-batch-backfill`, with atmos branch `jc/backfill-batch-store`.
+2026-10-02. Branch `jc/pg-batch-backfill`, with atmos v0.6.0 (jcalabro/atmos#12).
 
 ## What pop2 showed
 
@@ -47,7 +47,6 @@ One fixture lesson: aggregate decrements clamp at zero. A test that seeds repo r
 
 ## Follow-ups
 
-- **Pin a tagged atmos.** Jetstream's `go.mod` pins the unmerged atmos PR (jcalabro/atmos#12) by pseudo-version. Bump to the release tag once it merges.
 - **Pipeline the catalog transaction.** Each commit makes 5 round trips (BEGIN, fence, apply, NOTIFY, COMMIT), and the `archive` row lock is held for 4 of them. Sending BEGIN with the fence, and the apply with NOTIFY and COMMIT, would cut both commit latency and lock hold time for every leader write, block commits included.
 - **Cache the verifier's chain reads.** The live verifier does one `syncstate` `MetaGet` per commit, about 300 per second. A cache in front of `LoadChain` would cut that load.
 - **Revisit the layer 3 single-host setting.** `BackfillMaxActiveHosts = 1` in layer 3 no longer has to protect against atmos's mutex. An 8-host experiment passed 20 seeds, but so did unmodified main, because the simulated world is too small to collide. Raising the setting needs a mutation re-run.
