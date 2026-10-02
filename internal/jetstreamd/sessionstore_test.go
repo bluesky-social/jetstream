@@ -23,6 +23,8 @@ type failingReads struct {
 
 func (s failingReads) Get(context.Context, []byte) ([]byte, error) { return nil, s.err }
 
+func (s failingReads) GetMany(context.Context, [][]byte) ([][]byte, error) { return nil, s.err }
+
 func (s failingReads) NewIter(context.Context, []byte, []byte) (metastore.Iterator, error) {
 	return nil, s.err
 }
@@ -51,8 +53,9 @@ func TestSessionStore_ReadFailureEndsSession(t *testing.T) {
 
 	conn := errors.New("connection reset")
 	for name, read := range map[string]func(*sessionStore) error{
-		"get":  func(s *sessionStore) error { _, err := s.Get(t.Context(), []byte("k")); return err },
-		"iter": func(s *sessionStore) error { _, err := s.NewIter(t.Context(), nil, nil); return err },
+		"get":      func(s *sessionStore) error { _, err := s.Get(t.Context(), []byte("k")); return err },
+		"get_many": func(s *sessionStore) error { _, err := s.GetMany(t.Context(), [][]byte{[]byte("k")}); return err },
+		"iter":     func(s *sessionStore) error { _, err := s.NewIter(t.Context(), nil, nil); return err },
 	} {
 		s, sess := newStore(conn)
 		err := read(s)

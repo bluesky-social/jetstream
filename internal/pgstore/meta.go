@@ -43,6 +43,59 @@ func (s *Store) MetaGet(ctx context.Context, key []byte) ([]byte, bool, error) {
 	return nonNil(v), true, nil
 }
 
+// MetaGetMany reads several metadata_kv keys in one autocommit query. It
+// returns one value per key, in order, nil for an absent key; a present value
+// is non-nil even when empty. Keys may repeat.
+func (s *Store) MetaGetMany(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	start := time.Now()
+	_, span := tracer.Start(ctx, "pg.meta_get_many")
+	defer span.End()
+	span.SetAttributes(attribute.Int("keys", len(keys)))
+	out, err := s.metaGetMany(ctx, keys)
+	s.metrics.observe(txKindMetaRead, start, err != nil)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "meta_get_many")
+		return nil, fmt.Errorf("pgstore: meta get many: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) metaGetMany(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	out := make([][]byte, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	at := make(map[string][]int, len(keys))
+	params := make([][]byte, 0, len(keys))
+	for i, key := range keys {
+		k := string(key)
+		if _, ok := at[k]; !ok {
+			params = append(params, nonNil(key))
+		}
+		at[k] = append(at[k], i)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT key, value FROM metadata_kv WHERE key = ANY($1::bytea[])`, params)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k, v []byte
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		v = nonNil(v)
+		for n, i := range at[string(k)] {
+			if n > 0 {
+				v = append([]byte{}, v...)
+			}
+			out[i] = v
+		}
+	}
+	return out, rows.Err()
+}
+
 // MetaScan returns up to limit rows with lower <= key < upper in bytewise
 // order (bytea compares as memcmp). A nil upper is unbounded. Callers page
 // by passing the last key plus a zero byte as the next lower bound.

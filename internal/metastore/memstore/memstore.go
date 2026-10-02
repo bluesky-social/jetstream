@@ -37,6 +37,20 @@ func (s *Store) Get(_ context.Context, key []byte) ([]byte, error) {
 	return bytes.Clone(v), nil
 }
 
+// GetMany reads every key under one lock, so unlike the interface requires,
+// the result is a snapshot.
+func (s *Store) GetMany(_ context.Context, keys [][]byte) ([][]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([][]byte, len(keys))
+	for i, key := range keys {
+		if v, ok := s.data[string(key)]; ok {
+			out[i] = append([]byte{}, v...)
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) Set(ctx context.Context, key, value []byte) error {
 	b := s.NewBatch()
 	b.Set(key, value)

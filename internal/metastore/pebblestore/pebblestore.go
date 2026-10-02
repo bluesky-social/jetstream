@@ -93,6 +93,11 @@ func (s *Store) Get(_ context.Context, key []byte) ([]byte, error) {
 	return out, nil
 }
 
+// GetMany reads each key from the local LSM; a point read is cheap here.
+func (s *Store) GetMany(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	return metastore.GetEach(ctx, s, keys)
+}
+
 func (s *Store) Set(_ context.Context, key, value []byte) error {
 	return s.st.Set(key, value, store.SyncWrites)
 }
