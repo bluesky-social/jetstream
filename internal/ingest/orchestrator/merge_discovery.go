@@ -22,17 +22,19 @@ type discoveryStore struct {
 	runner *mergeRunner
 }
 
-func (s discoveryStore) OnDiscover(ctx context.Context, host string, entry atmossync.ListReposEntry) error {
-	if err := s.base.OnDiscoverForRetry(ctx, host, entry); err != nil {
+func (s discoveryStore) OnDiscover(ctx context.Context, host string, entries []atmossync.ListReposEntry) error {
+	if err := s.base.OnDiscoverForRetry(ctx, host, entries); err != nil {
 		return err
 	}
-	s.runner.metrics.incMergeDIDsDiscoveredPostBootstrap()
-	s.runner.logger.InfoContext(ctx, "discovered post-bootstrap DID", "did", entry.DID, "pds", host)
+	for _, entry := range entries {
+		s.runner.metrics.incMergeDIDsDiscoveredPostBootstrap()
+		s.runner.logger.InfoContext(ctx, "discovered post-bootstrap DID", "did", entry.DID, "pds", host)
+	}
 	return nil
 }
 
-func (s discoveryStore) HostCursor(ctx context.Context, hostname string) (string, bool, error) {
-	return s.base.HostDiscoveryCursor(ctx, hostname)
+func (s discoveryStore) HostCursor(ctx context.Context, hostnames []string) ([]atmosbackfill.HostCursorState, error) {
+	return s.base.HostDiscoveryCursors(ctx, hostnames)
 }
 
 // OnHostExhausted keeps the base bookkeeping but surfaces the miss loudly:

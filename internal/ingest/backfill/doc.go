@@ -11,6 +11,14 @@
 // covers can become durable in that same batch, so a crash may repeat a page
 // but can never skip undurable archive data.
 //
+// atmos's Store takes enumeration callbacks a page at a time, so each
+// listRepos page and listHosts page costs a constant number of metadata
+// round trips, and
+// concurrent hosts' page writes share one group-committed transaction. In
+// disaggregated mode every metadata read is a network round trip and every
+// commit a fenced catalog transaction; per-entry calls would cap a large PDS
+// at a few repos per second (specs/gotchas.md).
+//
 // SegmentHandler.HandleRepo walks the downloaded repo's MST and emits one
 // segment.KindCreate event per record into the shared segment writer.
 package backfill
