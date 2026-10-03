@@ -56,6 +56,13 @@ const (
 //
 // A Tx is not safe for concurrent use. After any method returns an error the
 // only valid call is Rollback.
+//
+// A method that returns only an error and writes (ApplyMeta, InsertHotBatch,
+// InsertActiveBlock, InsertGenerationBlocks, InsertSegment, DeleteNamespace,
+// Notify) may be queued and sent with a later statement, to save a round
+// trip. Its failure is then reported by the first later call, at the latest
+// Commit, and the transaction aborts as it would have anyway. Scripts treat
+// every error alike, so none depends on which call reports it.
 type Tx interface {
 	// FenceBump runs the §6.4 fence. ok=false means no row matched: the
 	// epoch is stale.

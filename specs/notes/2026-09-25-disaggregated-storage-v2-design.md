@@ -566,6 +566,14 @@ Notes:
 - Leader write transactions use `READ COMMITTED` isolation. Correctness comes
   from the fence row lock, not from isolation level.
 - The fence is always the first statement (§6.4).
+- Statements are pipelined to save WAN round trips (pgstore `tx`): `BEGIN`
+  goes in the same round trip as the fence, and a write whose only result is
+  its error (the metadata apply, row inserts, `pg_notify`) is queued and sent
+  with the next statement or with `COMMIT`. PostgreSQL runs a pipeline in
+  order and aborts the transaction at the first failure, so what commits is
+  unchanged; only which call reports a queued write's error moves
+  (`catalog.Tx`). A metadata commit is two round trips, and a direct-mode
+  block commit eight.
 - No S3 calls or other network I/O happen inside a transaction. Upload first,
   then commit.
 - A transaction that returns an error, or whose `COMMIT` result is unknown, ends

@@ -2,6 +2,9 @@ package pgstore_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -15,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/pgstore"
 	"github.com/bluesky-social/jetstream/internal/pgstore/pgtest"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -317,7 +321,8 @@ func TestTxnMetrics(t *testing.T) {
 	require.NoError(t, setMeta(t, s, 0, "k", "v").Commit(t.Context()))
 	getMeta(t, s, "k")
 	tx := setMeta(t, s, 0, "k", "v")
-	require.Error(t, tx.InsertHotBatch(t.Context(), catalog.HotBatchRow{FirstSeq: 1, LastSeq: 1, EventCount: 1}))
+	require.NoError(t, tx.InsertHotBatch(t.Context(), catalog.HotBatchRow{FirstSeq: 1, LastSeq: 1, EventCount: 1}), "queued")
+	require.Error(t, tx.Commit(t.Context()))
 	require.NoError(t, tx.Rollback(t.Context()))
 
 	require.Equal(t, 2, testutil.CollectAndCount(m.TxnDuration))
@@ -433,4 +438,86 @@ func TestReaderRole(t *testing.T) {
 		require.ErrorAs(t, err, &pgErr, stmt)
 		require.Equal(t, "42501", pgErr.Code, "insufficient_privilege: %s", stmt)
 	}
+}
+
+// The leader transaction pipelines its statements (tx.go): BEGIN rides with
+// the fence, and error-only writes ride with the next statement or COMMIT.
+// These are the round trips the two hottest scripts make once the
+// connection has the statements prepared; each was a round trip more per
+// statement before.
+func TestPipelinedRoundTrips(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	_, u := pgtest.Open(t, nil)
+	proxy, pu := pgtest.NewProxy(t, u)
+	// One connection, so the warm-up prepares every statement on the
+	// connection the measured transactions use.
+	s, err := pgstore.Open(ctx, pgstore.Config{URL: pu, MaxConns: 1})
+	require.NoError(t, err)
+	t.Cleanup(s.Close)
+	l := s.NewLease()
+	require.NoError(t, l.Acquire(ctx, time.Minute))
+	sess := catalog.NewSession(catalog.SessionConfig{DB: s, Epoch: l.Epoch()})
+	_, err = sess.InitNamespace(ctx, catalog.Main, nil)
+	require.NoError(t, err)
+
+	next := uint64(1)
+	commitBlock := func() int64 {
+		data := []byte(fmt.Sprintf("block at %d", next))
+		sha := sha256.Sum256(data)
+		var key [16]byte
+		_, err := rand.Read(key[:])
+		require.NoError(t, err)
+		slots, _, err := sess.BeginUploads(ctx, []catalog.UploadRequest{{Key: key, SHA256: sha, Length: int64(len(data))}}, time.Hour)
+		require.NoError(t, err)
+		before := proxy.RoundTrips()
+		_, err = sess.CommitBlock(ctx, catalog.Block{
+			Namespace: catalog.Main,
+			Info:      segment.BlockInfo{MinSeq: next, MaxSeq: next + 9, EventCount: 10, CompressedSize: uint32(len(data)), UncompressedSize: 100},
+			Object:    catalog.ObjectRef{ID: slots[0].ObjectID, SHA256: sha, Pending: true},
+			Meta:      []metastore.Op{{Kind: metastore.OpSet, Key: []byte("block"), Value: data}},
+		})
+		require.NoError(t, err)
+		next += 10
+		return proxy.RoundTrips() - before
+	}
+	commitMeta := func() int64 {
+		before := proxy.RoundTrips()
+		_, err := sess.CommitMeta(ctx, []metastore.Op{
+			{Kind: metastore.OpSet, Key: []byte("a"), Value: []byte("1")},
+			{Kind: metastore.OpDelete, Key: []byte("b")},
+		})
+		require.NoError(t, err)
+		return proxy.RoundTrips() - before
+	}
+	commitBlock()
+	commitMeta()
+
+	// BEGIN+fence, seq, active segment, last block, dedup lookup, mark
+	// available, ref check, then insert+meta+NOTIFY+COMMIT.
+	require.Equal(t, int64(8), commitBlock(), "CommitBlock")
+	// BEGIN+fence, then the meta statements+NOTIFY+COMMIT.
+	require.Equal(t, int64(2), commitMeta(), "CommitMeta")
+
+	got, ok := getMeta(t, s, "block")
+	require.True(t, ok)
+	require.Equal(t, "block at 11", got, "the pipelined commits applied")
+}
+
+// A queued write's failure surfaces from the next round trip, named for the
+// statement that failed rather than the one that carried it.
+func TestQueuedFailureNamesItsStatement(t *testing.T) {
+	t.Parallel()
+	s, _ := pgtest.Open(t, nil)
+	tx := setMeta(t, s, 0, "k", "v")
+	require.NoError(t, tx.InsertHotBatch(t.Context(), catalog.HotBatchRow{FirstSeq: 1, LastSeq: 1, EventCount: 1}))
+	_, _, err := tx.MetaGetForUpdate(t.Context(), []byte("k"))
+	require.ErrorIs(t, err, catalog.ErrSessionEnded)
+	require.ErrorContains(t, err, "metadata/insert_hot_batch (sent with meta_get_for_update)")
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr, "the server's error is still reachable")
+	require.Error(t, tx.Commit(t.Context()))
+	require.NoError(t, tx.Rollback(t.Context()))
+	_, found := getMeta(t, s, "k")
+	require.False(t, found)
 }

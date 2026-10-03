@@ -337,7 +337,11 @@ func TestCompletionBatcherQueueCompleteReplacesDuplicateDID(t *testing.T) {
 	require.Equal(t, "rev-new", rs.Rev)
 }
 
-func TestCompletionBatcherHoldsCountsLockUntilAfterDone(t *testing.T) {
+// A write that follows the hook's staging stages without waiting (countsMu
+// is free once the hook has staged) but does not commit, or return, until
+// the hook's batch is done: it builds on rows that batch may yet fail to
+// commit (commitPipe).
+func TestCompletionBatcherOrdersLaterWritesAfterItsCommit(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -364,6 +368,7 @@ func TestCompletionBatcherHoldsCountsLockUntilAfterDone(t *testing.T) {
 	go func() {
 		discoverDone <- bs.OnDiscover(t.Context(), testListReposEntry(discovered))
 	}()
+	requireStaged(t, bs, repoKey(discovered))
 
 	select {
 	case err := <-discoverDone:
