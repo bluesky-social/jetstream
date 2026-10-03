@@ -1085,6 +1085,18 @@ between the footer upload and the commit leaves the catalog unchanged, apart
 from the footer's uploading row, which GC reclaims. Hot batches keep committing during a seal. Folds wait. The unfolded cap
 (§10.5) bounds how far behind they get.
 
+As built, step 1 fetches and decodes only the blocks an earlier session
+committed. `maintainer.Segment` indexes each block the session commits for the
+footer (`segment.IndexBlock`) on a goroutine of its own as the block commits,
+and the seal adds those indexes to a `segment.SealBuilder` in order. The
+output is byte-identical to `BuildSealed`, which is itself a `SealBuilder` fed
+from a frame source. On pop2 a seal took 2.3 s on average, most of it decoding
+the segment's blocks and building the per-block blooms, while every block
+commit waited behind it. The blooms were slow because each block's filter
+derived the same bloom parameters, which are now derived once per seal. The
+indexes hold each block's distinct DIDs until the seal: about 200MiB for a
+full segment of live traffic, which a seal held all at once before anyway.
+
 ### 10.9 Session start in hot mode
 
 1. Acquire the lease and read the metadata the orchestrator needs.

@@ -736,6 +736,48 @@ func TestDirect_UploadFailureAfterOverlappedCommit(t *testing.T) {
 	require.Equal(t, uint64(blockEvents+1), e.seqKey(catalog.Main))
 }
 
+// A seal reads back only the blocks an earlier session committed: this
+// session's were indexed as they committed. Either way the generation is
+// byte-identical to a local seal of its events.
+func TestDirect_SealReadsBackOnlyEarlierSessionsBlocks(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	rng := rand.New(rand.NewPCG(31, 31))
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{}, ingest.DirectConfig{})
+	require.NoError(t, w.AppendBatch(t.Context(), testEvents(rng, 3*blockEvents)))
+	require.NoError(t, w.Close())
+
+	e.restart()
+	w = e.directWriter(catalog.Main, 1<<20, ingest.Config{}, ingest.DirectConfig{})
+	require.NoError(t, w.AppendBatch(t.Context(), testEvents(rng, 2*blockEvents)))
+	require.NoError(t, w.Flush(t.Context()))
+	before := e.gets.n.Load()
+	require.NoError(t, w.ForceRotate(t.Context()))
+	require.Equal(t, int64(3+1), e.gets.n.Load()-before, "the earlier session's 3 blocks, and the footer upload's read-back")
+	require.NoError(t, w.Close())
+
+	gens := e.generations(e.snapshot())
+	require.Len(t, gens, 1)
+	got := verify(t, gens[0])
+	require.Len(t, got, 5*blockEvents)
+	require.Equal(t, localSeal(t, got), gens[0].file())
+}
+
+// A seal fails on a committed block whose frame does not index, rather than
+// seal a footer that leaves it out.
+func TestSegment_SealFailsOnUnindexableBlock(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	seg, err := maintainer.OpenSegment(t.Context(), maintainer.SegmentConfig{Session: e.s, Uploader: e.up, Objects: e.reader})
+	require.NoError(t, err)
+	c := catalog.BlockCommit{Segment: seg.Index(), Ordinal: 0, ObjectID: 1}
+	require.NoError(t, seg.Committed(c, catalog.ObjectRef{ID: 1}, []byte("not a zstd frame")))
+	err = seg.Seal(t.Context())
+	require.ErrorContains(t, err, "index block 0 (object 1)")
+	require.Equal(t, 1, seg.Blocks(), "nothing sealed")
+	require.Empty(t, e.generations(e.snapshot()))
+}
+
 // A block's commit that lands after the segment reached the threshold, in a
 // session that ended before sealing, is sealed by the next session before it
 // commits anything else.

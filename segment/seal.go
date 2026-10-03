@@ -349,9 +349,7 @@ func (s *fileFrameSource) NextFrame() ([]byte, error) {
 // Writers never produce empty blocks in an active segment, so this only
 // fires on input no writer made.
 func BuildSealed(src FrameSource) (header, footer []byte, h Header, err error) {
-	res := newBlockWalkResult()
-	off := int64(ReservedHeaderBytes)
-	indexing := true
+	b := NewSealBuilder()
 	for {
 		frame, err := src.NextFrame()
 		if errors.Is(err, io.EOF) {
@@ -360,27 +358,168 @@ func BuildSealed(src FrameSource) (header, footer []byte, h Header, err error) {
 		if err != nil {
 			return nil, nil, Header{}, err
 		}
-		// BlockInfo stores the frame length as a uint32, and the
-		// virtual offsets must stay representable as file offsets.
-		if uint64(len(frame)) > math.MaxUint32 {
-			return nil, nil, Header{}, fmt.Errorf("%w: frame at %d is %d bytes",
-				ErrCorruptSegment, off, len(frame))
+		if err := b.AddFrame(frame); err != nil {
+			return nil, nil, Header{}, err
 		}
-		if int64(len(frame)) > math.MaxInt64-off-8 {
-			return nil, nil, Header{}, fmt.Errorf("%w: frame at %d overflows the segment size",
-				ErrCorruptSegment, off)
-		}
-		if indexing {
-			empty, err := res.addFrame(frame, off)
-			if err != nil {
-				return nil, nil, Header{}, err
-			}
-			indexing = !empty
-		}
-		off += 8 + int64(len(frame))
 	}
+	return b.Finish()
+}
 
-	footer, h, err = buildFooter(res, off)
+// BlockIndex is what a sealed segment's header and footer record about one
+// block, decoded from its frame by IndexBlock. It does not depend on where
+// the block sits in the segment, so a writer can index each block as it
+// writes it, off its own path, and hand the indexes to a SealBuilder in
+// order when it seals.
+type BlockIndex struct {
+	frameLen int
+	// empty is a frame of zero events; nothing else is set.
+	empty bool
+	info  BlockInfo // Offset is zero
+	dids  map[string]struct{}
+	// collections are the block's distinct collection ids, real and
+	// sentinel, in first-seen order, which fixes the segment's id order.
+	collections []blockCollection
+}
+
+type blockCollection struct {
+	name   string
+	events uint32 // events with this real collection; zero for a sentinel
+}
+
+// IndexBlock decodes frame, a block's zstd frame without its length
+// prefix, and indexes it.
+func IndexBlock(frame []byte) (*BlockIndex, error) {
+	events, uncompressedSize, err := decodeBlockCompressedSized(frame)
+	if err != nil {
+		return nil, err
+	}
+	ix := &BlockIndex{frameLen: len(frame)}
+	if len(events) == 0 {
+		ix.empty = true
+		return ix, nil
+	}
+	ix.info = BlockInfo{
+		CompressedSize:   uint32(len(frame)),
+		UncompressedSize: uint32(uncompressedSize),
+		EventCount:       uint32(len(events)),
+		MinSeq:           events[0].Seq,
+		MaxSeq:           events[0].Seq,
+		MinWitnessedAt:   events[0].WitnessedAt,
+		MaxWitnessedAt:   events[0].WitnessedAt,
+	}
+	ix.dids = map[string]struct{}{}
+	at := map[string]int{}
+	note := func(name string, real bool) {
+		i, ok := at[name]
+		if !ok {
+			// Clone: name aliases the decompressed frame.
+			name = string([]byte(name))
+			i = len(ix.collections)
+			at[name] = i
+			ix.collections = append(ix.collections, blockCollection{name: name})
+		}
+		if real {
+			ix.collections[i].events++
+		}
+	}
+	for i := range events {
+		ev := &events[i]
+		ix.info.MinSeq = min(ix.info.MinSeq, ev.Seq)
+		ix.info.MaxSeq = max(ix.info.MaxSeq, ev.Seq)
+		ix.info.MinWitnessedAt = min(ix.info.MinWitnessedAt, ev.WitnessedAt)
+		ix.info.MaxWitnessedAt = max(ix.info.MaxWitnessedAt, ev.WitnessedAt)
+		// DIDs may be empty for some kinds (Identity, Account, Sync
+		// events sometimes carry no DID per atproto spec). Skip empty
+		// DIDs from both bloom filters and the unique-DID count: an
+		// empty bloom hit is meaningless, and the uniqueDIDCount in the
+		// header should reflect real DIDs.
+		if ev.DID != "" {
+			if _, ok := ix.dids[ev.DID]; !ok {
+				// Clone: ev.DID aliases the decompressed frame.
+				ix.dids[string([]byte(ev.DID))] = struct{}{}
+			}
+		}
+		// The same coordinates indexEventCollection interns.
+		if ev.Collection != "" {
+			note(ev.Collection, true)
+		}
+		if sentinel := didMarkerSentinel(ev.Kind); sentinel != "" {
+			note(sentinel, false)
+		}
+	}
+	return ix, nil
+}
+
+// SealBuilder computes a sealed segment's header and footer from its
+// blocks, added in order. BuildSealed is a SealBuilder fed by a
+// FrameSource; a writer that indexed its blocks as it wrote them adds the
+// indexes instead, and decodes nothing when it seals.
+type SealBuilder struct {
+	res blockWalkResult
+	// off is where the next block's length prefix would start.
+	off      int64
+	indexing bool
+}
+
+// NewSealBuilder returns a SealBuilder for a segment with no blocks yet.
+func NewSealBuilder() *SealBuilder {
+	return &SealBuilder{res: newBlockWalkResult(), off: ReservedHeaderBytes, indexing: true}
+}
+
+// AddFrame indexes the segment's next block frame and adds it.
+func (b *SealBuilder) AddFrame(frame []byte) error {
+	if err := b.checkFrameLen(len(frame)); err != nil {
+		return err
+	}
+	if !b.indexing {
+		b.off += 8 + int64(len(frame))
+		return nil
+	}
+	ix, err := IndexBlock(frame)
+	if err != nil {
+		return fmt.Errorf("segment: decode block at %d: %w", b.off, err)
+	}
+	return b.add(ix)
+}
+
+// Add adds the segment's next block, which IndexBlock indexed.
+func (b *SealBuilder) Add(ix *BlockIndex) error {
+	if err := b.checkFrameLen(ix.frameLen); err != nil {
+		return err
+	}
+	if !b.indexing {
+		b.off += 8 + int64(ix.frameLen)
+		return nil
+	}
+	return b.add(ix)
+}
+
+// checkFrameLen rejects a frame BlockInfo cannot describe: it stores the
+// frame length as a uint32, and the virtual offsets must stay
+// representable as file offsets.
+func (b *SealBuilder) checkFrameLen(n int) error {
+	if uint64(n) > math.MaxUint32 {
+		return fmt.Errorf("%w: frame at %d is %d bytes", ErrCorruptSegment, b.off, n)
+	}
+	if int64(n) > math.MaxInt64-b.off-8 {
+		return fmt.Errorf("%w: frame at %d overflows the segment size", ErrCorruptSegment, b.off)
+	}
+	return nil
+}
+
+func (b *SealBuilder) add(ix *BlockIndex) error {
+	if ix.empty {
+		b.indexing = false
+	} else if err := b.res.addIndex(ix, b.off); err != nil {
+		return err
+	}
+	b.off += 8 + int64(ix.frameLen)
+	return nil
+}
+
+// Finish returns the header, its checksum patched in, and the footer.
+func (b *SealBuilder) Finish() (header, footer []byte, h Header, err error) {
+	footer, h, err = buildFooter(b.res, b.off)
 	if err != nil {
 		return nil, nil, Header{}, err
 	}
@@ -432,99 +571,59 @@ func walkActiveFrames(f io.ReaderAt, maxOffset int64) (blockWalkResult, error) {
 // recording anything, when the frame decodes to zero events: callers
 // stop indexing there.
 func (res *blockWalkResult) addFrame(frame []byte, off int64) (empty bool, err error) {
-	events, uncompressedSize, err := decodeBlockCompressedSized(frame)
+	ix, err := IndexBlock(frame)
 	if err != nil {
-		return false, fmt.Errorf("segment: decode block at %d: %w",
-			off, err)
+		return false, fmt.Errorf("segment: decode block at %d: %w", off, err)
 	}
-	if len(events) == 0 {
+	if ix.empty {
 		return true, nil
 	}
+	return false, res.addIndex(ix, off)
+}
 
-	info := BlockInfo{
-		Offset:           uint64(off),
-		CompressedSize:   uint32(len(frame)),
-		UncompressedSize: uint32(uncompressedSize),
-		EventCount:       uint32(len(events)),
+// addIndex folds a non-empty block whose frame starts (length prefix
+// included) at off into res.
+func (res *blockWalkResult) addIndex(ix *BlockIndex, off int64) error {
+	info := ix.info
+	info.Offset = uint64(off)
+	if !res.sawAny {
+		res.minSeq, res.maxSeq = info.MinSeq, info.MaxSeq
+		res.minWitnessedAt, res.maxWitnessedAt = info.MinWitnessedAt, info.MaxWitnessedAt
+		res.sawAny = true
+	} else {
+		res.minSeq = min(res.minSeq, info.MinSeq)
+		res.maxSeq = max(res.maxSeq, info.MaxSeq)
+		res.minWitnessedAt = min(res.minWitnessedAt, info.MinWitnessedAt)
+		res.maxWitnessedAt = max(res.maxWitnessedAt, info.MaxWitnessedAt)
 	}
-	blockDIDs := map[string]struct{}{}
-	blockCollections := map[uint32]struct{}{}
-
-	for i, ev := range events {
-		if i == 0 {
-			info.MinSeq = ev.Seq
-			info.MaxSeq = ev.Seq
-			info.MinWitnessedAt = ev.WitnessedAt
-			info.MaxWitnessedAt = ev.WitnessedAt
-		}
-		if ev.Seq < info.MinSeq {
-			info.MinSeq = ev.Seq
-		}
-		if ev.Seq > info.MaxSeq {
-			info.MaxSeq = ev.Seq
-		}
-		if ev.WitnessedAt < info.MinWitnessedAt {
-			info.MinWitnessedAt = ev.WitnessedAt
-		}
-		if ev.WitnessedAt > info.MaxWitnessedAt {
-			info.MaxWitnessedAt = ev.WitnessedAt
-		}
-
-		if !res.sawAny {
-			res.minSeq = ev.Seq
-			res.maxSeq = ev.Seq
-			res.minWitnessedAt = ev.WitnessedAt
-			res.maxWitnessedAt = ev.WitnessedAt
-			res.sawAny = true
-		} else {
-			if ev.Seq < res.minSeq {
-				res.minSeq = ev.Seq
-			}
-			if ev.Seq > res.maxSeq {
-				res.maxSeq = ev.Seq
-			}
-			if ev.WitnessedAt < res.minWitnessedAt {
-				res.minWitnessedAt = ev.WitnessedAt
-			}
-			if ev.WitnessedAt > res.maxWitnessedAt {
-				res.maxWitnessedAt = ev.WitnessedAt
-			}
-		}
-
-		// DIDs may be empty for some kinds (Identity, Account,
-		// Sync events sometimes carry no DID per atproto spec).
-		// Skip empty DIDs from both bloom filters and the unique-
-		// DID count: an empty bloom hit is meaningless, and the
-		// uniqueDIDCount in the header should reflect real DIDs.
-		if ev.DID != "" {
-			if _, ok := res.uniqueDIDs[ev.DID]; !ok {
-				// Clone the string: ev.DID aliases the decompressed
-				// frame, which goes out of scope at the end of this
-				// loop iteration.
-				did := string([]byte(ev.DID))
-				res.uniqueDIDs[did] = struct{}{}
-				blockDIDs[did] = struct{}{}
-			} else if _, ok := blockDIDs[ev.DID]; !ok {
-				blockDIDs[string([]byte(ev.DID))] = struct{}{}
-			}
-		}
-		if err := res.indexEventCollection(&ev, blockCollections); err != nil {
-			return false, err
-		}
+	for did := range ix.dids {
+		res.uniqueDIDs[did] = struct{}{}
 	}
-
-	res.infos = append(res.infos, info)
-	res.perBlockDIDs = append(res.perBlockDIDs, blockDIDs)
-
+	blockCollections := make(map[uint32]struct{}, len(ix.collections))
+	for _, c := range ix.collections {
+		id, ok := res.collectionIDByName[c.name]
+		if !ok {
+			if uint64(len(res.collectionStringTable)) >= math.MaxUint32 {
+				return fmt.Errorf("%w: too many distinct collections", ErrInvalidFooter)
+			}
+			id = uint32(len(res.collectionStringTable))
+			res.collectionStringTable = append(res.collectionStringTable, c.name)
+			res.collectionEventCounts = append(res.collectionEventCounts, 0)
+			res.collectionIDByName[c.name] = id
+		}
+		res.collectionEventCounts[id] += c.events
+		blockCollections[id] = struct{}{}
+	}
 	ids := make([]uint32, 0, len(blockCollections))
 	for id := range blockCollections {
 		ids = append(ids, id)
 	}
 	sortUint32(ids)
+	res.infos = append(res.infos, info)
+	res.perBlockDIDs = append(res.perBlockDIDs, ix.dids)
 	res.perBlockCollections = append(res.perBlockCollections, ids)
-
-	res.totalEventCount += uint32(len(events))
-	return false, nil
+	res.totalEventCount += info.EventCount
+	return nil
 }
 
 // buildFooter assembles the four footer sections in the layout
@@ -561,9 +660,12 @@ func buildFooter(walk blockWalkResult, footerOffset int64) ([]byte, Header, erro
 			perBlockCapacity = n
 		}
 	}
+	// Every filter has the same parameters: deriving them once rather
+	// than per block took a 1,500-block seal from about 770ms to 20ms.
+	numBlocks, k, _ := gloom.OptimalParams(perBlockCapacity, perBlockBloomFPRate)
 	perBlockFilters := make([]*gloom.Filter, len(walk.perBlockDIDs))
 	for i, dids := range walk.perBlockDIDs {
-		f := gloom.New(perBlockCapacity, perBlockBloomFPRate)
+		f := gloom.NewWithParams(numBlocks, k)
 		for did := range dids {
 			f.AddString(did)
 		}
