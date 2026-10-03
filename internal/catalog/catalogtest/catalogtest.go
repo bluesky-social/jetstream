@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func Run(t *testing.T, newBackend func(t *testing.T) Backend) {
 		{"DeleteNamespace", testDeleteNamespace},
 		{"ReaderSnapshot", testReaderSnapshot},
 		{"AbortedTransaction", testAbortedTransaction},
+		{"QueuedWrites", testQueuedWrites},
 		{"Notify", testNotify},
 	}
 	for _, tc := range tests {
@@ -100,12 +102,20 @@ func write(t *testing.T, b Backend, epoch uint64, fn func(ctx context.Context, t
 	return rev
 }
 
-// failing runs fn, which must fail a statement, and rolls back.
+// failing runs fn, which must fail a statement, and rolls back. A queued
+// write may report its failure from the next statement instead (catalog.Tx);
+// either way the transaction is aborted and cannot commit.
 func failing(t *testing.T, b Backend, epoch uint64, fn func(ctx context.Context, tx catalog.Tx) error) {
 	t.Helper()
 	tx, _ := begin(t, b, epoch)
-	require.Error(t, fn(ctxT(t), tx))
-	require.NoError(t, tx.Rollback(ctxT(t)))
+	ctx := ctxT(t)
+	err := fn(ctx, tx)
+	if err == nil {
+		_, _, err = tx.MetaGetForUpdate(ctx, []byte("failing/probe"))
+		require.Error(t, err, "a queued write's failure is reported by the next statement")
+	}
+	require.Error(t, tx.Commit(ctx), "a failed transaction does not commit")
+	require.NoError(t, tx.Rollback(ctx))
 }
 
 func read(t *testing.T, b Backend) catalog.ReadTx {
@@ -837,12 +847,14 @@ func testGC(t *testing.T, b Backend) {
 	// forget is the last line of defense after the claim's re-check.
 	doomed := availableObject(t, b, epoch, []byte("doomed"))
 	failing(t, b, epoch, func(ctx context.Context, tx catalog.Tx) error {
+		// loose[2] and the second "loose 1" row are unreferenced too, so
+		// the mark and claim take them along with doomed.
 		page, err := tx.MarkUnreferenced(ctx, 0, 100)
-		if err != nil || page.Marked != 1 {
+		if err != nil || page.Marked != 3 {
 			return errors.Join(fmt.Errorf("unexpected mark %+v", page), err)
 		}
 		rows, err := tx.ClaimObjects(ctx, -time.Hour, -time.Hour, 100)
-		if err != nil || len(rows) != 1 || rows[0].ID != doomed {
+		if err != nil || !slices.ContainsFunc(rows, func(r catalog.ObjectRow) bool { return r.ID == doomed }) {
 			return errors.Join(fmt.Errorf("unexpected claim %v", rows), err)
 		}
 		if err := tx.InsertHotBatch(ctx, hot(2, 2, nil, doomed)); err != nil {
@@ -915,8 +927,12 @@ func testAbortedTransaction(t *testing.T, b Backend) {
 	tx, _ := begin(t, b, epoch)
 	ctx := ctxT(t)
 	require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte("v")}}))
-	require.Error(t, tx.InsertHotBatch(ctx, hot(1, 1, nil, 0)))
-	_, _, err := tx.MetaGetForUpdate(ctx, []byte("k"))
+	err := tx.InsertHotBatch(ctx, hot(1, 1, nil, 0))
+	if err == nil {
+		_, _, err = tx.MetaGetForUpdate(ctx, []byte("k"))
+	}
+	require.Error(t, err, "the bad insert fails, by the next statement at the latest")
+	_, _, err = tx.MetaGetForUpdate(ctx, []byte("k"))
 	require.Error(t, err, "statements after a failure are rejected")
 	require.Error(t, tx.Commit(ctx), "committing an aborted transaction rolls back")
 	require.NoError(t, tx.Rollback(ctx))
@@ -924,6 +940,72 @@ func testAbortedTransaction(t *testing.T, b Backend) {
 	require.NoError(t, err)
 	require.Empty(t, got)
 	// The aborted transaction released the row lock.
+	write(t, b, epoch, func(context.Context, catalog.Tx, uint64) {})
+}
+
+// testQueuedWrites pins what a backend that queues error-only writes
+// (catalog.Tx) must still guarantee: later statements see them, a failure is
+// reported by whichever kind of call comes next, and nothing queued around a
+// failure commits.
+func testQueuedWrites(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	initMain(t, b, epoch)
+	obj := availableObject(t, b, epoch, []byte("q"))
+
+	t.Run("later statements see them", func(t *testing.T) {
+		write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+			require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.BootstrapLive, Index: 0, State: catalog.Active, Revision: rev}))
+			seg, found, err := tx.ActiveSegment(ctx, catalog.BootstrapLive)
+			require.NoError(t, err)
+			require.True(t, found, "a single-row read sees the queued insert")
+			require.Equal(t, uint64(0), seg.Index)
+			require.NoError(t, tx.InsertActiveBlock(ctx, activeBlock(catalog.BootstrapLive, 0, 0, obj, 1, 3)))
+			blocks, err := tx.ActiveBlocksForUpdate(ctx, catalog.BootstrapLive, 0)
+			require.NoError(t, err)
+			require.Len(t, blocks, 1, "a multi-row read sees the queued insert")
+			n, err := tx.DeleteActiveBlocks(ctx, catalog.BootstrapLive, 0)
+			require.NoError(t, err)
+			require.Equal(t, 1, n, "a command-tag statement sees the queued insert")
+		})
+	})
+
+	// Each kind of call that follows a failed queued write reports it.
+	next := map[string]func(ctx context.Context, tx catalog.Tx) error{
+		"single-row read": func(ctx context.Context, tx catalog.Tx) error {
+			_, _, err := tx.MetaGetForUpdate(ctx, []byte("k"))
+			return err
+		},
+		"multi-row read": func(ctx context.Context, tx catalog.Tx) error {
+			_, err := tx.ActiveBlocksForUpdate(ctx, catalog.Main, 0)
+			return err
+		},
+		"command tag": func(ctx context.Context, tx catalog.Tx) error {
+			_, err := tx.SetObjectAvailable(ctx, obj)
+			return err
+		},
+		"commit": func(ctx context.Context, tx catalog.Tx) error { return tx.Commit(ctx) },
+	}
+	for name, call := range next {
+		t.Run("failure reported by "+name, func(t *testing.T) {
+			tx, rev := begin(t, b, epoch)
+			ctx := ctxT(t)
+			ok := []metastore.Op{{Kind: metastore.OpSet, Key: []byte("queued/" + name), Value: []byte("v")}}
+			require.NoError(t, tx.ApplyMeta(ctx, ok))
+			err := tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.Main, Index: 0, State: catalog.Active, Revision: rev})
+			if err == nil {
+				require.NoError(t, tx.ApplyMeta(ctx, ok))
+				require.NoError(t, tx.Notify(ctx, rev))
+				err = call(ctx, tx)
+			}
+			require.Error(t, err, "a duplicate active segment fails")
+			require.Error(t, tx.Commit(ctx))
+			require.NoError(t, tx.Rollback(ctx))
+			got, err := read(t, b).MetaGet(ctxT(t), [][]byte{[]byte("queued/" + name)})
+			require.NoError(t, err)
+			require.Empty(t, got, "writes queued around the failure did not commit")
+		})
+	}
+	// The archive row lock went with every aborted transaction.
 	write(t, b, epoch, func(context.Context, catalog.Tx, uint64) {})
 }
 

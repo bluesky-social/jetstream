@@ -13,21 +13,42 @@ import (
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
-// tx is a READ COMMITTED leader transaction (design §9.1).
+// tx is a READ COMMITTED leader transaction (design §9.1). Over a WAN link
+// each round trip to PostgreSQL costs more than the statement it carries,
+// and the fence's row lock is held from the fence to COMMIT, so the
+// transaction pipelines what it can without changing what it does:
+//
+//   - BEGIN is not sent on its own. It goes in the same round trip as the
+//     first statement, normally the fence.
+//   - A statement whose only result is its error (ApplyMeta, the row
+//     inserts, Notify) is queued, and goes in the same round trip as the
+//     next statement that returns a result, or as COMMIT.
+//
+// PostgreSQL runs a pipeline's statements in order and aborts the
+// transaction at the first failure, skipping the rest, so this commits
+// exactly what sending each statement alone would. Only the call that
+// reports a queued statement's error changes (catalog.Tx).
 type tx struct {
-	tx      pgx.Tx
+	conn    *pgxpool.Conn
 	kind    catalog.TxKind
 	metrics *Metrics
 	span    trace.Span
 	start   time.Time
 	failed  bool
 	done    bool
+
+	// queue holds the statements not yet sent: BEGIN until the first round
+	// trip, then queued writes. names labels each for errors.
+	queue *pgx.Batch
+	names []string
 }
 
 var _ catalog.Tx = (*tx)(nil)
@@ -36,7 +57,7 @@ var _ catalog.Tx = (*tx)(nil)
 func (s *Store) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, error) {
 	start := time.Now()
 	_, span := tracer.Start(ctx, "pg.txn", trace.WithAttributes(attribute.String("kind", string(kind))))
-	ptx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		s.metrics.observe(string(kind), start, true)
 		span.RecordError(err)
@@ -44,13 +65,30 @@ func (s *Store) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, err
 		span.End()
 		return nil, fmt.Errorf("%w: pgstore %s: begin: %w", catalog.ErrSessionEnded, kind, err)
 	}
-	return &tx{tx: ptx, kind: kind, metrics: s.metrics, span: span, start: start}, nil
+	t := &tx{conn: conn, kind: kind, metrics: s.metrics, span: span, start: start, queue: &pgx.Batch{}}
+	t.enqueue("begin", `BEGIN ISOLATION LEVEL READ COMMITTED`)
+	return t, nil
 }
 
-// fail marks the transaction failed and wraps err as session-ending.
+// queuedError is the failure of a queued statement, reported by the call
+// whose round trip carried it.
+type queuedError struct {
+	stmt string
+	err  error
+}
+
+func (e *queuedError) Error() string { return e.stmt + ": " + e.err.Error() }
+func (e *queuedError) Unwrap() error { return e.err }
+
+// fail marks the transaction failed and wraps err as session-ending. A
+// queued statement's failure is named for that statement.
 func (t *tx) fail(stmt string, err error) error {
 	t.failed = true
 	t.span.RecordError(err)
+	if q, ok := errors.AsType[*queuedError](err); ok {
+		stmt = q.stmt + " (sent with " + stmt + ")"
+		err = q.err
+	}
 	return fmt.Errorf("%w: pgstore %s/%s: %w", catalog.ErrSessionEnded, t.kind, stmt, err)
 }
 
@@ -64,11 +102,102 @@ func (t *tx) finish() {
 		t.span.SetStatus(codes.Error, "failed")
 	}
 	t.span.End()
+	// The pool destroys a connection that is closed or still inside a
+	// transaction, so a failed rollback cannot leak one.
+	t.conn.Release()
+}
+
+// enqueue adds a statement to the next round trip.
+func (t *tx) enqueue(name, sql string, args ...any) {
+	t.queue.Queue(sql, args...)
+	t.names = append(t.names, name)
+}
+
+// send starts a round trip carrying every queued statement, then extra.
+// It checks the queued statements' results and returns the batch
+// positioned at extra's. The caller must Close it.
+func (t *tx) send(ctx context.Context, extra *pgx.Batch) (pgx.BatchResults, error) {
+	b, names := t.queue, t.names
+	t.queue, t.names = &pgx.Batch{}, nil
+	b.QueuedQueries = append(b.QueuedQueries, extra.QueuedQueries...)
+	br := t.conn.SendBatch(ctx, b)
+	for _, name := range names {
+		if _, err := br.Exec(); err != nil {
+			_ = br.Close()
+			return nil, &queuedError{stmt: name, err: err}
+		}
+	}
+	return br, nil
+}
+
+// queryRow runs a single-row statement. The row's Scan makes the round
+// trip, carrying the queued statements.
+func (t *tx) queryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if len(t.names) == 0 {
+		return t.conn.QueryRow(ctx, sql, args...)
+	}
+	return &pipelinedRow{t: t, ctx: ctx, sql: sql, args: args}
+}
+
+type pipelinedRow struct {
+	t    *tx
+	ctx  context.Context
+	sql  string
+	args []any
+}
+
+func (r *pipelinedRow) Scan(dest ...any) error {
+	b := &pgx.Batch{}
+	b.Queue(r.sql, r.args...)
+	br, err := r.t.send(r.ctx, b)
+	if err != nil {
+		return err
+	}
+	err = br.QueryRow().Scan(dest...)
+	if cerr := br.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// exec runs a statement whose command tag the caller needs, carrying the
+// queued statements.
+func (t *tx) exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if len(t.names) == 0 {
+		return t.conn.Exec(ctx, sql, args...)
+	}
+	b := &pgx.Batch{}
+	b.Queue(sql, args...)
+	br, err := t.send(ctx, b)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	tag, err := br.Exec()
+	if cerr := br.Close(); err == nil {
+		err = cerr
+	}
+	return tag, err
+}
+
+// query runs a multi-row statement. Rows stream back one at a time, so the
+// queued statements go first in a round trip of their own; no script reads
+// rows after a queued write on its hot path.
+func (t *tx) query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if len(t.names) > 0 {
+		br, err := t.send(ctx, &pgx.Batch{})
+		if err != nil {
+			return nil, err
+		}
+		if err := br.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return t.conn.Query(ctx, sql, args...)
 }
 
 func (t *tx) FenceBump(ctx context.Context, epoch uint64) (uint64, bool, error) {
 	var rev uint64
-	err := t.tx.QueryRow(ctx,
+	err := t.queryRow(ctx,
 		`UPDATE archive SET catalog_revision = catalog_revision + 1
 		 WHERE id = 1 AND writer_epoch = $1
 		 RETURNING catalog_revision`, epoch).Scan(&rev)
@@ -85,7 +214,7 @@ func (t *tx) FenceBump(ctx context.Context, epoch uint64) (uint64, bool, error) 
 
 func (t *tx) MetaGetForUpdate(ctx context.Context, key []byte) ([]byte, bool, error) {
 	var v []byte
-	err := t.tx.QueryRow(ctx, `SELECT value FROM metadata_kv WHERE key = $1 FOR UPDATE`, nonNil(key)).Scan(&v)
+	err := t.queryRow(ctx, `SELECT value FROM metadata_kv WHERE key = $1 FOR UPDATE`, nonNil(key)).Scan(&v)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -95,13 +224,9 @@ func (t *tx) MetaGetForUpdate(ctx context.Context, key []byte) ([]byte, bool, er
 	return nonNil(v), true, nil
 }
 
-func (t *tx) ApplyMeta(ctx context.Context, ops []metastore.Op) error {
-	b := MetaBatch(ops)
-	if b.Len() == 0 {
-		return nil
-	}
-	if err := t.tx.SendBatch(ctx, b).Close(); err != nil {
-		return t.fail("apply_meta", err)
+func (t *tx) ApplyMeta(_ context.Context, ops []metastore.Op) error {
+	for _, q := range MetaBatch(ops).QueuedQueries {
+		t.enqueue("apply_meta", q.SQL, q.Arguments...)
 	}
 	return nil
 }
@@ -188,7 +313,7 @@ func scanObject(row pgx.Row) (catalog.ObjectRow, error) {
 }
 
 func (t *tx) FindAvailableObject(ctx context.Context, sha [32]byte, maxUnrefAge time.Duration) (catalog.ObjectRow, bool, error) {
-	o, err := scanObject(t.tx.QueryRow(ctx,
+	o, err := scanObject(t.queryRow(ctx,
 		`SELECT `+objectCols+` FROM objects
 		 WHERE sha256 = $1 AND state = 'available'
 		   AND ($2::bigint <= 0 OR unreferenced_at IS NULL
@@ -212,7 +337,7 @@ func (t *tx) InsertObjects(ctx context.Context, objs []catalog.NewObject) ([]uin
 	}
 	// RETURNING order is not guaranteed, so match IDs back by key, which is
 	// unique.
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`INSERT INTO objects (key, sha256, byte_length, state)
 		 SELECT k, s, l, 'uploading' FROM unnest($1::uuid[], $2::bytea[], $3::bigint[]) AS u(k, s, l)
 		 RETURNING key, object_id`, keys, shas, lens)
@@ -243,7 +368,7 @@ func (t *tx) InsertObjects(ctx context.Context, objs []catalog.NewObject) ([]uin
 }
 
 func (t *tx) SetObjectAvailable(ctx context.Context, id uint64) (bool, error) {
-	tag, err := t.tx.Exec(ctx,
+	tag, err := t.exec(ctx,
 		`UPDATE objects SET state = 'available' WHERE object_id = $1 AND state = 'uploading'`, id)
 	if err != nil {
 		return false, t.fail("set_object_available", err)
@@ -252,7 +377,7 @@ func (t *tx) SetObjectAvailable(ctx context.Context, id uint64) (bool, error) {
 }
 
 func (t *tx) RefCheck(ctx context.Context, ids []uint64) ([]uint64, error) {
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`UPDATE objects SET unreferenced_at = NULL
 		 WHERE object_id = ANY($1::bigint[]) AND state = 'available'
 		 RETURNING object_id`, int64s(ids))
@@ -295,16 +420,13 @@ func nullID(id uint64) *uint64 {
 	return &id
 }
 
-func (t *tx) InsertHotBatch(ctx context.Context, row catalog.HotBatchRow) error {
-	_, err := t.tx.Exec(ctx,
+func (t *tx) InsertHotBatch(_ context.Context, row catalog.HotBatchRow) error {
+	t.enqueue("insert_hot_batch",
 		`INSERT INTO hot_batches (first_seq, last_seq, event_count, min_witnessed_us, max_witnessed_us,
 		                          epoch, revision, frame, object_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		row.FirstSeq, row.LastSeq, int64(row.EventCount), row.MinWitnessedUS, row.MaxWitnessedUS,
 		row.Epoch, row.Revision, row.Frame, nullID(row.ObjectID))
-	if err != nil {
-		return t.fail("insert_hot_batch", err)
-	}
 	return nil
 }
 
@@ -322,7 +444,7 @@ func (t *tx) DeleteHotBatches(ctx context.Context, lo, hi uint64) ([]catalog.Hot
 		// Run the statement anyway so the call shape matches storagefake.
 		lo, hi = 1, 0
 	}
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`DELETE FROM hot_batches WHERE first_seq >= $1 AND first_seq <= $2
 		 RETURNING first_seq, last_seq, event_count, object_id`, clampSeq(lo), clampSeq(hi))
 	if err != nil {
@@ -381,7 +503,7 @@ func segmentState(s string) catalog.SegmentState {
 }
 
 func (t *tx) ActiveSegment(ctx context.Context, ns catalog.Namespace) (catalog.SegmentRow, bool, error) {
-	r, err := scanSegment(t.tx.QueryRow(ctx,
+	r, err := scanSegment(t.queryRow(ctx,
 		`SELECT `+segmentCols+` FROM segments WHERE namespace = $1 AND state = 'active' FOR UPDATE`, string(ns)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return catalog.SegmentRow{}, false, nil
@@ -415,7 +537,7 @@ func collectActiveBlocks(rows pgx.Rows) ([]catalog.ActiveBlockRow, error) {
 }
 
 func (t *tx) LastActiveBlock(ctx context.Context, ns catalog.Namespace, idx uint64) (catalog.ActiveBlockRow, bool, error) {
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`SELECT `+activeBlockCols+` FROM active_segment_blocks
 		 WHERE namespace = $1 AND segment_index = $2 ORDER BY ordinal DESC LIMIT 1`, string(ns), clampSeq(idx))
 	if err != nil {
@@ -432,7 +554,7 @@ func (t *tx) LastActiveBlock(ctx context.Context, ns catalog.Namespace, idx uint
 }
 
 func (t *tx) ActiveBlocksForUpdate(ctx context.Context, ns catalog.Namespace, idx uint64) ([]catalog.ActiveBlockRow, error) {
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`SELECT `+activeBlockCols+` FROM active_segment_blocks
 		 WHERE namespace = $1 AND segment_index = $2 ORDER BY ordinal FOR UPDATE`, string(ns), clampSeq(idx))
 	if err != nil {
@@ -445,20 +567,17 @@ func (t *tx) ActiveBlocksForUpdate(ctx context.Context, ns catalog.Namespace, id
 	return out, nil
 }
 
-func (t *tx) InsertActiveBlock(ctx context.Context, r catalog.ActiveBlockRow) error {
-	_, err := t.tx.Exec(ctx,
+func (t *tx) InsertActiveBlock(_ context.Context, r catalog.ActiveBlockRow) error {
+	t.enqueue("insert_active_block",
 		`INSERT INTO active_segment_blocks (`+activeBlockCols+`)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		string(r.Namespace), r.Segment, r.Ordinal, r.ObjectID, int64(r.EventCount), r.MinSeq, r.MaxSeq,
 		r.MinWitnessedUS, r.MaxWitnessedUS, r.CompressedLength, r.UncompressedLength, r.Revision)
-	if err != nil {
-		return t.fail("insert_active_block", err)
-	}
 	return nil
 }
 
 func (t *tx) DeleteActiveBlocks(ctx context.Context, ns catalog.Namespace, idx uint64) (int, error) {
-	tag, err := t.tx.Exec(ctx,
+	tag, err := t.exec(ctx,
 		`DELETE FROM active_segment_blocks WHERE namespace = $1 AND segment_index = $2`, string(ns), clampSeq(idx))
 	if err != nil {
 		return 0, t.fail("delete_active_blocks", err)
@@ -468,7 +587,7 @@ func (t *tx) DeleteActiveBlocks(ctx context.Context, ns catalog.Namespace, idx u
 
 func (t *tx) InsertGeneration(ctx context.Context, r catalog.GenerationRow) (uint64, error) {
 	var id uint64
-	err := t.tx.QueryRow(ctx,
+	err := t.queryRow(ctx,
 		`INSERT INTO segment_generations (namespace, segment_index, header, footer_object_id, revision)
 		 VALUES ($1, $2, $3, $4, $5) RETURNING generation_id`,
 		string(r.Namespace), r.Segment, nonNil(r.Header), r.FooterObjectID, r.Revision).Scan(&id)
@@ -478,7 +597,7 @@ func (t *tx) InsertGeneration(ctx context.Context, r catalog.GenerationRow) (uin
 	return id, nil
 }
 
-func (t *tx) InsertGenerationBlocks(ctx context.Context, rows []catalog.GenerationBlockRow) error {
+func (t *tx) InsertGenerationBlocks(_ context.Context, rows []catalog.GenerationBlockRow) error {
 	gens := make([]uint64, len(rows))
 	ords := make([]int64, len(rows))
 	objs := make([]uint64, len(rows))
@@ -486,18 +605,15 @@ func (t *tx) InsertGenerationBlocks(ctx context.Context, rows []catalog.Generati
 	for i, r := range rows {
 		gens[i], ords[i], objs[i], lens[i] = r.GenerationID, int64(r.Ordinal), r.ObjectID, r.CompressedLength
 	}
-	_, err := t.tx.Exec(ctx,
+	t.enqueue("insert_generation_blocks",
 		`INSERT INTO generation_blocks (generation_id, ordinal, object_id, compressed_length)
 		 SELECT * FROM unnest($1::bigint[], $2::integer[], $3::bigint[], $4::bigint[])`,
 		gens, ords, objs, lens)
-	if err != nil {
-		return t.fail("insert_generation_blocks", err)
-	}
 	return nil
 }
 
 func (t *tx) SealSegment(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) (bool, error) {
-	tag, err := t.tx.Exec(ctx,
+	tag, err := t.exec(ctx,
 		`UPDATE segments SET state = 'sealed', current_generation_id = $3, revision = $4
 		 WHERE namespace = $1 AND segment_index = $2 AND state = 'active'`,
 		string(ns), clampSeq(idx), nullID(gen), revision)
@@ -507,30 +623,24 @@ func (t *tx) SealSegment(ctx context.Context, ns catalog.Namespace, idx, gen, re
 	return tag.RowsAffected() == 1, nil
 }
 
-func (t *tx) InsertSegment(ctx context.Context, r catalog.SegmentRow) error {
-	_, err := t.tx.Exec(ctx,
+func (t *tx) InsertSegment(_ context.Context, r catalog.SegmentRow) error {
+	t.enqueue("insert_segment",
 		`INSERT INTO segments (`+segmentCols+`) VALUES ($1, $2, $3, $4, $5)`,
 		string(r.Namespace), r.Index, r.State.String(), nullID(r.GenerationID), r.Revision)
-	if err != nil {
-		return t.fail("insert_segment", err)
-	}
 	return nil
 }
 
-func (t *tx) DeleteNamespace(ctx context.Context, ns catalog.Namespace) error {
+func (t *tx) DeleteNamespace(_ context.Context, ns catalog.Namespace) error {
 	// generation_blocks go with their generations (ON DELETE CASCADE).
-	_, err := t.tx.Exec(ctx,
+	t.enqueue("delete_namespace",
 		`WITH ab AS (DELETE FROM active_segment_blocks WHERE namespace = $1),
 		      g AS (DELETE FROM segment_generations WHERE namespace = $1)
 		 DELETE FROM segments WHERE namespace = $1`, string(ns))
-	if err != nil {
-		return t.fail("delete_namespace", err)
-	}
 	return nil
 }
 
 func (t *tx) SegmentForUpdate(ctx context.Context, ns catalog.Namespace, idx uint64) (catalog.SegmentRow, bool, error) {
-	r, err := scanSegment(t.tx.QueryRow(ctx,
+	r, err := scanSegment(t.queryRow(ctx,
 		`SELECT `+segmentCols+` FROM segments WHERE namespace = $1 AND segment_index = $2 FOR UPDATE`,
 		string(ns), clampSeq(idx)))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -555,7 +665,7 @@ func scanGeneration(row pgx.Row) (catalog.GenerationRow, error) {
 }
 
 func (t *tx) Generation(ctx context.Context, id uint64) (catalog.GenerationRow, bool, error) {
-	g, err := scanGeneration(t.tx.QueryRow(ctx,
+	g, err := scanGeneration(t.queryRow(ctx,
 		`SELECT `+generationCols+` FROM segment_generations WHERE generation_id = $1`, int64s([]uint64{id})[0]))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return catalog.GenerationRow{}, false, nil
@@ -573,7 +683,7 @@ func scanGenerationBlock(row pgx.CollectableRow) (catalog.GenerationBlockRow, er
 }
 
 func (t *tx) BlocksOfGeneration(ctx context.Context, id uint64) ([]catalog.GenerationBlockRow, error) {
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`SELECT generation_id, ordinal, object_id, compressed_length FROM generation_blocks
 		 WHERE generation_id = $1 ORDER BY ordinal`, int64s([]uint64{id})[0])
 	if err != nil {
@@ -587,7 +697,7 @@ func (t *tx) BlocksOfGeneration(ctx context.Context, id uint64) ([]catalog.Gener
 }
 
 func (t *tx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) (bool, error) {
-	tag, err := t.tx.Exec(ctx,
+	tag, err := t.exec(ctx,
 		`UPDATE segments SET current_generation_id = $3, revision = $4
 		 WHERE namespace = $1 AND segment_index = $2 AND state = 'sealed'`,
 		string(ns), clampSeq(idx), nullID(gen), revision)
@@ -599,7 +709,7 @@ func (t *tx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx
 
 func (t *tx) DeleteGeneration(ctx context.Context, id uint64) (bool, error) {
 	// generation_blocks go with it (ON DELETE CASCADE).
-	tag, err := t.tx.Exec(ctx, `DELETE FROM segment_generations WHERE generation_id = $1`, int64s([]uint64{id})[0])
+	tag, err := t.exec(ctx, `DELETE FROM segment_generations WHERE generation_id = $1`, int64s([]uint64{id})[0])
 	if err != nil {
 		return false, t.fail("delete_generation", err)
 	}
@@ -617,7 +727,7 @@ func (t *tx) MarkUnreferenced(ctx context.Context, after uint64, limit int) (cat
 		page catalog.MarkPage
 		last pgtype.Int8
 	)
-	err := t.tx.QueryRow(ctx,
+	err := t.queryRow(ctx,
 		`WITH page AS (
 		     SELECT object_id FROM objects
 		     WHERE state = 'available' AND unreferenced_at IS NULL AND object_id > $1
@@ -644,7 +754,7 @@ func collectObjects(rows pgx.Rows) ([]catalog.ObjectRow, error) {
 func (t *tx) ClaimObjects(ctx context.Context, gcDelay, orphanAge time.Duration, limit int) ([]catalog.ObjectRow, error) {
 	// The CTE's snapshot of each row is its pre-claim state; RETURNING
 	// reports it, so the caller knows which claims to re-check.
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`WITH c AS (
 		     SELECT `+objectCols+` FROM objects
 		     WHERE (state = 'available' AND unreferenced_at < now() - $1::bigint * interval '1 microsecond')
@@ -665,7 +775,7 @@ func (t *tx) ClaimObjects(ctx context.Context, gcDelay, orphanAge time.Duration,
 }
 
 func (t *tx) DeletingObjects(ctx context.Context, limit int) ([]catalog.ObjectRow, error) {
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`SELECT `+objectCols+` FROM objects WHERE state = 'deleting' ORDER BY object_id LIMIT $1`, limit)
 	if err != nil {
 		return nil, t.fail("deleting_objects", err)
@@ -678,7 +788,7 @@ func (t *tx) DeletingObjects(ctx context.Context, limit int) ([]catalog.ObjectRo
 }
 
 func (t *tx) ReferencedObjects(ctx context.Context, ids []uint64) ([]uint64, error) {
-	rows, err := t.tx.Query(ctx,
+	rows, err := t.query(ctx,
 		`SELECT DISTINCT o.object_id FROM unnest($1::bigint[]) AS o(object_id)
 		 WHERE NOT (`+unreferencedSQL+`) ORDER BY o.object_id`, int64s(ids))
 	if err != nil {
@@ -692,7 +802,7 @@ func (t *tx) ReferencedObjects(ctx context.Context, ids []uint64) ([]uint64, err
 }
 
 func (t *tx) ForgetObjects(ctx context.Context, ids []uint64) (int, error) {
-	tag, err := t.tx.Exec(ctx,
+	tag, err := t.exec(ctx,
 		`DELETE FROM objects WHERE object_id = ANY($1::bigint[]) AND state = 'deleting'`, int64s(ids))
 	if err != nil {
 		return 0, t.fail("forget_objects", err)
@@ -700,36 +810,62 @@ func (t *tx) ForgetObjects(ctx context.Context, ids []uint64) (int, error) {
 	return int(tag.RowsAffected()), nil
 }
 
-func (t *tx) Notify(ctx context.Context, revision uint64) error {
-	if _, err := t.tx.Exec(ctx, `SELECT pg_notify('jetstream_catalog', $1)`, strconv.FormatUint(revision, 10)); err != nil {
-		return t.fail("notify", err)
-	}
+func (t *tx) Notify(_ context.Context, revision uint64) error {
+	t.enqueue("notify", `SELECT pg_notify('jetstream_catalog', $1)`, strconv.FormatUint(revision, 10))
 	return nil
 }
 
+// Commit sends the queued statements and COMMIT in one round trip.
 func (t *tx) Commit(ctx context.Context) error {
 	if t.done {
 		return fmt.Errorf("%w: pgstore %s: commit: %w", catalog.ErrSessionEnded, t.kind, pgx.ErrTxClosed)
 	}
-	err := t.tx.Commit(ctx)
+	err := t.commit(ctx)
 	if err != nil {
-		// pgx reports committing an aborted transaction as
-		// ErrTxCommitRollback: nothing applied, but it is still a failure.
 		err = t.fail("commit", err)
 	}
 	t.finish()
 	return err
 }
 
+func (t *tx) commit(ctx context.Context) error {
+	if t.failed {
+		return errTxAborted
+	}
+	b := &pgx.Batch{}
+	b.Queue(`COMMIT`)
+	br, err := t.send(ctx, b)
+	if err != nil {
+		return err
+	}
+	tag, err := br.Exec()
+	if cerr := br.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && tag.String() != "COMMIT" {
+		// COMMIT of an aborted transaction rolls back and reports it in
+		// its tag: nothing applied, but it is still a failure.
+		err = pgx.ErrTxCommitRollback
+	}
+	return err
+}
+
+// errTxAborted rejects a commit after a failed statement, as PostgreSQL
+// would, without a round trip.
+var errTxAborted = errors.New("transaction is aborted")
+
 func (t *tx) Rollback(ctx context.Context) error {
 	if t.done {
 		return nil
 	}
-	err := t.tx.Rollback(ctx)
-	t.finish()
-	if err == nil || errors.Is(err, pgx.ErrTxClosed) || t.tx.Conn().IsClosed() {
-		// A dead connection means the server has rolled back already.
+	defer t.finish()
+	if t.conn.Conn().PgConn().TxStatus() == 'I' || t.conn.Conn().IsClosed() {
+		// BEGIN never reached the server, or a dead connection already
+		// ended the transaction there.
 		return nil
 	}
-	return fmt.Errorf("pgstore %s: rollback: %w", t.kind, err)
+	if _, err := t.conn.Exec(ctx, `ROLLBACK`); err != nil && !t.conn.Conn().IsClosed() {
+		return fmt.Errorf("pgstore %s: rollback: %w", t.kind, err)
+	}
+	return nil
 }

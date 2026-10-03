@@ -73,6 +73,17 @@ func (t *tx) stmt(ctx context.Context, name string, write bool) error {
 	return nil
 }
 
+// queued reports a queued write's failure the way pgstore does: not from
+// the call, which pgstore sends nowhere, but from the next statement or
+// Commit (catalog.Tx). The transaction is already aborted, so either one
+// returns it.
+func (t *tx) queued(err error) error {
+	if err != nil {
+		_ = t.abort(err)
+	}
+	return nil
+}
+
 // abort puts the transaction in the aborted state. Locks stay held until
 // Rollback, as in PostgreSQL, unless the connection died.
 func (t *tx) abort(err error) error {
@@ -124,6 +135,10 @@ func (t *tx) MetaGetForUpdate(ctx context.Context, key []byte) ([]byte, bool, er
 }
 
 func (t *tx) ApplyMeta(ctx context.Context, ops []metastore.Op) error {
+	return t.queued(t.applyMeta(ctx, ops))
+}
+
+func (t *tx) applyMeta(ctx context.Context, ops []metastore.Op) error {
 	if err := t.stmt(ctx, "apply_meta", true); err != nil {
 		return err
 	}
@@ -244,6 +259,10 @@ func (t *tx) objectFK(table string, id uint64) error {
 }
 
 func (t *tx) InsertHotBatch(ctx context.Context, row catalog.HotBatchRow) error {
+	return t.queued(t.insertHotBatch(ctx, row))
+}
+
+func (t *tx) insertHotBatch(ctx context.Context, row catalog.HotBatchRow) error {
 	if err := t.stmt(ctx, "insert_hot_batch", true); err != nil {
 		return err
 	}
@@ -345,6 +364,10 @@ func (t *tx) segmentFK(table string, ns catalog.Namespace, idx uint64) error {
 }
 
 func (t *tx) InsertActiveBlock(ctx context.Context, row catalog.ActiveBlockRow) error {
+	return t.queued(t.insertActiveBlock(ctx, row))
+}
+
+func (t *tx) insertActiveBlock(ctx context.Context, row catalog.ActiveBlockRow) error {
 	if err := t.stmt(ctx, "insert_active_block", true); err != nil {
 		return err
 	}
@@ -410,6 +433,10 @@ func (t *tx) InsertGeneration(ctx context.Context, row catalog.GenerationRow) (u
 }
 
 func (t *tx) InsertGenerationBlocks(ctx context.Context, rows []catalog.GenerationBlockRow) error {
+	return t.queued(t.insertGenerationBlocks(ctx, rows))
+}
+
+func (t *tx) insertGenerationBlocks(ctx context.Context, rows []catalog.GenerationBlockRow) error {
 	if err := t.stmt(ctx, "insert_generation_blocks", true); err != nil {
 		return err
 	}
@@ -452,6 +479,10 @@ func (t *tx) SealSegment(ctx context.Context, ns catalog.Namespace, idx, gen, re
 }
 
 func (t *tx) InsertSegment(ctx context.Context, row catalog.SegmentRow) error {
+	return t.queued(t.insertSegment(ctx, row))
+}
+
+func (t *tx) insertSegment(ctx context.Context, row catalog.SegmentRow) error {
 	if err := t.stmt(ctx, "insert_segment", true); err != nil {
 		return err
 	}
@@ -481,6 +512,10 @@ func (t *tx) InsertSegment(ctx context.Context, row catalog.SegmentRow) error {
 }
 
 func (t *tx) DeleteNamespace(ctx context.Context, ns catalog.Namespace) error {
+	return t.queued(t.deleteNamespace(ctx, ns))
+}
+
+func (t *tx) deleteNamespace(ctx context.Context, ns catalog.Namespace) error {
 	if err := t.stmt(ctx, "delete_namespace", true); err != nil {
 		return err
 	}
@@ -714,6 +749,10 @@ func (t *tx) ForgetObjects(ctx context.Context, ids []uint64) (int, error) {
 }
 
 func (t *tx) Notify(ctx context.Context, revision uint64) error {
+	return t.queued(t.notifyStmt(ctx, revision))
+}
+
+func (t *tx) notifyStmt(ctx context.Context, revision uint64) error {
 	// NOTIFY serializes committers on a global lock in PostgreSQL too.
 	if err := t.stmt(ctx, "notify", true); err != nil {
 		return err

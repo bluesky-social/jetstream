@@ -27,6 +27,7 @@ type Proxy struct {
 	conns map[*proxyConn]struct{}
 
 	dropCommit atomic.Int32 // armed DropCommitResponse count
+	roundTrips atomic.Int64 // client Sync and simple Query messages
 	wg         sync.WaitGroup
 }
 
@@ -37,6 +38,10 @@ type proxyConn struct {
 	// the server's replies are swallowed until ReadyForQuery, then both
 	// sides close.
 	dropping atomic.Bool
+	// prepared maps the connection's prepared statement names to their
+	// SQL, so a COMMIT sent through the extended protocol (by name, once
+	// cached) is still recognized.
+	prepared map[string][]byte
 }
 
 func (c *proxyConn) close() {
@@ -79,6 +84,10 @@ func (p *Proxy) KillAll() {
 	}
 }
 
+// RoundTrips counts the client's round trips through the proxy: each
+// simple Query and each extended-protocol Sync, which ends a pipeline.
+func (p *Proxy) RoundTrips() int64 { return p.roundTrips.Load() }
+
 // DropCommitResponse arms the next COMMIT on any connection: the proxy
 // forwards it, lets the server apply it, swallows the reply, and closes the
 // connection. The client sees the connection die with the commit applied
@@ -97,7 +106,7 @@ func (p *Proxy) accept() {
 			_ = client.Close()
 			continue
 		}
-		c := &proxyConn{client: client, server: server}
+		c := &proxyConn{client: client, server: server, prepared: map[string][]byte{}}
 		p.mu.Lock()
 		p.conns[c] = struct{}{}
 		p.mu.Unlock()
@@ -152,8 +161,28 @@ func (p *Proxy) clientToServer(c *proxyConn) {
 			return
 		}
 		typed = true
-		if kind == 'Q' && isCommit(msg[5:]) && p.takeDrop() {
-			c.dropping.Store(true)
+		switch kind {
+		case 'Q':
+			p.roundTrips.Add(1)
+			if isCommit(msg[5:]) && p.takeDrop() {
+				c.dropping.Store(true)
+			}
+		case 'S':
+			p.roundTrips.Add(1)
+		case 'P':
+			// Parse: statement name, then query, each NUL-terminated.
+			if name, rest, ok := bytes.Cut(msg[5:], []byte{0}); ok {
+				query, _, _ := bytes.Cut(rest, []byte{0})
+				c.prepared[string(name)] = query
+			}
+		case 'B':
+			// Bind: portal name, then statement name.
+			if _, rest, ok := bytes.Cut(msg[5:], []byte{0}); ok {
+				stmt, _, _ := bytes.Cut(rest, []byte{0})
+				if isCommit(c.prepared[string(stmt)]) && p.takeDrop() {
+					c.dropping.Store(true)
+				}
+			}
 		}
 		if _, err := c.server.Write(msg); err != nil {
 			return
