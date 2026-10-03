@@ -327,8 +327,7 @@ func commitSegment(ctx context.Context, b *bench, epoch, idx uint64, s builtSegm
 		if !ref.Pending {
 			return nil
 		}
-		_, err := tx.SetObjectAvailable(ctx, ref.ID)
-		return err
+		return tx.SetObjectsAvailable(ctx, []uint64{ref.ID})
 	}
 	var ids []uint64
 	if s.blocks == nil {
@@ -338,7 +337,10 @@ func commitSegment(ctx context.Context, b *bench, epoch, idx uint64, s builtSegm
 			_, _ = rand.Read(objs[i].SHA256[:])
 			objs[i].Length = int64(info.CompressedSize)
 		}
-		if ids, err = tx.InsertObjects(ctx, objs); err != nil {
+		// The IDs arrive with InsertGeneration's round trip, before the
+		// generation blocks below use them.
+		ids = make([]uint64, len(objs))
+		if err := tx.InsertObjects(ctx, objs, ids); err != nil {
 			return err
 		}
 	} else {

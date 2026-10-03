@@ -43,8 +43,7 @@ func TestFixtureLifecycle(t *testing.T) {
 		_, _ = rand.Read(objs[i].SHA256[:])
 		objs[i].Length = 1
 	}
-	_, err = tx.InsertObjects(ctx, objs)
-	require.NoError(t, err)
+	require.NoError(t, tx.InsertObjects(ctx, objs, make([]uint64, len(objs))))
 	require.NoError(t, tx.Commit(ctx))
 	walAfter, err := pgfixture.WALPosition(ctx, s)
 	require.NoError(t, err)

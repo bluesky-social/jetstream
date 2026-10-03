@@ -39,8 +39,11 @@ func Run(t *testing.T, newBackend func(t *testing.T) Backend) {
 		{"FenceStaleEpoch", testFenceStaleEpoch},
 		{"FenceSerializes", testFenceSerializes},
 		{"AcquireFencesOldEpoch", testAcquireFencesOldEpoch},
+		{"FenceReads", testFenceReads},
+		{"FenceReadsWaitForTheLock", testFenceReadsWaitForTheLock},
 		{"Meta", testMeta},
 		{"Objects", testObjects},
+		{"ObjectReads", testObjectReads},
 		{"ObjectKeyUnique", testObjectKeyUnique},
 		{"ObjectSHAUnique", testObjectSHAUnique},
 		{"ObjectLengthCheck", testObjectLengthCheck},
@@ -61,9 +64,28 @@ func Run(t *testing.T, newBackend func(t *testing.T) Backend) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			tc.fn(t, newBackend(t))
+			b := newBackend(t)
+			b.DB = rollbackDB{DB: b.DB, t: t}
+			tc.fn(t, b)
 		})
 	}
+}
+
+// rollbackDB rolls back every transaction it opens when the test ends. A
+// failed assertion mid-transaction would otherwise leave it holding its
+// connection, and closing the backend would wait on it forever. Rollback
+// after Commit or Rollback does nothing.
+type rollbackDB struct {
+	catalog.DB
+	t *testing.T
+}
+
+func (d rollbackDB) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, error) {
+	tx, err := d.DB.Begin(ctx, kind)
+	if err == nil {
+		d.t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	}
+	return tx, err
 }
 
 func ctxT(t *testing.T) context.Context {
@@ -111,7 +133,7 @@ func failing(t *testing.T, b Backend, epoch uint64, fn func(ctx context.Context,
 	ctx := ctxT(t)
 	err := fn(ctx, tx)
 	if err == nil {
-		_, _, err = tx.MetaGetForUpdate(ctx, []byte("failing/probe"))
+		_, _, err = metaGet(ctx, tx, "failing/probe")
 		require.Error(t, err, "a queued write's failure is reported by the next statement")
 	}
 	require.Error(t, tx.Commit(ctx), "a failed transaction does not commit")
@@ -133,6 +155,27 @@ func snapshot(t *testing.T, b Backend) *catalog.Snapshot {
 	return s
 }
 
+// metaGet reads and row-locks key in tx.
+func metaGet(ctx context.Context, tx catalog.Tx, key string) ([]byte, bool, error) {
+	r := &catalog.MetaRead{Key: []byte(key)}
+	err := tx.Read(ctx, r)
+	return r.Value, r.Found, err
+}
+
+// insertObjects inserts objs in tx and returns their IDs, which arrive with
+// the next statement that is not queued.
+func insertObjects(t *testing.T, ctx context.Context, tx catalog.Tx, objs ...catalog.NewObject) []uint64 {
+	t.Helper()
+	ids := make([]uint64, len(objs))
+	require.NoError(t, tx.InsertObjects(ctx, objs, ids))
+	_, _, err := metaGet(ctx, tx, "insert/probe")
+	require.NoError(t, err)
+	for _, id := range ids {
+		require.NotZero(t, id)
+	}
+	return ids
+}
+
 func newObject(t *testing.T, data []byte) catalog.NewObject {
 	var o catalog.NewObject
 	_, err := rand.Read(o.Key[:])
@@ -147,12 +190,8 @@ func availableObject(t *testing.T, b Backend, epoch uint64, data []byte) uint64 
 	t.Helper()
 	var id uint64
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
-		ids, err := tx.InsertObjects(ctx, []catalog.NewObject{newObject(t, data)})
-		require.NoError(t, err)
-		id = ids[0]
-		ok, err := tx.SetObjectAvailable(ctx, id)
-		require.NoError(t, err)
-		require.True(t, ok)
+		id = insertObjects(t, ctx, tx, newObject(t, data))[0]
+		require.NoError(t, tx.SetObjectsAvailable(ctx, []uint64{id}))
 	})
 	return id
 }
@@ -185,6 +224,10 @@ func testFenceStaleEpoch(t *testing.T, b Backend) {
 	_, ok, err := tx.FenceBump(ctx, epoch+1)
 	require.NoError(t, err)
 	require.False(t, ok)
+	// Nothing runs after a stale fence.
+	_, _, err = metaGet(ctx, tx, "k")
+	require.Error(t, err)
+	require.Error(t, tx.Commit(ctx))
 	require.NoError(t, tx.Rollback(ctx))
 
 	// A fence that matched nothing holds no lock.
@@ -243,6 +286,136 @@ func testAcquireFencesOldEpoch(t *testing.T, b Backend) {
 	require.NoError(t, tx.Rollback(ctx))
 }
 
+// testFenceReads pins the reads a fence carries: they see the state the
+// fence locked, including a queued write ahead of the fence in the same
+// transaction, and a stale fence leaves them unread rather than failing.
+func testFenceReads(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	initMain(t, b, epoch)
+	obj := availableObject(t, b, epoch, []byte("r"))
+	rev0 := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte("v")}}))
+		ab := activeBlock(catalog.Main, 0, 0, obj, 1, 5)
+		ab.Revision = rev
+		require.NoError(t, tx.InsertActiveBlock(ctx, ab))
+	})
+
+	ctx := ctxT(t)
+	tx, err := b.DB.Begin(ctx, catalog.TxMetadata)
+	require.NoError(t, err)
+	meta, absent := &catalog.MetaRead{Key: []byte("k")}, &catalog.MetaRead{Key: []byte("absent")}
+	seg, last := &catalog.ActiveSegmentRead{Namespace: catalog.Main}, &catalog.LastActiveBlockRead{Namespace: catalog.Main}
+	rows := &catalog.ObjectsRead{IDs: []uint64{obj}}
+	avail := &catalog.AvailableObjectsRead{SHA256: [][32]byte{sha256.Sum256([]byte("r"))}}
+	rev, ok, err := tx.FenceBump(ctx, epoch, meta, absent, seg, last, rows, avail)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, rev0+1, rev)
+	require.True(t, meta.Found)
+	require.Equal(t, "v", string(meta.Value))
+	require.False(t, absent.Found)
+	require.True(t, seg.Found)
+	require.Equal(t, uint64(0), seg.Row.Index)
+	require.True(t, last.Found)
+	require.Equal(t, uint64(5), last.Row.MaxSeq)
+	require.Equal(t, catalog.ObjectAvailable, rows.Rows[obj].State)
+	require.Equal(t, obj, avail.Rows[sha256.Sum256([]byte("r"))].ID)
+	require.NoError(t, tx.Commit(ctx))
+
+	// A stale fence reports ok=false, not an error, whatever it carried,
+	// and its row-locking reads never ran: until it rolls back, the
+	// leader's transaction must not wait on it for the rows they name.
+	stale, err := b.DB.Begin(ctx, catalog.TxMetadata)
+	require.NoError(t, err)
+	defer func() { _ = stale.Rollback(context.Background()) }()
+	meta = &catalog.MetaRead{Key: []byte("k")}
+	_, ok, err = stale.FenceBump(ctx, epoch+1, meta, &catalog.ObjectsRead{IDs: []uint64{obj}}, &catalog.ActiveSegmentRead{Namespace: catalog.Main})
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.False(t, meta.Found, "the read did not run")
+	quick, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	tx, err = b.DB.Begin(quick, catalog.TxMetadata)
+	require.NoError(t, err)
+	_, ok, err = tx.FenceBump(quick, epoch, &catalog.MetaRead{Key: []byte("k")}, &catalog.ObjectsRead{IDs: []uint64{obj}}, &catalog.ActiveSegmentRead{Namespace: catalog.Main})
+	require.NoError(t, err, "the leader waited on the stale transaction's row locks")
+	require.True(t, ok)
+	require.NoError(t, tx.ClearUnreferenced(quick, []uint64{obj}))
+	require.NoError(t, tx.ApplyMeta(quick, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte("w")}}))
+	require.NoError(t, tx.Commit(quick))
+	require.NoError(t, stale.Rollback(ctx))
+}
+
+// testFenceReadsWaitForTheLock pins why a script may read in the fence's
+// round trip: the reads run after the fence takes the archive row lock, so
+// they see what the previous holder committed, never what it had before.
+// The rows it reads are ones the holder creates, which no row lock guards:
+// only the fence orders those reads after its commit.
+func testFenceReadsWaitForTheLock(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	initMain(t, b, epoch)
+	obj := availableObject(t, b, epoch, []byte("w"))
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("seq"), Value: []byte("1")}}))
+	})
+	tx1, r1 := begin(t, b, epoch)
+	ctx := ctxT(t)
+	require.NoError(t, tx1.ApplyMeta(ctx, []metastore.Op{
+		{Kind: metastore.OpSet, Key: []byte("seq"), Value: []byte("2")},
+		{Kind: metastore.OpSet, Key: []byte("new"), Value: []byte("n")},
+	}))
+	require.NoError(t, tx1.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.BootstrapLive, Index: 0, State: catalog.Active, Revision: r1}))
+	require.NoError(t, tx1.InsertActiveBlock(ctx, activeBlock(catalog.BootstrapLive, 0, 0, obj, 1, 1)))
+	_, _, err := metaGet(ctx, tx1, "seq")
+	require.NoError(t, err, "tx1's writes reached the database")
+
+	type result struct {
+		rev        uint64
+		seq, new   string
+		live, last bool
+		err        error
+	}
+	got := make(chan result, 1)
+	go func() {
+		ctx := context.Background()
+		tx2, err := b.DB.Begin(ctx, catalog.TxMetadata)
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		// The read of a row tx1 updated comes last: its own row lock would
+		// hold back the reads after it.
+		last := &catalog.LastActiveBlockRead{Namespace: catalog.BootstrapLive}
+		newKey, live := &catalog.MetaRead{Key: []byte("new")}, &catalog.ActiveSegmentRead{Namespace: catalog.BootstrapLive}
+		seq := &catalog.MetaRead{Key: []byte("seq")}
+		rev, ok, err := tx2.FenceBump(ctx, epoch, last, newKey, live, seq)
+		if err == nil && !ok {
+			err = errors.New("fenced")
+		}
+		// Before the send: once it lands, the test may end and roll back
+		// tx2 itself, and a Tx is not safe for concurrent use.
+		_ = tx2.Rollback(ctx)
+		got <- result{rev: rev, seq: string(seq.Value), new: string(newKey.Value), live: live.Found, last: last.Found, err: err}
+	}()
+	select {
+	case r := <-got:
+		t.Fatalf("second fence finished (%+v) while the first transaction held the row lock", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.NoError(t, tx1.Commit(ctx))
+	select {
+	case r := <-got:
+		require.NoError(t, r.err)
+		require.Equal(t, r1+1, r.rev)
+		require.True(t, r.last, "the unlocked read saw the committed block")
+		require.Equal(t, "n", r.new, "the read saw the committed key")
+		require.True(t, r.live, "the read saw the committed segment")
+		require.Equal(t, "2", r.seq, "the read saw the committed value, not the one before the lock")
+	case <-time.After(5 * time.Second):
+		t.Fatal("second fence never finished")
+	}
+}
+
 func testMeta(t *testing.T, b Backend) {
 	_, epoch := acquire(t, b)
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
@@ -262,13 +435,18 @@ func testMeta(t *testing.T, b Backend) {
 			{Kind: metastore.OpDeleteRange, Key: []byte("b"), End: []byte("c")},
 			{Kind: metastore.OpSet, Key: []byte("b\x01"), Value: []byte("new")},
 		}))
-		v, found, err := tx.MetaGetForUpdate(ctx, []byte("a"))
+		v, found, err := metaGet(ctx, tx, "a")
 		require.NoError(t, err)
 		require.True(t, found)
 		require.Equal(t, "y", string(v))
-		_, found, err = tx.MetaGetForUpdate(ctx, []byte("b"))
+		v, found, err = metaGet(ctx, tx, "b")
 		require.NoError(t, err)
 		require.False(t, found)
+		require.Nil(t, v)
+		v, found, err = metaGet(ctx, tx, "c")
+		require.NoError(t, err)
+		require.True(t, found, "an empty value is present")
+		require.Equal(t, []byte{}, v)
 	})
 	got, err := read(t, b).MetaGet(ctxT(t), [][]byte{[]byte("a"), []byte("b"), []byte("b\x00"), []byte("b\x01"), []byte("c"), []byte("d"), []byte("zz")})
 	require.NoError(t, err)
@@ -288,39 +466,40 @@ func testObjects(t *testing.T, b Backend) {
 	o1, o2 := newObject(t, []byte("one")), newObject(t, []byte("two"))
 	var ids []uint64
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
-		var err error
-		ids, err = tx.InsertObjects(ctx, []catalog.NewObject{o1, o2})
-		require.NoError(t, err)
-		require.Len(t, ids, 2)
+		ids = insertObjects(t, ctx, tx, o1, o2)
 		require.NotEqual(t, ids[0], ids[1])
-		missing, err := tx.RefCheck(ctx, []uint64{ids[0], ids[1], 1 << 40})
-		require.NoError(t, err)
-		require.ElementsMatch(t, []uint64{ids[0], ids[1], 1 << 40}, missing, "uploading and absent objects fail the reference check")
-		_, found, err := tx.FindAvailableObject(ctx, o1.SHA256, 0)
-		require.NoError(t, err)
-		require.False(t, found, "uploading rows are not dedup candidates")
+		avail := &catalog.AvailableObjectsRead{SHA256: [][32]byte{o1.SHA256, o2.SHA256}}
+		rows := &catalog.ObjectsRead{IDs: []uint64{ids[1], ids[0], ids[0], 1 << 40}}
+		require.NoError(t, tx.Read(ctx, avail, rows))
+		require.Empty(t, avail.Rows, "uploading rows are not dedup candidates")
+		require.Len(t, rows.Rows, 2, "an absent ID has no row; a repeated one, one")
+		for i, o := range []catalog.NewObject{o1, o2} {
+			row := rows.Rows[ids[i]]
+			require.Equal(t, ids[i], row.ID)
+			require.Equal(t, o.Key, row.Key)
+			require.Equal(t, o.SHA256, row.SHA256)
+			require.Equal(t, o.Length, row.Length)
+			require.Equal(t, catalog.ObjectUploading, row.State)
+			require.False(t, row.CreatedAt.IsZero())
+		}
 	})
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
-		ok, err := tx.SetObjectAvailable(ctx, ids[0])
-		require.NoError(t, err)
-		require.True(t, ok)
-		ok, err = tx.SetObjectAvailable(ctx, ids[0])
-		require.NoError(t, err)
-		require.False(t, ok, "only an uploading row becomes available")
-		ok, err = tx.SetObjectAvailable(ctx, 1<<40)
-		require.NoError(t, err)
-		require.False(t, ok)
-		row, found, err := tx.FindAvailableObject(ctx, o1.SHA256, time.Hour)
-		require.NoError(t, err)
-		require.True(t, found)
+		require.NoError(t, tx.SetObjectsAvailable(ctx, []uint64{ids[0], ids[0], 1 << 40}))
+		avail := &catalog.AvailableObjectsRead{SHA256: [][32]byte{o1.SHA256, o2.SHA256, o1.SHA256}, MaxUnrefAge: time.Hour}
+		rows := &catalog.ObjectsRead{IDs: ids}
+		require.NoError(t, tx.Read(ctx, avail, rows))
+		require.Len(t, avail.Rows, 1)
+		row := avail.Rows[o1.SHA256]
 		require.Equal(t, ids[0], row.ID)
 		require.Equal(t, o1.Key, row.Key)
 		require.Equal(t, o1.Length, row.Length)
 		require.Equal(t, catalog.ObjectAvailable, row.State)
 		require.True(t, row.UnreferencedAt.IsZero())
-		missing, err := tx.RefCheck(ctx, []uint64{ids[0], ids[0]})
-		require.NoError(t, err)
-		require.Empty(t, missing)
+		require.Equal(t, catalog.ObjectAvailable, rows.Rows[ids[0]].State, "a later read sees the queued update")
+		require.Equal(t, catalog.ObjectUploading, rows.Rows[ids[1]].State, "only the named rows change")
+		// Only an uploading row becomes available; an available one is
+		// left as it is.
+		require.NoError(t, tx.SetObjectsAvailable(ctx, ids[:1]))
 	})
 	objs, err := read(t, b).Objects(ctxT(t), []uint64{ids[1], ids[0], ids[0]})
 	require.NoError(t, err)
@@ -333,23 +512,86 @@ func testObjects(t *testing.T, b Backend) {
 
 	// Sequences are not transactional: a rolled-back insert burns its ID.
 	tx, _ := begin(t, b, epoch)
-	burnt, err := tx.InsertObjects(ctxT(t), []catalog.NewObject{newObject(t, []byte("x"))})
-	require.NoError(t, err)
+	burnt := insertObjects(t, ctxT(t), tx, newObject(t, []byte("x")))
 	require.NoError(t, tx.Rollback(ctxT(t)))
 	next := availableObject(t, b, epoch, []byte("y"))
 	require.Greater(t, next, burnt[0])
+
+	// The IDs of an insert queued until COMMIT arrive with it.
+	more := make([]uint64, 2)
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		require.NoError(t, tx.InsertObjects(ctx, []catalog.NewObject{newObject(t, []byte("p")), newObject(t, []byte("q"))}, more))
+	})
+	objs, err = read(t, b).Objects(ctxT(t), more)
+	require.NoError(t, err)
+	require.Len(t, objs, 2)
+	require.Equal(t, more, []uint64{objs[0].ID, objs[1].ID})
+}
+
+// testObjectReads pins the §7.3 dedup age rule and the §7.4 write.
+func testObjectReads(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	marked := availableObject(t, b, epoch, []byte("marked"))
+	cleared := availableObject(t, b, epoch, []byte("cleared"))
+	fresh := availableObject(t, b, epoch, []byte("fresh"))
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		page, err := tx.MarkUnreferenced(ctx, 0, 2)
+		require.NoError(t, err)
+		require.Equal(t, 2, page.Marked, "nothing references marked or cleared")
+	})
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		require.NoError(t, tx.ClearUnreferenced(ctx, []uint64{cleared, cleared, fresh, 1 << 40}))
+		rows := &catalog.ObjectsRead{IDs: []uint64{marked, cleared, fresh}}
+		require.NoError(t, tx.Read(ctx, rows))
+		require.False(t, rows.Rows[marked].UnreferencedAt.IsZero())
+		require.True(t, rows.Rows[cleared].UnreferencedAt.IsZero(), "a later read sees the queued clear")
+		require.True(t, rows.Rows[fresh].UnreferencedAt.IsZero())
+	})
+	// The mark is now older than a millisecond.
+	time.Sleep(5 * time.Millisecond)
+	shas := [][32]byte{sha256.Sum256([]byte("marked")), sha256.Sum256([]byte("cleared")), sha256.Sum256([]byte("absent"))}
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		anyAge := &catalog.AvailableObjectsRead{SHA256: shas}
+		young := &catalog.AvailableObjectsRead{SHA256: shas, MaxUnrefAge: time.Hour}
+		old := &catalog.AvailableObjectsRead{SHA256: shas, MaxUnrefAge: time.Millisecond}
+		require.NoError(t, tx.Read(ctx, anyAge, young, old))
+		require.Equal(t, []uint64{marked, cleared}, sortedIDs(anyAge.Rows), "no age: every available row")
+		require.Equal(t, []uint64{marked, cleared}, sortedIDs(young.Rows), "marked within the age")
+		require.Equal(t, []uint64{cleared}, sortedIDs(old.Rows), "marked longer ago than the age")
+	})
+	// A row that is not available keeps its mark.
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		claimed, err := tx.ClaimObjects(ctx, -time.Hour, time.Hour, 100)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+		require.Equal(t, marked, claimed[0].ID)
+		require.NoError(t, tx.ClearUnreferenced(ctx, []uint64{marked}))
+		rows := &catalog.ObjectsRead{IDs: []uint64{marked}}
+		avail := &catalog.AvailableObjectsRead{SHA256: shas[:1]}
+		require.NoError(t, tx.Read(ctx, rows, avail))
+		require.Equal(t, catalog.ObjectDeleting, rows.Rows[marked].State)
+		require.False(t, rows.Rows[marked].UnreferencedAt.IsZero())
+		require.Empty(t, avail.Rows, "a deleting row is not a dedup candidate")
+	})
+}
+
+func sortedIDs(rows map[[32]byte]catalog.ObjectRow) []uint64 {
+	var ids []uint64
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 func testObjectKeyUnique(t *testing.T, b Backend) {
 	_, epoch := acquire(t, b)
 	o := newObject(t, []byte("k"))
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
-		_, err := tx.InsertObjects(ctx, []catalog.NewObject{o})
-		require.NoError(t, err)
+		insertObjects(t, ctx, tx, o)
 	})
 	failing(t, b, epoch, func(ctx context.Context, tx catalog.Tx) error {
-		_, err := tx.InsertObjects(ctx, []catalog.NewObject{o})
-		return err
+		return tx.InsertObjects(ctx, []catalog.NewObject{o}, make([]uint64, 1))
 	})
 }
 
@@ -358,14 +600,11 @@ func testObjectSHAUnique(t *testing.T, b Backend) {
 	first := availableObject(t, b, epoch, []byte("same"))
 	var second uint64
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
-		ids, err := tx.InsertObjects(ctx, []catalog.NewObject{newObject(t, []byte("same"))})
-		require.NoError(t, err)
-		second = ids[0]
+		second = insertObjects(t, ctx, tx, newObject(t, []byte("same")))[0]
 	})
 	require.NotEqual(t, first, second)
 	failing(t, b, epoch, func(ctx context.Context, tx catalog.Tx) error {
-		_, err := tx.SetObjectAvailable(ctx, second)
-		return err
+		return tx.SetObjectsAvailable(ctx, []uint64{second})
 	})
 	objs, err := read(t, b).Objects(ctxT(t), []uint64{second})
 	require.NoError(t, err)
@@ -375,9 +614,7 @@ func testObjectSHAUnique(t *testing.T, b Backend) {
 func testObjectLengthCheck(t *testing.T, b Backend) {
 	_, epoch := acquire(t, b)
 	failing(t, b, epoch, func(ctx context.Context, tx catalog.Tx) error {
-		o := newObject(t, nil)
-		_, err := tx.InsertObjects(ctx, []catalog.NewObject{o})
-		return err
+		return tx.InsertObjects(ctx, []catalog.NewObject{newObject(t, nil)}, make([]uint64, 1))
 	})
 }
 
@@ -467,26 +704,27 @@ func testSegments(t *testing.T, b Backend) {
 	obj := availableObject(t, b, epoch, []byte("blk"))
 	footer := availableObject(t, b, epoch, []byte("footer"))
 	r0 := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
-		_, found, err := tx.ActiveSegment(ctx, catalog.Main)
-		require.NoError(t, err)
-		require.False(t, found)
+		seg, last := &catalog.ActiveSegmentRead{Namespace: catalog.Main}, &catalog.LastActiveBlockRead{Namespace: catalog.Main}
+		require.NoError(t, tx.Read(ctx, seg, last))
+		require.False(t, seg.Found)
+		require.False(t, last.Found)
 		require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.Main, Index: 0, State: catalog.Active, Revision: rev}))
-		seg, found, err := tx.ActiveSegment(ctx, catalog.Main)
-		require.NoError(t, err)
-		require.True(t, found)
-		require.Equal(t, uint64(0), seg.Index)
-		_, found, err = tx.LastActiveBlock(ctx, catalog.Main, 0)
-		require.NoError(t, err)
-		require.False(t, found)
+		require.NoError(t, tx.Read(ctx, seg, last))
+		require.True(t, seg.Found)
+		require.Equal(t, catalog.SegmentRow{Namespace: catalog.Main, Index: 0, State: catalog.Active, Revision: rev}, seg.Row)
+		require.False(t, last.Found)
 		for i := range 3 {
 			ab := activeBlock(catalog.Main, 0, i, obj, uint64(i*10+1), uint64(i*10+10))
 			ab.Revision = rev
 			require.NoError(t, tx.InsertActiveBlock(ctx, ab))
 		}
-		last, found, err := tx.LastActiveBlock(ctx, catalog.Main, 0)
-		require.NoError(t, err)
-		require.True(t, found)
-		require.Equal(t, 2, last.Ordinal)
+		other := &catalog.LastActiveBlockRead{Namespace: catalog.BootstrapLive}
+		require.NoError(t, tx.Read(ctx, last, other))
+		require.True(t, last.Found)
+		want := activeBlock(catalog.Main, 0, 2, obj, 21, 30)
+		want.Revision = rev
+		require.Equal(t, want, last.Row)
+		require.False(t, other.Found, "another namespace's blocks are not its")
 	})
 	r := read(t, b)
 	blocks, err := r.ActiveBlocksSince(ctxT(t), r0-1)
@@ -528,6 +766,22 @@ func testSegments(t *testing.T, b Backend) {
 		require.False(t, ok, "a sealed segment cannot be sealed again")
 		require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.Main, Index: 1, State: catalog.Active, Revision: rev}))
 	})
+	// The last block is the active segment's, not the newest segment
+	// with blocks.
+	func() {
+		tx, _ := begin(t, b, epoch)
+		ctx := ctxT(t)
+		defer func() { require.NoError(t, tx.Rollback(ctx)) }()
+		require.NoError(t, tx.InsertActiveBlock(ctx, activeBlock(catalog.Main, 0, 9, obj, 91, 100)))
+		seg, last := &catalog.ActiveSegmentRead{Namespace: catalog.Main}, &catalog.LastActiveBlockRead{Namespace: catalog.Main}
+		require.NoError(t, tx.Read(ctx, seg, last))
+		require.Equal(t, uint64(1), seg.Row.Index)
+		require.False(t, last.Found)
+		require.NoError(t, tx.InsertActiveBlock(ctx, activeBlock(catalog.Main, 1, 0, obj, 31, 40)))
+		require.NoError(t, tx.Read(ctx, last))
+		require.True(t, last.Found)
+		require.Equal(t, uint64(1), last.Row.Segment)
+	}()
 	r = read(t, b)
 	segs, err := r.SegmentsSince(ctxT(t), 0)
 	require.NoError(t, err)
@@ -748,9 +1002,7 @@ func testGC(t *testing.T, b Backend) {
 	}
 	var uploading uint64
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
-		ids, err := tx.InsertObjects(ctx, []catalog.NewObject{newObject(t, []byte("uploading"))})
-		require.NoError(t, err)
-		uploading = ids[0]
+		uploading = insertObjects(t, ctx, tx, newObject(t, []byte("uploading")))[0]
 	})
 	sealedMain(t, b, epoch, footer, blk)
 	ptr := availableObject(t, b, epoch, []byte("pointer"))
@@ -793,9 +1045,7 @@ func testGC(t *testing.T, b Backend) {
 
 	// Referencing a marked row clears the mark (§7.4).
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
-		missing, err := tx.RefCheck(ctx, []uint64{loose[2]})
-		require.NoError(t, err)
-		require.Empty(t, missing)
+		require.NoError(t, tx.ClearUnreferenced(ctx, []uint64{loose[2]}))
 	})
 	states, err := read(t, b).ObjectStates(ctxT(t))
 	require.NoError(t, err)
@@ -818,9 +1068,9 @@ func testGC(t *testing.T, b Backend) {
 		require.Equal(t, uploading, more[0].ID)
 		require.Equal(t, catalog.ObjectUploading, more[0].State)
 		claimed = append(claimed, more...)
-		_, found, err := tx.FindAvailableObject(ctx, sha256.Sum256([]byte("loose 1")), 0)
-		require.NoError(t, err)
-		require.False(t, found, "a claimed row is not a dedup candidate")
+		avail := &catalog.AvailableObjectsRead{SHA256: [][32]byte{sha256.Sum256([]byte("loose 1"))}}
+		require.NoError(t, tx.Read(ctx, avail))
+		require.Empty(t, avail.Rows, "a claimed row is not a dedup candidate")
 	})
 	// The same bytes can become available again under a new row.
 	availableObject(t, b, epoch, []byte("loose 1"))
@@ -883,9 +1133,9 @@ func testDeleteNamespace(t *testing.T, b Backend) {
 	})
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
 		require.NoError(t, tx.DeleteNamespace(ctx, catalog.BootstrapLive))
-		_, found, err := tx.ActiveSegment(ctx, catalog.BootstrapLive)
-		require.NoError(t, err)
-		require.False(t, found)
+		seg := &catalog.ActiveSegmentRead{Namespace: catalog.BootstrapLive}
+		require.NoError(t, tx.Read(ctx, seg))
+		require.False(t, seg.Found)
 	})
 	s := snapshot(t, b)
 	require.Equal(t, []catalog.SegmentRow{{Namespace: catalog.Main, Index: 0, State: catalog.Active, Revision: s.Segments[0].Revision}}, s.Segments)
@@ -929,10 +1179,10 @@ func testAbortedTransaction(t *testing.T, b Backend) {
 	require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte("v")}}))
 	err := tx.InsertHotBatch(ctx, hot(1, 1, nil, 0))
 	if err == nil {
-		_, _, err = tx.MetaGetForUpdate(ctx, []byte("k"))
+		_, _, err = metaGet(ctx, tx, "k")
 	}
 	require.Error(t, err, "the bad insert fails, by the next statement at the latest")
-	_, _, err = tx.MetaGetForUpdate(ctx, []byte("k"))
+	_, _, err = metaGet(ctx, tx, "k")
 	require.Error(t, err, "statements after a failure are rejected")
 	require.Error(t, tx.Commit(ctx), "committing an aborted transaction rolls back")
 	require.NoError(t, tx.Rollback(ctx))
@@ -955,10 +1205,10 @@ func testQueuedWrites(t *testing.T, b Backend) {
 	t.Run("later statements see them", func(t *testing.T) {
 		write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
 			require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.BootstrapLive, Index: 0, State: catalog.Active, Revision: rev}))
-			seg, found, err := tx.ActiveSegment(ctx, catalog.BootstrapLive)
-			require.NoError(t, err)
-			require.True(t, found, "a single-row read sees the queued insert")
-			require.Equal(t, uint64(0), seg.Index)
+			seg := &catalog.ActiveSegmentRead{Namespace: catalog.BootstrapLive}
+			require.NoError(t, tx.Read(ctx, seg))
+			require.True(t, seg.Found, "a single-row read sees the queued insert")
+			require.Equal(t, uint64(0), seg.Row.Index)
 			require.NoError(t, tx.InsertActiveBlock(ctx, activeBlock(catalog.BootstrapLive, 0, 0, obj, 1, 3)))
 			blocks, err := tx.ActiveBlocksForUpdate(ctx, catalog.BootstrapLive, 0)
 			require.NoError(t, err)
@@ -972,15 +1222,18 @@ func testQueuedWrites(t *testing.T, b Backend) {
 	// Each kind of call that follows a failed queued write reports it.
 	next := map[string]func(ctx context.Context, tx catalog.Tx) error{
 		"single-row read": func(ctx context.Context, tx catalog.Tx) error {
-			_, _, err := tx.MetaGetForUpdate(ctx, []byte("k"))
+			_, _, err := metaGet(ctx, tx, "k")
 			return err
 		},
 		"multi-row read": func(ctx context.Context, tx catalog.Tx) error {
 			_, err := tx.ActiveBlocksForUpdate(ctx, catalog.Main, 0)
 			return err
 		},
+		"batched reads": func(ctx context.Context, tx catalog.Tx) error {
+			return tx.Read(ctx, &catalog.ObjectsRead{IDs: []uint64{obj}}, &catalog.LastActiveBlockRead{Namespace: catalog.Main})
+		},
 		"command tag": func(ctx context.Context, tx catalog.Tx) error {
-			_, err := tx.SetObjectAvailable(ctx, obj)
+			_, err := tx.DeleteActiveBlocks(ctx, catalog.Main, 0)
 			return err
 		},
 		"commit": func(ctx context.Context, tx catalog.Tx) error { return tx.Commit(ctx) },

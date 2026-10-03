@@ -366,9 +366,11 @@ referencing transaction runs step 6 (see the end of this section). Steps:
    `jetstream_s3_verify_failures_total{path="upload"}`, not as corruption,
    because nothing durable is wrong.
 6. `UPDATE objects SET state = 'available' WHERE object_id = $id AND state =
-   'uploading'` (fenced). If this hits the partial unique index on `sha256`
-   because another upload of the same bytes won, use the winning row's
-   `object_id` and leave this row for GC.
+   'uploading'` (fenced). If another upload of the same bytes already won, the
+   update would hit the partial unique index on `sha256`: use the winning
+   row's `object_id` instead and leave this row for GC. The transaction reads
+   the winner and this row, row-locked, in the fence's round trip (§9.1), so
+   it knows which case it is in before it queues the update.
 
 Transient S3 errors in steps 4 and 5 are retried with backoff, up to
 `JETSTREAM_S3_RETRY_TIMEOUT` (default 30s). After that the upload fails and the
@@ -397,13 +399,16 @@ Any transaction that adds a reference to an object (a `hot_batches.object_id`,
 `segment_generations.footer_object_id`) must, in the same transaction, run:
 
 ```sql
+SELECT ... FROM objects WHERE object_id = ANY($ids) FOR UPDATE;  -- in the fence's round trip
+-- every row must be 'available' (or made available earlier in this transaction)
 UPDATE objects SET unreferenced_at = NULL
-WHERE object_id = $id AND state = 'available'
-RETURNING object_id;
+WHERE object_id = ANY($ids) AND state = 'available' AND unreferenced_at IS NOT NULL;
 ```
 
-Zero rows means the object is being deleted or never became available. Treat
-that as an internal error and end the session. This check, together with GC
+A row that is not available means the object is being deleted or never became
+available. Treat that as an internal error and end the session; nothing
+commits. The row lock means the queued `UPDATE` changes exactly the rows the
+check saw. This check, together with GC
 claiming deletes in fenced transactions (§13), means GC can never delete an
 object that is still referenced.
 
@@ -567,13 +572,20 @@ Notes:
   from the fence row lock, not from isolation level.
 - The fence is always the first statement (§6.4).
 - Statements are pipelined to save WAN round trips (pgstore `tx`): `BEGIN`
-  goes in the same round trip as the fence, and a write whose only result is
-  its error (the metadata apply, row inserts, `pg_notify`) is queued and sent
-  with the next statement or with `COMMIT`. PostgreSQL runs a pipeline in
-  order and aborts the transaction at the first failure, so what commits is
-  unchanged; only which call reports a queued write's error moves
-  (`catalog.Tx`). A metadata commit is two round trips, and a direct-mode
-  block commit eight.
+  goes in the same round trip as the fence, and a write whose result the
+  script does not need before going on (the metadata apply, row inserts,
+  object state updates, `pg_notify`) is queued and sent with the next
+  statement or with `COMMIT`. PostgreSQL runs a pipeline in order and aborts
+  the transaction at the first failure, so what commits is unchanged; only
+  which call reports a queued write's error moves (`catalog.Tx`).
+- A script names the reads it needs up front (`catalog.Read`) and they go in
+  the fence's round trip, after the fence, so they run under its lock. The
+  archive row lock is held for every round trip after the fence, and every
+  leader transaction waits for it, so those round trips cap the leader's
+  write rate. The object rows a script checks (§7.3 step 6, §7.4) are read
+  `FOR UPDATE`, so the queued updates after the checks change exactly the
+  rows the checks saw. A metadata commit, a direct-mode block commit, a hot
+  batch commit, and an objects transaction are each two round trips.
 - No S3 calls or other network I/O happen inside a transaction. Upload first,
   then commit.
 - A transaction that returns an error, or whose `COMMIT` result is unknown, ends

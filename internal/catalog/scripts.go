@@ -132,10 +132,15 @@ func (s *Session) ended() error {
 	return fmt.Errorf("%w: an earlier transaction failed: %w", ErrSessionEnded, s.err)
 }
 
-// run is the shape every leader write transaction takes: fence first, the
-// script body, NOTIFY, commit. Any error rolls back and ends the session;
-// a failed COMMIT is an unknown result and is never retried.
-func (s *Session) run(ctx context.Context, kind TxKind, body func(tx Tx, rev uint64) error) (uint64, error) {
+// run is the shape every leader write transaction takes: fence first, with
+// reads in its round trip, then the script body, NOTIFY, commit. Any error
+// rolls back and ends the session; a failed COMMIT is an unknown result and
+// is never retried.
+//
+// The archive row lock is held from the fence to COMMIT, and every leader
+// transaction waits for it, so a script passes every read it can name up
+// front as reads rather than spend a round trip under the lock on each.
+func (s *Session) run(ctx context.Context, kind TxKind, reads []Read, body func(tx Tx, rev uint64) error) (uint64, error) {
 	if err := s.ended(); err != nil {
 		return 0, err
 	}
@@ -143,7 +148,7 @@ func (s *Session) run(ctx context.Context, kind TxKind, body func(tx Tx, rev uin
 	if err != nil {
 		return 0, s.fail(sessionEnded(string(kind)+": begin", err))
 	}
-	rev, err := s.runBody(ctx, kind, tx, body)
+	rev, err := s.runBody(ctx, kind, tx, reads, body)
 	if err == nil {
 		if err = tx.Commit(ctx); err != nil {
 			err = sessionEnded(string(kind)+": commit result unknown", err)
@@ -156,8 +161,8 @@ func (s *Session) run(ctx context.Context, kind TxKind, body func(tx Tx, rev uin
 	return rev, nil
 }
 
-func (s *Session) runBody(ctx context.Context, kind TxKind, tx Tx, body func(tx Tx, rev uint64) error) (uint64, error) {
-	rev, ok, err := tx.FenceBump(ctx, s.epoch)
+func (s *Session) runBody(ctx context.Context, kind TxKind, tx Tx, reads []Read, body func(tx Tx, rev uint64) error) (uint64, error) {
+	rev, ok, err := tx.FenceBump(ctx, s.epoch, reads...)
 	if err != nil {
 		return 0, sessionEnded(string(kind)+": fence", err)
 	}
@@ -174,33 +179,22 @@ func (s *Session) runBody(ctx context.Context, kind TxKind, tx Tx, body func(tx 
 	return rev, nil
 }
 
-// checkSeq locks ns's seq key and checks it equals first (§10.2). A
-// mismatch means the leader's in-memory seq state diverged from what
-// committed, which is corruption.
-func checkSeq(ctx context.Context, tx Tx, ns Namespace, first uint64) error {
-	key := SeqKey(ns)
-	val, found, err := tx.MetaGetForUpdate(ctx, []byte(key))
-	if err != nil {
-		return err
-	}
-	stored, err := DecodeSeq(key, val, found)
+// seqRead reads and locks ns's seq key, for checkSeq.
+func seqRead(ns Namespace) *MetaRead {
+	return &MetaRead{Key: []byte(SeqKey(ns))}
+}
+
+// checkSeq checks the seq key r read equals first (§10.2). A mismatch means
+// the leader's in-memory seq state diverged from what committed, which is
+// corruption.
+func checkSeq(r *MetaRead, first uint64) error {
+	key := string(r.Key)
+	stored, err := DecodeSeq(key, r.Value, r.Found)
 	if err != nil {
 		return err
 	}
 	if stored != first {
 		return Corruptf(SourceSeq, "%s is %d, commit starts at %d", key, stored, first)
-	}
-	return nil
-}
-
-// refCheck runs the §7.4 reference check for every ID.
-func refCheck(ctx context.Context, tx Tx, ids ...uint64) error {
-	missing, err := tx.RefCheck(ctx, ids)
-	if err != nil {
-		return err
-	}
-	if len(missing) > 0 {
-		return Corruptf(SourceRef, "objects %v are not available", missing)
 	}
 	return nil
 }
@@ -215,42 +209,104 @@ type ObjectRef struct {
 	Pending bool
 }
 
-// resolve makes a pending object available and reference-checks the
-// object the transaction will point at, returning its ID.
-func resolve(ctx context.Context, tx Tx, ref ObjectRef) (uint64, error) {
-	id := ref.ID
-	if ref.Pending {
-		var err error
-		if id, err = markAvailable(ctx, tx, ref.ID, ref.SHA256); err != nil {
-			return 0, err
-		}
-	}
-	if err := refCheck(ctx, tx, id); err != nil {
-		return 0, err
-	}
-	return id, nil
+// objectReads are the reads that resolving refs takes, sent with the fence:
+// each ref's own row, and for a pending ref the available row with its
+// bytes. Both are row-locked, and every writer of objects holds the fence
+// besides, so the writes queued after the checks change exactly the rows
+// the checks saw.
+type objectReads struct {
+	refs  []ObjectRef
+	rows  ObjectsRead
+	avail AvailableObjectsRead
 }
 
-// markAvailable is §7.3 step 6. Every write runs under the fence's row
-// lock, so the winner lookup and the update cannot race another upload.
-func markAvailable(ctx context.Context, tx Tx, id uint64, sha [32]byte) (uint64, error) {
-	winner, found, err := tx.FindAvailableObject(ctx, sha, 0)
+func newObjectReads(refs ...ObjectRef) *objectReads {
+	r := &objectReads{refs: refs}
+	for _, ref := range refs {
+		r.rows.IDs = append(r.rows.IDs, ref.ID)
+		if ref.Pending {
+			r.avail.SHA256 = append(r.avail.SHA256, ref.SHA256)
+		}
+	}
+	return r
+}
+
+func (r *objectReads) reads() []Read {
+	switch {
+	case len(r.refs) == 0:
+		return nil
+	case len(r.avail.SHA256) == 0:
+		return []Read{&r.rows}
+	}
+	return []Read{&r.rows, &r.avail}
+}
+
+// markAvailable is §7.3 step 6 for each pending ref, in order: its row
+// becomes available, unless an available object with the same bytes
+// already won, which the ref then names instead. It queues the change and
+// returns the object ID each ref names, and the state every object read
+// will be in once the change applies.
+func (r *objectReads) markAvailable(ctx context.Context, tx Tx) ([]uint64, map[uint64]ObjectState, error) {
+	states := make(map[uint64]ObjectState, len(r.rows.Rows)+len(r.avail.Rows))
+	for id, row := range r.rows.Rows {
+		states[id] = row.State
+	}
+	winners := make(map[[32]byte]uint64, len(r.avail.Rows))
+	for sha, row := range r.avail.Rows {
+		winners[sha] = row.ID
+		states[row.ID] = row.State
+	}
+	ids := make([]uint64, len(r.refs))
+	var promote []uint64
+	for i, ref := range r.refs {
+		ids[i] = ref.ID
+		if !ref.Pending {
+			continue
+		}
+		if id, ok := winners[ref.SHA256]; ok {
+			ids[i] = id
+			continue
+		}
+		if states[ref.ID] != ObjectUploading {
+			// GC may have claimed an upload that stalled past the orphan age
+			// (§7.3's accepted leak). A fresh session retries the upload.
+			return nil, nil, fmt.Errorf("object %d is no longer uploading", ref.ID)
+		}
+		// A later ref to the same bytes references this one, as it would
+		// have found it available.
+		states[ref.ID] = ObjectAvailable
+		winners[ref.SHA256] = ref.ID
+		promote = append(promote, ref.ID)
+	}
+	if len(promote) > 0 {
+		if err := tx.SetObjectsAvailable(ctx, promote); err != nil {
+			return nil, nil, err
+		}
+	}
+	return ids, states, nil
+}
+
+// resolve makes the pending refs available (markAvailable), runs the §7.4
+// reference check on every object the refs name, and returns their IDs in
+// ref order.
+func (r *objectReads) resolve(ctx context.Context, tx Tx) ([]uint64, error) {
+	if len(r.refs) == 0 {
+		return nil, nil
+	}
+	ids, states, err := r.markAvailable(ctx, tx)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if found {
-		return winner.ID, nil
+	var missing []uint64
+	for _, id := range ids {
+		if states[id] != ObjectAvailable {
+			missing = append(missing, id)
+		}
 	}
-	ok, err := tx.SetObjectAvailable(ctx, id)
-	if err != nil {
-		return 0, err
+	if len(missing) > 0 {
+		return nil, Corruptf(SourceRef, "objects %v are not available", missing)
 	}
-	if !ok {
-		// GC may have claimed an upload that stalled past the orphan age
-		// (§7.3's accepted leak). A fresh session retries the upload.
-		return 0, fmt.Errorf("object %d is no longer uploading", id)
-	}
-	return id, nil
+	return ids, tx.ClearUnreferenced(ctx, ids)
 }
 
 // HotBatch is one frozen hot batch to commit (§10.4). Exactly one of Frame
@@ -303,9 +359,20 @@ func (s *Session) CommitHotBatches(ctx context.Context, bs []HotBatch) ([]HotBat
 		}
 		meta = append(meta, b.Meta...)
 	}
+	var refs []ObjectRef
+	for _, b := range bs {
+		if b.Frame == nil {
+			refs = append(refs, b.Object)
+		}
+	}
+	seq, objs := seqRead(Main), newObjectReads(refs...)
 	out := make([]HotBatchCommit, len(bs))
-	rev, err := s.run(ctx, TxHotBatch, func(tx Tx, rev uint64) error {
-		if err := checkSeq(ctx, tx, Main, bs[0].FirstSeq); err != nil {
+	rev, err := s.run(ctx, TxHotBatch, append([]Read{seq}, objs.reads()...), func(tx Tx, rev uint64) error {
+		if err := checkSeq(seq, bs[0].FirstSeq); err != nil {
+			return err
+		}
+		ids, err := objs.resolve(ctx, tx)
+		if err != nil {
 			return err
 		}
 		for i, b := range bs {
@@ -320,11 +387,8 @@ func (s *Session) CommitHotBatches(ctx context.Context, bs []HotBatch) ([]HotBat
 				Frame:          b.Frame,
 			}
 			if b.Frame == nil {
-				id, err := resolve(ctx, tx, b.Object)
-				if err != nil {
-					return err
-				}
-				row.ObjectID, out[i].ObjectID = id, id
+				row.ObjectID, out[i].ObjectID = ids[0], ids[0]
+				ids = ids[1:]
 			}
 			if err := tx.InsertHotBatch(ctx, row); err != nil {
 				return err
@@ -404,11 +468,12 @@ func (s *Session) CommitBlock(ctx context.Context, b Block) (BlockCommit, error)
 		return BlockCommit{}, s.fail(err)
 	}
 	var out BlockCommit
-	rev, err := s.run(ctx, TxBlock, func(tx Tx, rev uint64) error {
-		if err := checkSeq(ctx, tx, b.Namespace, b.Info.MinSeq); err != nil {
+	seq, br := seqRead(b.Namespace), newBlockReads(b)
+	rev, err := s.run(ctx, TxBlock, append([]Read{seq}, br.reads()...), func(tx Tx, rev uint64) error {
+		if err := checkSeq(seq, b.Info.MinSeq); err != nil {
 			return err
 		}
-		if err := insertActiveBlock(ctx, tx, rev, b, &out); err != nil {
+		if err := insertActiveBlock(ctx, tx, rev, b, br, &out); err != nil {
 			return err
 		}
 		return tx.ApplyMeta(ctx, withSeq(b.Namespace, b.Info.MaxSeq+1, b.Meta))
@@ -427,7 +492,8 @@ func (s *Session) Fold(ctx context.Context, b Block) (BlockCommit, error) {
 		return BlockCommit{}, s.fail(errors.New("catalog: fold is main-only and carries no metadata"))
 	}
 	var out BlockCommit
-	rev, err := s.run(ctx, TxFold, func(tx Tx, rev uint64) error {
+	br := newBlockReads(b)
+	rev, err := s.run(ctx, TxFold, br.reads(), func(tx Tx, rev uint64) error {
 		spans, err := tx.DeleteHotBatches(ctx, b.Info.MinSeq, b.Info.MaxSeq)
 		if err != nil {
 			return err
@@ -435,7 +501,7 @@ func (s *Session) Fold(ctx context.Context, b Block) (BlockCommit, error) {
 		if err := checkCoverage(spans, b.Info.MinSeq, b.Info.MaxSeq); err != nil {
 			return err
 		}
-		return insertActiveBlock(ctx, tx, rev, b, &out)
+		return insertActiveBlock(ctx, tx, rev, b, br, &out)
 	})
 	out.Revision = rev
 	return out, err
@@ -459,34 +525,52 @@ func checkCoverage(spans []HotBatchSpan, lo, hi uint64) error {
 	return nil
 }
 
+// blockReads are the reads insertActiveBlock takes, sent with the fence.
+type blockReads struct {
+	seg  ActiveSegmentRead
+	last LastActiveBlockRead
+	obj  *objectReads
+}
+
+func newBlockReads(b Block) *blockReads {
+	return &blockReads{
+		seg:  ActiveSegmentRead{Namespace: b.Namespace},
+		last: LastActiveBlockRead{Namespace: b.Namespace},
+		obj:  newObjectReads(b.Object),
+	}
+}
+
+func (r *blockReads) reads() []Read {
+	return append([]Read{&r.seg, &r.last}, r.obj.reads()...)
+}
+
 // insertActiveBlock appends b to its namespace's active segment. The block
 // must continue the segment's last block. The first block of a segment is
 // checked by the seq key (direct mode) or the hot batch coverage (fold),
 // together with CheckInvariants.
-func insertActiveBlock(ctx context.Context, tx Tx, rev uint64, b Block, out *BlockCommit) error {
-	seg, found, err := tx.ActiveSegment(ctx, b.Namespace)
-	if err != nil {
-		return err
-	}
-	if !found {
+func insertActiveBlock(ctx context.Context, tx Tx, rev uint64, b Block, r *blockReads, out *BlockCommit) error {
+	if !r.seg.Found {
 		return Corruptf(SourceInvariant, "namespace %s has no active segment", b.Namespace)
 	}
+	seg := r.seg.Row
 	ordinal := 0
-	last, found, err := tx.LastActiveBlock(ctx, b.Namespace, seg.Index)
-	if err != nil {
-		return err
-	}
-	if found {
+	if r.last.Found {
+		last := r.last.Row
+		if last.Segment != seg.Index {
+			return Corruptf(SourceInvariant, "%s last active block is in segment %d; the active segment is %d",
+				b.Namespace, last.Segment, seg.Index)
+		}
 		if last.MaxSeq+1 != b.Info.MinSeq {
 			return Corruptf(SourceInvariant, "%s segment %d block %d ends at %d; new block starts at %d",
 				b.Namespace, seg.Index, last.Ordinal, last.MaxSeq, b.Info.MinSeq)
 		}
 		ordinal = last.Ordinal + 1
 	}
-	id, err := resolve(ctx, tx, b.Object)
+	ids, err := r.obj.resolve(ctx, tx)
 	if err != nil {
 		return err
 	}
+	id := ids[0]
 	row := ActiveBlockRow{
 		Namespace:          b.Namespace,
 		Segment:            seg.Index,
@@ -542,33 +626,30 @@ func (s *Session) Seal(ctx context.Context, sl Seal) (SealCommit, error) {
 	if !sl.Namespace.Valid() || sl.Footer.ID == 0 {
 		return SealCommit{}, s.fail(fmt.Errorf("catalog: seal %s segment %d: bad namespace or footer", sl.Namespace, sl.Segment))
 	}
+	// The footer first, then the blocks: ids[0] is the footer's.
+	refs := []ObjectRef{sl.Footer}
+	for _, b := range sl.Blocks {
+		refs = append(refs, ObjectRef{ID: b.ObjectID})
+	}
+	seg, objs := &ActiveSegmentRead{Namespace: sl.Namespace}, newObjectReads(refs...)
 	var out SealCommit
-	rev, err := s.run(ctx, TxSeal, func(tx Tx, rev uint64) error {
-		seg, found, err := tx.ActiveSegment(ctx, sl.Namespace)
-		if err != nil {
-			return err
-		}
-		if !found || seg.Index != sl.Segment {
+	rev, err := s.run(ctx, TxSeal, append([]Read{seg}, objs.reads()...), func(tx Tx, rev uint64) error {
+		if !seg.Found || seg.Row.Index != sl.Segment {
 			return Corruptf(SourceSeal, "%s segment %d is not the active segment", sl.Namespace, sl.Segment)
 		}
 		rows, err := tx.ActiveBlocksForUpdate(ctx, sl.Namespace, sl.Segment)
 		if err != nil {
 			return err
 		}
+		// The check makes the blocks' refs name exactly the rows' objects.
 		if err := checkSealList(sl, hdr, rows); err != nil {
 			return err
 		}
-		footerID, err := resolve(ctx, tx, sl.Footer)
+		ids, err := objs.resolve(ctx, tx)
 		if err != nil {
 			return err
 		}
-		ids := make([]uint64, len(rows))
-		for i, r := range rows {
-			ids[i] = r.ObjectID
-		}
-		if err := refCheck(ctx, tx, ids...); err != nil {
-			return err
-		}
+		footerID := ids[0]
 		gen, err := tx.InsertGeneration(ctx, GenerationRow{
 			Namespace:      sl.Namespace,
 			Segment:        sl.Segment,
@@ -691,8 +772,15 @@ func (s *Session) PublishGeneration(ctx context.Context, p Publish) (PublishComm
 			return PublishCommit{}, s.fail(fmt.Errorf("catalog: publish segment %d: bad block %d", p.Segment, i))
 		}
 	}
-	out := PublishCommit{ObjectIDs: make([]uint64, len(p.Blocks))}
-	rev, err := s.run(ctx, TxCompaction, func(tx Tx, rev uint64) error {
+	// The blocks in ordinal order, then the footer. A reused block is not
+	// pending, so resolving it is its reference check.
+	refs := make([]ObjectRef, 0, len(p.Blocks)+1)
+	for _, b := range p.Blocks {
+		refs = append(refs, b.Object)
+	}
+	objs := newObjectReads(append(refs, p.Footer)...)
+	var out PublishCommit
+	rev, err := s.run(ctx, TxCompaction, objs.reads(), func(tx Tx, rev uint64) error {
 		seg, found, err := tx.SegmentForUpdate(ctx, Main, p.Segment)
 		if err != nil {
 			return err
@@ -715,26 +803,12 @@ func (s *Session) PublishGeneration(ctx context.Context, p Publish) (PublishComm
 		if err := checkPublish(p, hdr, src, srcBlocks); err != nil {
 			return err
 		}
-		var reused []uint64
-		for i, b := range p.Blocks {
-			if b.Reused {
-				out.ObjectIDs[i] = b.Object.ID
-				reused = append(reused, b.Object.ID)
-				continue
-			}
-			if out.ObjectIDs[i], err = resolve(ctx, tx, b.Object); err != nil {
-				return err
-			}
-		}
-		if len(reused) > 0 {
-			if err := refCheck(ctx, tx, reused...); err != nil {
-				return err
-			}
-		}
-		footerID, err := resolve(ctx, tx, p.Footer)
+		ids, err := objs.resolve(ctx, tx)
 		if err != nil {
 			return err
 		}
+		out.ObjectIDs, ids = ids[:len(p.Blocks)], ids[len(p.Blocks):]
+		footerID := ids[0]
 		gen, err := tx.InsertGeneration(ctx, GenerationRow{
 			Namespace:      Main,
 			Segment:        p.Segment,
@@ -818,13 +892,11 @@ func (s *Session) CompareAndSetMeta(ctx context.Context, key string, prior, valu
 	if value == nil {
 		return 0, s.fail(fmt.Errorf("catalog: compare-and-set of %s to nil", key))
 	}
-	return s.run(ctx, TxMetadata, func(tx Tx, rev uint64) error {
-		got, found, err := tx.MetaGetForUpdate(ctx, []byte(key))
-		if err != nil {
-			return err
-		}
-		if found != (prior != nil) || !bytes.Equal(got, prior) {
-			return Corruptf(SourceCompaction, "%s is %x (found=%t); expected %x (found=%t)", key, got, found, prior, prior != nil)
+	stored := &MetaRead{Key: []byte(key)}
+	return s.run(ctx, TxMetadata, []Read{stored}, func(tx Tx, rev uint64) error {
+		if stored.Found != (prior != nil) || !bytes.Equal(stored.Value, prior) {
+			return Corruptf(SourceCompaction, "%s is %x (found=%t); expected %x (found=%t)",
+				key, stored.Value, stored.Found, prior, prior != nil)
 		}
 		return tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte(key), Value: value}})
 	})
@@ -833,7 +905,7 @@ func (s *Session) CompareAndSetMeta(ctx context.Context, key string, prior, valu
 // GCMark is one page of the §13 mark, in one fenced transaction.
 func (s *Session) GCMark(ctx context.Context, after uint64, limit int) (MarkPage, error) {
 	var page MarkPage
-	_, err := s.run(ctx, TxGC, func(tx Tx, rev uint64) error {
+	_, err := s.run(ctx, TxGC, nil, func(tx Tx, rev uint64) error {
 		var err error
 		page, err = tx.MarkUnreferenced(ctx, after, limit)
 		return err
@@ -849,7 +921,7 @@ func (s *Session) GCMark(ctx context.Context, after uint64, limit int) (MarkPage
 // referenced is corruption.
 func (s *Session) GCClaim(ctx context.Context, gcDelay, orphanAge time.Duration, limit int) ([]ObjectRow, error) {
 	var out []ObjectRow
-	_, err := s.run(ctx, TxGC, func(tx Tx, rev uint64) error {
+	_, err := s.run(ctx, TxGC, nil, func(tx Tx, rev uint64) error {
 		rows, err := tx.DeletingObjects(ctx, limit)
 		if err != nil || len(rows) > 0 {
 			out = rows
@@ -882,7 +954,7 @@ func (s *Session) GCClaim(ctx context.Context, gcDelay, orphanAge time.Duration,
 // rows of deleted objects that are still deleting, and returns how many.
 func (s *Session) GCForget(ctx context.Context, ids []uint64) (int, error) {
 	var n int
-	_, err := s.run(ctx, TxGC, func(tx Tx, rev uint64) error {
+	_, err := s.run(ctx, TxGC, nil, func(tx Tx, rev uint64) error {
 		var err error
 		n, err = tx.ForgetObjects(ctx, ids)
 		return err
@@ -896,12 +968,9 @@ func (s *Session) InitNamespace(ctx context.Context, ns Namespace, meta []metast
 	if !ns.Valid() {
 		return 0, s.fail(fmt.Errorf("catalog: unknown namespace %q", ns))
 	}
-	return s.run(ctx, TxNamespace, func(tx Tx, rev uint64) error {
-		_, found, err := tx.ActiveSegment(ctx, ns)
-		if err != nil {
-			return err
-		}
-		if !found {
+	active := &ActiveSegmentRead{Namespace: ns}
+	return s.run(ctx, TxNamespace, []Read{active}, func(tx Tx, rev uint64) error {
+		if !active.Found {
 			if err := tx.InsertSegment(ctx, SegmentRow{Namespace: ns, Index: 0, State: Active, Revision: rev}); err != nil {
 				return err
 			}
@@ -920,7 +989,7 @@ func (s *Session) DeleteNamespace(ctx context.Context, ns Namespace, meta []meta
 	if ns != BootstrapLive {
 		return 0, s.fail(fmt.Errorf("catalog: refusing to delete namespace %q", ns))
 	}
-	return s.run(ctx, TxNamespace, func(tx Tx, rev uint64) error {
+	return s.run(ctx, TxNamespace, nil, func(tx Tx, rev uint64) error {
 		if err := tx.DeleteNamespace(ctx, ns); err != nil {
 			return err
 		}
@@ -935,7 +1004,7 @@ func (s *Session) DeleteNamespace(ctx context.Context, ns Namespace, meta []meta
 // leader's metastore.Store commits (design §6.4: every metadata write is a
 // leader write transaction).
 func (s *Session) CommitMeta(ctx context.Context, ops []metastore.Op) (uint64, error) {
-	return s.run(ctx, TxMetadata, func(tx Tx, rev uint64) error {
+	return s.run(ctx, TxMetadata, nil, func(tx Tx, rev uint64) error {
 		return tx.ApplyMeta(ctx, ops)
 	})
 }
@@ -1034,18 +1103,33 @@ func (s *Session) leadUploads(ctx context.Context) {
 }
 
 func (s *Session) beginUploads(ctx context.Context, calls []*uploadCall) ([][]UploadSlot, time.Time, error) {
+	// One dedup lookup per distinct age, in the fence's round trip. The
+	// calls almost always share one.
+	lookups := map[time.Duration]*AvailableObjectsRead{}
+	var reads []Read
+	for _, c := range calls {
+		l := lookups[c.maxUnrefAge]
+		if l == nil {
+			l = &AvailableObjectsRead{MaxUnrefAge: c.maxUnrefAge}
+			lookups[c.maxUnrefAge] = l
+			reads = append(reads, l)
+		}
+		for _, r := range c.reqs {
+			l.SHA256 = append(l.SHA256, r.SHA256)
+		}
+	}
 	slots := make([][]UploadSlot, len(calls))
-	_, err := s.run(ctx, TxObjects, func(tx Tx, rev uint64) error {
+	var (
+		at  [][2]int
+		ids []uint64
+	)
+	_, err := s.run(ctx, TxObjects, reads, func(tx Tx, rev uint64) error {
 		var fresh []NewObject
-		var at [][2]int
 		for i, c := range calls {
 			slots[i] = make([]UploadSlot, len(c.reqs))
+			found := lookups[c.maxUnrefAge].Rows
 			for j, r := range c.reqs {
-				row, found, err := tx.FindAvailableObject(ctx, r.SHA256, c.maxUnrefAge)
-				if err != nil {
-					return err
-				}
-				if found {
+				if row, ok := found[r.SHA256]; ok {
 					slots[i][j] = UploadSlot{ObjectID: row.ID, Dedup: true}
 					continue
 				}
@@ -1056,20 +1140,19 @@ func (s *Session) beginUploads(ctx context.Context, calls []*uploadCall) ([][]Up
 		if len(fresh) == 0 {
 			return nil
 		}
-		ids, err := tx.InsertObjects(ctx, fresh)
-		if err != nil {
-			return err
-		}
-		if len(ids) != len(fresh) {
-			return fmt.Errorf("inserted %d object rows, want %d", len(ids), len(fresh))
-		}
-		for k, ij := range at {
-			slots[ij[0]][ij[1]] = UploadSlot{ObjectID: ids[k]}
-		}
-		return nil
+		// The IDs arrive with COMMIT's round trip.
+		ids = make([]uint64, len(fresh))
+		return tx.InsertObjects(ctx, fresh, ids)
 	})
 	if err != nil {
 		return nil, time.Time{}, err
+	}
+	for k, ij := range at {
+		if ids[k] == 0 {
+			// The rows committed, but as orphaned uploads GC collects.
+			return nil, time.Time{}, s.fail(sessionEnded(string(TxObjects), fmt.Errorf("object row %d of %d has no ID", k, len(ids))))
+		}
+		slots[ij[0]][ij[1]] = UploadSlot{ObjectID: ids[k]}
 	}
 	// The monotonic reading taken after commit is the start of the
 	// orphan-age window for the skip-PUT rule.
@@ -1080,11 +1163,16 @@ func (s *Session) beginUploads(ctx context.Context, calls []*uploadCall) ([][]Up
 // object ID callers must reference: ref.ID, or the row of another upload of
 // the same bytes that won first.
 func (s *Session) MarkAvailable(ctx context.Context, ref ObjectRef) (uint64, error) {
+	ref.Pending = true
+	objs := newObjectReads(ref)
 	var id uint64
-	_, err := s.run(ctx, TxObjects, func(tx Tx, rev uint64) error {
-		var err error
-		id, err = markAvailable(ctx, tx, ref.ID, ref.SHA256)
-		return err
+	_, err := s.run(ctx, TxObjects, objs.reads(), func(tx Tx, rev uint64) error {
+		ids, _, err := objs.markAvailable(ctx, tx)
+		if err != nil {
+			return err
+		}
+		id = ids[0]
+		return nil
 	})
 	return id, err
 }
