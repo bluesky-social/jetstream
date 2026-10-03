@@ -16,9 +16,11 @@
 // through a prefetched metaView rather than one key at a time.
 //
 // Whole-row read-modify-write paths preserve fields a future PR may
-// add to RepoStatus (e.g. RecordCount). They serialize through countsMu
-// with aggregate writes and deferred completion staging so a stale
-// callback cannot overwrite a just-committed completion row.
+// add to RepoStatus (e.g. RecordCount). They stage under countsMu with
+// aggregate writes and deferred completion staging, reading every write
+// staged ahead of them, so a stale callback cannot overwrite a
+// just-completed row. Commits run after the lock is released, in staging
+// order (commitPipe), so no writer waits out another's commit to stage.
 
 package backfill
 
@@ -27,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -47,10 +50,14 @@ type Store struct {
 	crashInjector      crashpoint.Injector
 	countsMu           chanMutex
 	rosterMu           chanMutex
+	pipe               commitPipe
 	group              groupCommitter
-	completions        *completionBatcher
-	runMu              sync.Mutex
-	discoveredThisRun  map[atmos.DID]struct{}
+	// hookOpen is set while a durable-batch hook's staged write awaits its
+	// commit (stageDurableBatch).
+	hookOpen          atomic.Bool
+	completions       *completionBatcher
+	runMu             sync.Mutex
+	discoveredThisRun map[atmos.DID]struct{}
 }
 
 // atmosStoreAdapter is the atmos backfill.Store view of Store. atmos's
@@ -90,8 +97,8 @@ func NewStore(db metastore.Store, metrics *Metrics) *Store {
 }
 
 // chanMutex is a mutex built on a channel. countsMu and rosterMu are held
-// across metadata commits, and in disaggregated mode a commit is a catalog
-// transaction. testing/synctest counts a goroutine waiting on a channel as
+// across metadata reads, and in disaggregated mode a read is a catalog
+// round trip. testing/synctest counts a goroutine waiting on a channel as
 // durably blocked but not one waiting on a sync.Mutex, so the layer 3
 // oracle's seeded scheduler, which admits the next catalog call only once
 // every goroutine is durably blocked, would wedge on a sync.Mutex here.
@@ -107,6 +114,67 @@ func (m chanMutex) Unlock() {
 	default:
 		panic("backfill: unlock of unlocked chanMutex")
 	}
+}
+
+// lockedView returns a view for a read-modify-write under countsMu: it
+// sees every write staged ahead of it, committed or not (commitPipe). Pass
+// the reader to commitPipe.stage.
+func (s *Store) lockedView() (*metaView, *pipeReader) {
+	r := &pipeReader{Store: s.db, p: &s.pipe}
+	return newMetaView(r), r
+}
+
+// writeLocked is the shape of every read-modify-write of the shared rows:
+// stage under countsMu (and rosterMu with roster) through a lockedView, then
+// commit after releasing the locks, in staging order. keys are prefetched
+// in one read. A commit error is wrapped with what.
+func (s *Store) writeLocked(
+	ctx context.Context,
+	roster bool,
+	what string,
+	keys [][]byte,
+	stage func(view *metaView, batch metastore.Batch) error,
+) error {
+	t, ops, err := s.stageLocked(ctx, roster, keys, stage)
+	if err != nil || t == nil {
+		return err
+	}
+	if err := t.commit(func() error { return applyOps(ctx, s.db, ops) }); err != nil {
+		return fmt.Errorf("backfill: %s: %w", what, err)
+	}
+	return nil
+}
+
+// stageLocked runs stage under the locks and stages its ops in the pipe. It
+// returns no ticket when stage wrote nothing.
+func (s *Store) stageLocked(
+	ctx context.Context,
+	roster bool,
+	keys [][]byte,
+	stage func(view *metaView, batch metastore.Batch) error,
+) (*pipeTicket, []metastore.Op, error) {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+	if roster {
+		s.rosterMu.Lock()
+		defer s.rosterMu.Unlock()
+	}
+	view, reader := s.lockedView()
+	if err := view.prefetch(ctx, keys); err != nil {
+		return nil, nil, err
+	}
+	local := metastore.NewOpBatch(nil)
+	if err := stage(view, view.batch(local)); err != nil {
+		return nil, nil, err
+	}
+	if local.Len() == 0 {
+		return nil, nil, nil
+	}
+	t, err := s.pipe.stage(reader, local.Ops())
+	if err != nil {
+		return nil, nil, err
+	}
+	return t, local.Ops(), nil
 }
 
 // errCountsNotSeeded means a counts-maintaining write ran before SeedCounts.
@@ -138,13 +206,8 @@ func (s *Store) SeedCounts(ctx context.Context) error {
 	return SaveCounts(s.db, counts)
 }
 
-// loadCountsLocked reads backfill/counts for an incremental update. The
-// caller holds countsMu.
-func (s *Store) loadCountsLocked() (Counts, error) {
-	return loadCountsFrom(s.db)
-}
-
-// loadCountsFrom is loadCountsLocked reading through db, normally a metaView.
+// loadCountsFrom reads backfill/counts for an incremental update through db,
+// normally a lockedView under countsMu.
 func loadCountsFrom(db metastore.Store) (Counts, error) {
 	counts, ok, err := LoadCounts(db)
 	if err != nil {
@@ -334,31 +397,23 @@ func (s *Store) updateRepoStatusesAndCounts(
 	dids []atmos.DID,
 	mutate func(*RepoStatus, bool, Status) (func(*HostStatus), error),
 ) error {
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
-
 	ctx := context.Background()
-	view := newMetaView(s.db)
 	keys := [][]byte{[]byte(countsKey)}
 	for _, did := range dids {
 		keys = append(keys, repoKey(did))
 	}
-	if err := view.prefetch(ctx, keys); err != nil {
-		return err
+	what := fmt.Sprintf("write %d repo rows and counts", len(dids))
+	if len(dids) == 1 {
+		what = fmt.Sprintf("write repo/%s and counts", dids[0])
 	}
-	batch := view.batch(s.db.NewBatch())
-	for _, did := range dids {
-		if err := s.stageRepoStatusUpdate(ctx, view, batch, did, mutate); err != nil {
-			return err
+	return s.writeLocked(ctx, false, what, keys, func(view *metaView, batch metastore.Batch) error {
+		for _, did := range dids {
+			if err := s.stageRepoStatusUpdate(ctx, view, batch, did, mutate); err != nil {
+				return err
+			}
 		}
-	}
-	if err := batch.Commit(ctx); err != nil {
-		if len(dids) == 1 {
-			return fmt.Errorf("backfill: write repo/%s and counts: %w", dids[0], err)
-		}
-		return fmt.Errorf("backfill: write %d repo rows and counts: %w", len(dids), err)
-	}
-	return nil
+		return nil
+	})
 }
 
 // stageRepoStatusUpdate stages one repo row's read-modify-write and the
@@ -481,33 +536,100 @@ func prefetchHostStatuses(ctx context.Context, view *metaView, hosts ...string) 
 }
 
 func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, completions []queuedCompletion, cursors []queuedHostCursor) (func(error), error) {
-	s.countsMu.Lock()
-	s.rosterMu.Lock()
-	locked := true
-	unlock := func(error) {
-		if locked {
-			locked = false
-			s.rosterMu.Unlock()
-			s.countsMu.Unlock()
-		}
-	}
-	fail := func(err error) (func(error), error) {
-		unlock(err)
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	if err := ctx.Err(); err != nil {
-		return fail(err)
-	}
 	if len(completions) == 0 && len(cursors) == 0 {
-		unlock(nil)
 		return nil, nil
 	}
+	// The staged write waits for every write staged ahead of it, so a second
+	// hook call before this one's commit would wait on itself. The segment
+	// writers call the hook once per commit; hot mode's multi-batch group
+	// commit would not, so refuse it rather than hang.
+	if !s.hookOpen.CompareAndSwap(false, true) {
+		return nil, errHookReentered
+	}
+	var t *pipeTicket
+	var ops []metastore.Op
+	for attempt := 1; ; attempt++ {
+		var err error
+		t, ops, err = s.stageCompletionsLocked(ctx, completions, cursors)
+		if err == nil {
+			if err = t.wait(); err != nil {
+				t.finish(err)
+			}
+		}
+		if err == nil {
+			break
+		}
+		// A write these rows build on failed, so they build on rows that
+		// never landed. Stage again from the store rather than fail the
+		// segment writer over another write's failure.
+		if _, ok := errors.AsType[*stagedOnFailureError](err); !ok || attempt == maxHookRestages {
+			s.hookOpen.Store(false)
+			return nil, err
+		}
+	}
+	for _, op := range ops {
+		switch op.Kind {
+		case metastore.OpSet:
+			batch.Set(op.Key, op.Value)
+		case metastore.OpDelete:
+			batch.Delete(op.Key)
+		}
+	}
+	return func(commitErr error) {
+		t.finish(commitErr)
+		s.hookOpen.Store(false)
+		if commitErr != nil {
+			return
+		}
+		for _, c := range completions {
+			if err := s.simulateCrash(ctx, crashpoint.AfterRepoComplete); err != nil {
+				if s.afterCompleteError != nil {
+					s.afterCompleteError(fmt.Errorf("backfill: after repo complete crashpoint %s: %w", c.did, err))
+				}
+				continue
+			}
+			if s.afterComplete != nil {
+				if err := s.afterComplete(ctx, c.did); err != nil {
+					err = fmt.Errorf("backfill: after complete hook %s: %w", c.did, err)
+					if s.afterCompleteError != nil {
+						s.afterCompleteError(err)
+					}
+				}
+			}
+		}
+	}, nil
+}
+
+// errHookReentered is a durable-batch hook call made before the previous
+// call's batch finished (stageDurableBatch).
+var errHookReentered = errors.New("backfill: internal error: durable batch hook called again before the previous batch finished; it supports one batch per commit")
+
+// maxHookRestages bounds how many times stageDurableBatch stages again
+// after writes staged ahead of it fail. Each retry needs another write's
+// commit to fail, so the bound only matters when the store fails every
+// commit, and then the segment writer's own commit fails too.
+const maxHookRestages = 8
+
+// stageCompletionsLocked stages queued completions and host cursors under
+// countsMu and rosterMu, reading through the pipe, and returns the staged
+// write's ticket.
+func (s *Store) stageCompletionsLocked(ctx context.Context, completions []queuedCompletion, cursors []queuedHostCursor) (*pipeTicket, []metastore.Op, error) {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+	s.rosterMu.Lock()
+	defer s.rosterMu.Unlock()
+	// Staged rows go to a plain batch, not the view's: as with the writer's
+	// batch they used to go to directly, later reads see the store and the
+	// caches below, not earlier staging.
+	local := metastore.NewOpBatch(nil)
 
 	// Read everything the staging below touches in two round trips — the
 	// rows named up front, then the host buckets those rows were attributed
 	// to — rather than one per completion while holding countsMu.
-	view := newMetaView(s.db)
+	view, reader := s.lockedView()
 	keys := [][]byte{[]byte(countsKey)}
 	for _, c := range completions {
 		keys = append(keys, repoKey(c.did))
@@ -516,13 +638,13 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		keys = append(keys, pdsHostKey(cursor.host))
 	}
 	if err := view.prefetch(context.Background(), keys); err != nil {
-		return fail(err)
+		return nil, nil, err
 	}
 	hosts := make([]string, 0, 2*len(completions))
 	for _, c := range completions {
 		rs, err := readRepoStatusFrom(view, c.did)
 		if err != nil {
-			return fail(err)
+			return nil, nil, err
 		}
 		if rs != nil {
 			hosts = append(hosts, rs.Host)
@@ -532,12 +654,12 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		}
 	}
 	if err := prefetchHostStatuses(context.Background(), view, hosts...); err != nil {
-		return fail(err)
+		return nil, nil, err
 	}
 
 	counts, err := loadCountsFrom(view)
 	if err != nil {
-		return fail(err)
+		return nil, nil, err
 	}
 
 	type stagedRepoStatus struct {
@@ -548,10 +670,10 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 	hostCache := make(map[string]*HostStatus)
 	for _, c := range completions {
 		if err := ctx.Err(); err != nil {
-			return fail(err)
+			return nil, nil, err
 		}
 		if c.commit == nil {
-			return fail(fmt.Errorf("backfill: stage complete %s: nil commit", c.did))
+			return nil, nil, fmt.Errorf("backfill: stage complete %s: nil commit", c.did)
 		}
 
 		cached, ok := repoCache[c.did]
@@ -561,7 +683,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 			var err error
 			rs, err = readRepoStatusFrom(view, c.did)
 			if err != nil {
-				return fail(err)
+				return nil, nil, err
 			}
 			hadRow = rs != nil
 			if rs == nil {
@@ -597,7 +719,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 				if oldHS == nil {
 					oldHS, _, err = loadHostStatus(view, oldHost)
 					if err != nil {
-						return fail(err)
+						return nil, nil, err
 					}
 					hostCache[oldHost] = oldHS
 				}
@@ -615,9 +737,9 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 
 		enc, err := encodeRepoStatus(rs)
 		if err != nil {
-			return fail(err)
+			return nil, nil, err
 		}
-		batch.Set(repoKey(c.did), enc)
+		local.Set(repoKey(c.did), enc)
 		repoCache[c.did] = stagedRepoStatus{status: rs, hadRow: true}
 		if rs.Host != "" {
 			hs := hostCache[rs.Host]
@@ -625,7 +747,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 				var err error
 				hs, _, err = loadHostStatus(view, rs.Host)
 				if err != nil {
-					return fail(err)
+					return nil, nil, err
 				}
 				hostCache[rs.Host] = hs
 			}
@@ -634,14 +756,14 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		}
 	}
 	for _, hs := range hostCache {
-		if err := stageHostStatus(batch, hs); err != nil {
-			return fail(err)
+		if err := stageHostStatus(local, hs); err != nil {
+			return nil, nil, err
 		}
 	}
 	for _, cursor := range cursors {
 		host, _, err := loadPDSHostFrom(view, cursor.host)
 		if err != nil {
-			return fail(err)
+			return nil, nil, err
 		}
 		oldState := atmosbackfill.HostState(host.State)
 		host.State = string(cursor.state)
@@ -676,37 +798,20 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		applyHostCountTransition(&counts, oldState, cursor.state)
 		enc, err := encodePDSHost(host)
 		if err != nil {
-			return fail(err)
+			return nil, nil, err
 		}
-		batch.Set(pdsHostKey(cursor.host), enc)
+		local.Set(pdsHostKey(cursor.host), enc)
 	}
 	countsEnc, err := encodeCounts(counts)
 	if err != nil {
-		return fail(err)
+		return nil, nil, err
 	}
-	batch.Set([]byte(countsKey), countsEnc)
-	return func(commitErr error) {
-		unlock(commitErr)
-		if commitErr != nil {
-			return
-		}
-		for _, c := range completions {
-			if err := s.simulateCrash(ctx, crashpoint.AfterRepoComplete); err != nil {
-				if s.afterCompleteError != nil {
-					s.afterCompleteError(fmt.Errorf("backfill: after repo complete crashpoint %s: %w", c.did, err))
-				}
-				continue
-			}
-			if s.afterComplete != nil {
-				if err := s.afterComplete(ctx, c.did); err != nil {
-					err = fmt.Errorf("backfill: after complete hook %s: %w", c.did, err)
-					if s.afterCompleteError != nil {
-						s.afterCompleteError(err)
-					}
-				}
-			}
-		}
-	}, nil
+	local.Set([]byte(countsKey), countsEnc)
+	t, err := s.pipe.stage(reader, local.Ops())
+	if err != nil {
+		return nil, nil, err
+	}
+	return t, local.Ops(), nil
 }
 
 func applyHostCountTransition(counts *Counts, old, next atmosbackfill.HostState) {
@@ -834,22 +939,11 @@ func readRepoStatusFrom(db metastore.Store, did atmos.DID) (*RepoStatus, error) 
 }
 
 func (s *Store) updateRepoHostActive(did atmos.DID, pds string, active bool) error {
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
-
 	ctx := context.Background()
-	view := newMetaView(s.db)
-	if err := view.prefetch(ctx, [][]byte{repoKey(did)}); err != nil {
-		return err
-	}
-	batch := view.batch(s.db.NewBatch())
-	if err := stageRepoHostActive(ctx, view, batch, did, pds, active); err != nil {
-		return err
-	}
-	if err := batch.Commit(ctx); err != nil {
-		return fmt.Errorf("backfill: write repo/%s and host active: %w", did, err)
-	}
-	return nil
+	return s.writeLocked(ctx, false, fmt.Sprintf("write repo/%s and host active", did), [][]byte{repoKey(did)},
+		func(view *metaView, batch metastore.Batch) error {
+			return stageRepoHostActive(ctx, view, batch, did, pds, active)
+		})
 }
 
 // stageRepoHostActive stages an Active flip (and, given a pds, a PDS
@@ -931,100 +1025,96 @@ func (s *Store) recordIdentityResolution(_ context.Context, did atmos.DID, resol
 		return fmt.Errorf("backfill: record identity resolution %s: %w", did, err)
 	}
 
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
-
-	rs, err := s.readRepoStatus(did)
-	if err != nil {
-		return err
-	}
-	hadRow := rs != nil
-	if rs == nil {
-		rs = &RepoStatus{
-			Backfill: RepoBackfillStatus{Status: StatusNotStarted},
-		}
-	}
-	oldStatus := rs.Backfill.Status
-	oldHost := rs.Host
-	if oldHost != "" {
-		oldHost, _, err = normalizeHostStatusKey(oldHost)
-		if err != nil {
-			return fmt.Errorf("backfill: record identity resolution %s: existing host %q: %w", did, rs.Host, err)
-		}
-	}
-	oldActive := rs.Active
-	oldHandle := rs.Handle
-
-	rs.Handle = resolution.Handle
-	rs.PDS = resolution.PDS
-	rs.Host = normalizedHost
-
-	enc, err := encodeRepoStatus(rs)
-	if err != nil {
-		return err
-	}
-
-	var countsEnc []byte
-	if !hadRow {
-		counts, err := s.loadCountsLocked()
-		if err != nil {
-			return err
-		}
-		applyCountTransition(&counts, false, "", rs.Backfill.Status)
-		countsEnc, err = encodeCounts(counts)
-		if err != nil {
-			return err
-		}
-	}
-
-	batch := s.db.NewBatch()
-	batch.Set(repoKey(did), enc)
-	if len(countsEnc) > 0 {
-		batch.Set([]byte(countsKey), countsEnc)
-	}
-	if handleIndexChanged(oldHandle, resolution.Handle) {
-		if err := stageHandleIndexDeleteIfMatches(s.db, batch, oldHandle, did); err != nil {
-			return err
-		}
-	}
-	if err := stageHandleIndexSet(batch, resolution.Handle, did); err != nil {
-		return err
-	}
-	if oldHost != normalizedHost {
-		if oldHost != "" {
-			oldHS, _, err := loadHostStatus(s.db, oldHost)
+	return s.writeLocked(context.Background(), false, fmt.Sprintf("write identity resolution %s", did), [][]byte{repoKey(did)},
+		func(view *metaView, batch metastore.Batch) error {
+			rs, err := readRepoStatusFrom(view, did)
 			if err != nil {
 				return err
 			}
-			if oldHS.Total > 0 {
-				oldHS.Total--
+			hadRow := rs != nil
+			if rs == nil {
+				rs = &RepoStatus{
+					Backfill: RepoBackfillStatus{Status: StatusNotStarted},
+				}
 			}
-			if oldActive && oldHS.Active > 0 {
-				oldHS.Active--
+			oldStatus := rs.Backfill.Status
+			oldHost := rs.Host
+			if oldHost != "" {
+				oldHost, _, err = normalizeHostStatusKey(oldHost)
+				if err != nil {
+					return fmt.Errorf("backfill: record identity resolution %s: existing host %q: %w", did, rs.Host, err)
+				}
 			}
-			decrementStatus(oldHS, oldStatus)
-			if err := stageHostStatus(batch, oldHS); err != nil {
+			oldActive := rs.Active
+			oldHandle := rs.Handle
+
+			rs.Handle = resolution.Handle
+			rs.PDS = resolution.PDS
+			rs.Host = normalizedHost
+
+			enc, err := encodeRepoStatus(rs)
+			if err != nil {
 				return err
 			}
-		}
 
-		newHS, _, err := loadHostStatus(s.db, normalizedHost)
-		if err != nil {
-			return err
-		}
-		newHS.Total++
-		if rs.Active {
-			newHS.Active++
-		}
-		incrementStatus(newHS, rs.Backfill.Status)
-		if err := stageHostStatus(batch, newHS); err != nil {
-			return err
-		}
-	}
-	if err := batch.Commit(context.Background()); err != nil {
-		return fmt.Errorf("backfill: write identity resolution %s: %w", did, err)
-	}
-	return nil
+			var countsEnc []byte
+			if !hadRow {
+				counts, err := loadCountsFrom(view)
+				if err != nil {
+					return err
+				}
+				applyCountTransition(&counts, false, "", rs.Backfill.Status)
+				countsEnc, err = encodeCounts(counts)
+				if err != nil {
+					return err
+				}
+			}
+
+			batch.Set(repoKey(did), enc)
+			if len(countsEnc) > 0 {
+				batch.Set([]byte(countsKey), countsEnc)
+			}
+			if handleIndexChanged(oldHandle, resolution.Handle) {
+				if err := stageHandleIndexDeleteIfMatches(view, batch, oldHandle, did); err != nil {
+					return err
+				}
+			}
+			if err := stageHandleIndexSet(batch, resolution.Handle, did); err != nil {
+				return err
+			}
+			if oldHost != normalizedHost {
+				if oldHost != "" {
+					oldHS, _, err := loadHostStatus(view, oldHost)
+					if err != nil {
+						return err
+					}
+					if oldHS.Total > 0 {
+						oldHS.Total--
+					}
+					if oldActive && oldHS.Active > 0 {
+						oldHS.Active--
+					}
+					decrementStatus(oldHS, oldStatus)
+					if err := stageHostStatus(batch, oldHS); err != nil {
+						return err
+					}
+				}
+
+				newHS, _, err := loadHostStatus(view, normalizedHost)
+				if err != nil {
+					return err
+				}
+				newHS.Total++
+				if rs.Active {
+					newHS.Active++
+				}
+				incrementStatus(newHS, rs.Backfill.Status)
+				if err := stageHostStatus(batch, newHS); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 }
 
 func handleIndexChanged(a, b string) bool {
@@ -1200,39 +1290,31 @@ func (s *Store) commitGrouped(w *groupWrite) error {
 	return s.group.commit(w, s.commitGroup)
 }
 
-// commitGroup runs one group's transaction under the aggregate locks every
-// member's apply expects: one prefetch for every member's keys, each apply in
-// queue order against a shared view, one commit.
+// commitGroup runs one group's transaction: under the aggregate locks every
+// member's apply expects, one prefetch for every member's keys and each apply
+// in queue order against a shared view; then, after the locks are released,
+// one commit (commitPipe).
 func (s *Store) commitGroup(group []*groupWrite) error {
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
-	s.rosterMu.Lock()
-	defer s.rosterMu.Unlock()
-
 	ctx := context.Background()
-	view := newMetaView(s.db)
 	var keys [][]byte
 	for _, w := range group {
 		keys = append(keys, w.keys...)
 	}
-	if err := view.prefetch(ctx, keys); err != nil {
-		return err
+	ops := 0
+	err := s.writeLocked(ctx, true, fmt.Sprintf("group commit of %d writes", len(group)), keys,
+		func(view *metaView, batch metastore.Batch) error {
+			for _, w := range group {
+				if err := w.apply(ctx, view, batch); err != nil {
+					return err
+				}
+			}
+			ops = batch.Len()
+			return nil
+		})
+	if err == nil && ops > 0 {
+		s.metrics.observeGroupCommit(len(group), ops)
 	}
-	batch := view.batch(s.db.NewBatch())
-	for _, w := range group {
-		if err := w.apply(ctx, view, batch); err != nil {
-			return err
-		}
-	}
-	ops := batch.Len()
-	if ops == 0 {
-		return nil
-	}
-	if err := batch.Commit(ctx); err != nil {
-		return fmt.Errorf("backfill: group commit of %d writes: %w", len(group), err)
-	}
-	s.metrics.observeGroupCommit(len(group), ops)
-	return nil
+	return err
 }
 
 // HostDiscoveryCursor reopens a drained/exhausted host at its last non-empty
@@ -1429,40 +1511,35 @@ func (s *Store) updateHostStateDirect(ctx context.Context, hostname string, muta
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
-	s.rosterMu.Lock()
-	defer s.rosterMu.Unlock()
+	keys := [][]byte{pdsHostKey(hostname), []byte(countsKey)}
+	return s.writeLocked(ctx, true, fmt.Sprintf("commit pdshost/%s state", hostname), keys,
+		func(view *metaView, batch metastore.Batch) error {
+			host, _, err := loadPDSHostFrom(view, hostname)
+			if err != nil {
+				return err
+			}
+			oldState := atmosbackfill.HostState(host.State)
+			nextState := mutate(host)
+			host.State = string(nextState)
+			host.UpdatedAt = timeNow()
 
-	host, _, err := s.loadPDSHost(hostname)
-	if err != nil {
-		return err
-	}
-	oldState := atmosbackfill.HostState(host.State)
-	nextState := mutate(host)
-	host.State = string(nextState)
-	host.UpdatedAt = timeNow()
-
-	counts, err := s.loadCountsLocked()
-	if err != nil {
-		return err
-	}
-	applyHostCountTransition(&counts, oldState, nextState)
-	hostEnc, err := encodePDSHost(host)
-	if err != nil {
-		return err
-	}
-	countsEnc, err := encodeCounts(counts)
-	if err != nil {
-		return err
-	}
-	batch := s.db.NewBatch()
-	batch.Set(pdsHostKey(hostname), hostEnc)
-	batch.Set([]byte(countsKey), countsEnc)
-	if err := batch.Commit(context.Background()); err != nil {
-		return fmt.Errorf("backfill: commit pdshost/%s state: %w", hostname, err)
-	}
-	return nil
+			counts, err := loadCountsFrom(view)
+			if err != nil {
+				return err
+			}
+			applyHostCountTransition(&counts, oldState, nextState)
+			hostEnc, err := encodePDSHost(host)
+			if err != nil {
+				return err
+			}
+			countsEnc, err := encodeCounts(counts)
+			if err != nil {
+				return err
+			}
+			batch.Set(pdsHostKey(hostname), hostEnc)
+			batch.Set([]byte(countsKey), countsEnc)
+			return nil
+		})
 }
 
 // OnComplete records a successful repo download. The commit's rev is
@@ -1700,33 +1777,31 @@ func (s *Store) DeferRetryAttempt(ctx context.Context, did atmos.DID, nextAttemp
 		return err
 	}
 
-	s.countsMu.Lock()
-	defer s.countsMu.Unlock()
+	return s.writeLocked(ctx, false, fmt.Sprintf("defer retry repo/%s", did), [][]byte{repoKey(did)},
+		func(view *metaView, batch metastore.Batch) error {
+			rs, err := readRepoStatusFrom(view, did)
+			if err != nil {
+				return err
+			}
+			if rs == nil {
+				return fmt.Errorf("backfill: defer retry %s: missing row", did)
+			}
+			if !isRetryFailureRecordableStatus(rs.Backfill.Status) {
+				return nil
+			}
+			next := nextAttemptAt.UTC()
+			if !rs.Backfill.NextAttemptAt.IsZero() && rs.Backfill.NextAttemptAt.After(next) {
+				return nil
+			}
+			rs.Backfill.NextAttemptAt = next
 
-	rs, err := s.readRepoStatus(did)
-	if err != nil {
-		return err
-	}
-	if rs == nil {
-		return fmt.Errorf("backfill: defer retry %s: missing row", did)
-	}
-	if !isRetryFailureRecordableStatus(rs.Backfill.Status) {
-		return nil
-	}
-	next := nextAttemptAt.UTC()
-	if !rs.Backfill.NextAttemptAt.IsZero() && rs.Backfill.NextAttemptAt.After(next) {
-		return nil
-	}
-	rs.Backfill.NextAttemptAt = next
-
-	enc, err := encodeRepoStatus(rs)
-	if err != nil {
-		return err
-	}
-	if err := s.db.Set(context.Background(), repoKey(did), enc); err != nil {
-		return fmt.Errorf("backfill: defer retry repo/%s: %w", did, err)
-	}
-	return nil
+			enc, err := encodeRepoStatus(rs)
+			if err != nil {
+				return err
+			}
+			batch.Set(repoKey(did), enc)
+			return nil
+		})
 }
 
 // timeNow is a package var so tests can pin wall-clock values.
