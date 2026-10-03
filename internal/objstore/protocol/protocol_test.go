@@ -208,12 +208,16 @@ type ageTx struct {
 	ages chan time.Duration
 }
 
-func (t ageTx) FindAvailableObject(ctx context.Context, sha [32]byte, maxUnrefAge time.Duration) (catalog.ObjectRow, bool, error) {
-	select {
-	case t.ages <- maxUnrefAge:
-	default:
+func (t ageTx) FenceBump(ctx context.Context, epoch uint64, reads ...catalog.Read) (uint64, bool, error) {
+	for _, r := range reads {
+		if r, ok := r.(*catalog.AvailableObjectsRead); ok {
+			select {
+			case t.ages <- r.MaxUnrefAge:
+			default:
+			}
+		}
 	}
-	return t.Tx.FindAvailableObject(ctx, sha, maxUnrefAge)
+	return t.Tx.FenceBump(ctx, epoch, reads...)
 }
 
 func TestDedupAgeIsHalfGCDelay(t *testing.T) {

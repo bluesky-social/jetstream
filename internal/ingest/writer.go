@@ -636,6 +636,17 @@ func (w *Writer) SetDurableBatchHook(h DurableBatchHook) {
 	w.cfg.OnDurableBatch = h
 }
 
+// PipelinesDurableBatches reports whether the writer may run the
+// DurableBatchHook for a batch while the batch before it commits. Direct mode
+// does, from another goroutine than the commit's, so the earlier batch
+// finishes without waiting for the later hook call: that call may block until
+// the earlier batch's afterDone runs. Other modes call the hook once per
+// commit, except hot mode's group commit, which calls it for every batch of
+// a transaction before committing any.
+func (w *Writer) PipelinesDurableBatches() bool {
+	return w.direct != nil
+}
+
 func (w *Writer) commitTerminalDurableBatchLocked() error {
 	return w.commitDurableBatchLocked(context.Background(), w.nextSeq, true, true, w.sampleDurableBatchPrepareValueLocked())
 }

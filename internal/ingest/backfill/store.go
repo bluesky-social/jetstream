@@ -52,9 +52,12 @@ type Store struct {
 	rosterMu           chanMutex
 	pipe               commitPipe
 	group              groupCommitter
-	// hookOpen is set while a durable-batch hook's staged write awaits its
-	// commit (stageDurableBatch).
-	hookOpen          atomic.Bool
+	// hookOpen counts durable-batch hook calls whose staged write awaits
+	// its commit (stageDurableBatch).
+	hookOpen atomic.Int32
+	// hookAhead is set when the segment writer stages a durable batch
+	// while the batch before it commits (ingest.Writer.PipelinesDurableBatches).
+	hookAhead         bool
 	completions       *completionBatcher
 	runMu             sync.Mutex
 	discoveredThisRun map[atmos.DID]struct{}
@@ -542,11 +545,18 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 	if len(completions) == 0 && len(cursors) == 0 {
 		return nil, nil
 	}
-	// The staged write waits for every write staged ahead of it, so a second
-	// hook call before this one's commit would wait on itself. The segment
-	// writers call the hook once per commit; hot mode's multi-batch group
-	// commit would not, so refuse it rather than hang.
-	if !s.hookOpen.CompareAndSwap(false, true) {
+	// The staged write waits for every write staged ahead of it, so the
+	// call must not come before an open batch can finish without it. A
+	// pipelined writer stages the next batch while the open one commits on
+	// another goroutine. The other segment writers call the hook once per
+	// commit; hot mode's multi-batch group commit would not, and its second
+	// call would wait on itself, so refuse it rather than hang.
+	maxOpen := int32(1)
+	if s.hookAhead {
+		maxOpen = 2
+	}
+	if s.hookOpen.Add(1) > maxOpen {
+		s.hookOpen.Add(-1)
 		return nil, errHookReentered
 	}
 	var t *pipeTicket
@@ -566,7 +576,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		// never landed. Stage again from the store rather than fail the
 		// segment writer over another write's failure.
 		if _, ok := errors.AsType[*stagedOnFailureError](err); !ok || attempt == maxHookRestages {
-			s.hookOpen.Store(false)
+			s.hookOpen.Add(-1)
 			return nil, err
 		}
 	}
@@ -579,8 +589,10 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 		}
 	}
 	return func(commitErr error) {
+		// Closed before the write finishes, so once the batch staged
+		// behind it may proceed, this one no longer counts against it.
+		s.hookOpen.Add(-1)
 		t.finish(commitErr)
-		s.hookOpen.Store(false)
 		if commitErr != nil {
 			return
 		}
@@ -605,7 +617,7 @@ func (s *Store) stageDurableBatch(ctx context.Context, batch metastore.Batch, co
 
 // errHookReentered is a durable-batch hook call made before the previous
 // call's batch finished (stageDurableBatch).
-var errHookReentered = errors.New("backfill: internal error: durable batch hook called again before the previous batch finished; it supports one batch per commit")
+var errHookReentered = errors.New("backfill: internal error: durable batch hook called again before an earlier batch finished; it supports one batch per commit, or one staged ahead for a pipelined writer")
 
 // maxHookRestages bounds how many times stageDurableBatch stages again
 // after writes staged ahead of it fail. Each retry needs another write's

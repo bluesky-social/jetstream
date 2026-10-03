@@ -13,14 +13,15 @@
 // machine (append, flush, fsync, seal) on top of a BlockBuilder;
 // header.go, footer.go, bloom.go, and collection.go are pure
 // encode/decode for footer sub-formats; seal.go computes the sealed
-// header and footer from a sequence of block frames (BuildSealed) and
-// writes them to the active file; rewrite.go computes a compacted
+// header and footer from a sequence of block frames (BuildSealed), or
+// from blocks indexed as they were written (IndexBlock, SealBuilder),
+// and writes them to the active file; rewrite.go computes a compacted
 // segment in memory and swaps it in atomically; reader.go ships a
 // goroutine-safe public Reader over a sealed file, any io.ReaderAt
 // holding its bytes, or its header and footer plus a per-block fetcher.
 //
-// The pure pieces (BlockBuilder, BuildSealed, and the byte-source
-// Reader constructors) use virtual file offsets: a sealed segment's
+// The pure pieces (BlockBuilder, BuildSealed, SealBuilder, and the
+// byte-source Reader constructors) use virtual file offsets: a sealed segment's
 // offsets are the positions its sections would have in a segment file,
 // whether or not that file ever exists.
 //

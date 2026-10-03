@@ -527,6 +527,107 @@ func TestScripts_MissingReference(t *testing.T) {
 	})
 }
 
+// The direct-mode block transaction reference-checks its object like the
+// others, and a failed check commits nothing.
+func TestScripts_DirectBlockMissingReference(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		_, info := block(t, 1, 2)
+		_, err := h.s.CommitBlock(t.Context(), catalog.Block{Namespace: catalog.Main, Info: info, Object: catalog.ObjectRef{ID: 1 << 40}})
+		requireCorruption(t, err, catalog.SourceRef)
+		_, found := h.meta(catalog.MainSeqKey)
+		require.False(t, found, "the seq key did not move")
+		snap, err := h.snapshot()
+		require.NoError(t, err)
+		require.Empty(t, snap.ActiveBlocks)
+	})
+}
+
+// One transaction resolving several pending uploads of the same bytes
+// resolves them in order, as separate transactions would: the first becomes
+// available and the rest reference it, so the unique index on available
+// bytes never trips. An upload of bytes already available references that
+// row.
+func TestScripts_SameBytesInOneCommit(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		// Two uploads of "old" race; the first to become available wins.
+		old, raced := h.object([]byte("old")), h.object([]byte("old"))
+		require.True(t, raced.Pending)
+		_, err := h.s.MarkAvailable(ctx, old)
+		require.NoError(t, err)
+		deduped := h.object([]byte("old"))
+		require.False(t, deduped.Pending, "the dedup lookup found the available row")
+		a, b := h.object([]byte("same")), h.object([]byte("same"))
+		require.True(t, a.Pending)
+		require.True(t, b.Pending)
+		cs, err := h.s.CommitHotBatches(ctx, []catalog.HotBatch{
+			{FirstSeq: 1, LastSeq: 1, Object: a},
+			{FirstSeq: 2, LastSeq: 2, Frame: []byte("inline")},
+			{FirstSeq: 3, LastSeq: 3, Object: b},
+			{FirstSeq: 4, LastSeq: 4, Object: raced},
+			{FirstSeq: 5, LastSeq: 5, Object: a},
+			{FirstSeq: 6, LastSeq: 6, Object: deduped},
+		})
+		require.NoError(t, err)
+		got := make([]uint64, len(cs))
+		for i, c := range cs {
+			got[i] = c.ObjectID
+		}
+		require.Equal(t, []uint64{a.ID, 0, a.ID, old.ID, a.ID, old.ID}, got)
+		require.Equal(t, map[catalog.ObjectState]int64{catalog.ObjectAvailable: 2, catalog.ObjectUploading: 2}, h.objectStates(),
+			"b's and the racer's rows stay uploading for GC")
+	})
+}
+
+// A pending upload GC claimed before the block commit that would have made
+// it available ends the session, and nothing commits.
+func TestScripts_DirectBlockUploadClaimed(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		frame, info := block(t, 1, 2)
+		ref := h.object(frame)
+		claimed, err := h.s.GCClaim(ctx, claimNow, claimNow, 100)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+		_, err = h.s.CommitBlock(ctx, catalog.Block{Namespace: catalog.Main, Info: info, Object: ref})
+		require.ErrorIs(t, err, catalog.ErrSessionEnded)
+		_, corrupt := catalog.IsCorruption(err)
+		require.False(t, corrupt, "§7.3's accepted leak: the next session uploads again")
+		require.Equal(t, map[catalog.ObjectState]int64{catalog.ObjectDeleting: 1}, h.objectStates())
+		_, found := h.meta(catalog.MainSeqKey)
+		require.False(t, found)
+	})
+}
+
+// Referencing an object clears its GC mark (§7.4), whichever script
+// references it.
+func TestScripts_ReferenceClearsMark(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		frame, info := block(t, 1, 2)
+		ref := h.object(frame)
+		_, err := h.s.MarkAvailable(ctx, ref)
+		require.NoError(t, err)
+		require.Equal(t, 1, h.gcMark(100))
+		again := h.object(frame)
+		require.False(t, again.Pending, "a fresh mark is within the dedup age")
+		_, err = h.s.CommitBlock(ctx, catalog.Block{Namespace: catalog.Main, Info: info, Object: again})
+		require.NoError(t, err)
+		_, err = h.s.GCClaim(ctx, claimNow, claimNow, 100)
+		require.NoError(t, err)
+		require.Equal(t, map[catalog.ObjectState]int64{catalog.ObjectAvailable: 1}, h.objectStates(),
+			"the block's reference cleared the mark, so the claim passed it over")
+	})
+}
+
 // An upload GC claimed while it stalled ends the session without claiming
 // corruption: the next session uploads again (§7.3's accepted leak).
 func TestScripts_UploadNoLongerUploading(t *testing.T) {

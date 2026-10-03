@@ -62,6 +62,7 @@ func fuzzSegmentFrames(t *testing.T, data []byte) (frames [][]byte, dids []strin
 
 // FuzzBuildSealed builds sealed metadata from fuzz-derived frames and
 // reads it back through the byte-source Readers: valid frames must seal,
+// to the same bytes when the blocks are indexed ahead (SealBuilder.Add),
 // every Reader must agree and pass VerifySealedMetadata, and a flipped
 // byte anywhere in the checksummed header or footer must be rejected.
 // Corrupt input of any kind must error, never panic.
@@ -74,6 +75,13 @@ func FuzzBuildSealed(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte, flipAt uint32, flip byte) {
 		frames, dids, raw := fuzzSegmentFrames(t, data)
 		header, footer, h, err := BuildSealed(SliceFrameSource(frames))
+		ixHeader, ixFooter, _, ixErr := indexedSeal(t, frames)
+		if (err == nil) != (ixErr == nil) {
+			t.Fatalf("BuildSealed err %v; indexed blocks err %v", err, ixErr)
+		}
+		if err == nil && (!bytes.Equal(header, ixHeader) || !bytes.Equal(footer, ixFooter)) {
+			t.Fatal("blocks indexed ahead sealed to different metadata than BuildSealed")
+		}
 		if err != nil {
 			if !raw {
 				t.Fatalf("BuildSealed rejected BlockBuilder frames: %v", err)

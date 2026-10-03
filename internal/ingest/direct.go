@@ -103,6 +103,11 @@ func (d *DirectConfig) applyDefaults() {
 // several at a time. One committer goroutine commits frozen blocks strictly
 // in seq order, one CommitBlock each carrying the DurableBatchHook's output,
 // then releases what waits on the block and applies the rotation rule.
+//
+// A stager goroutine feeds the committer the queue in order, running the
+// hook for each block and checkpoint first. It runs one item ahead, so a
+// block's hook overlaps the previous block's commit: the backfill hook reads
+// the catalog, and a commit is several WAN round trips.
 type directWriter struct {
 	cfg     *Config
 	direct  *DirectConfig
@@ -116,8 +121,11 @@ type directWriter struct {
 
 	uploads  chan struct{} // upload concurrency semaphore
 	encoders sync.WaitGroup
-	wake     chan struct{} // committer: queue grew
-	done     chan struct{} // committer exited
+	wake     chan struct{} // stager: queue grew
+	// staged hands items from the stager to the committer. It is
+	// unbuffered: one staged item waits while the committer works.
+	staged chan stagedItem
+	loops  sync.WaitGroup // the stager and the committer
 
 	mu        sync.Mutex
 	nextSeq   uint64
@@ -158,6 +166,32 @@ type directItem struct {
 	stop    bool
 }
 
+// stagedItem is a queue entry the stager hands the committer, with the
+// hook's output for a block or a checkpoint.
+type stagedItem struct {
+	directItem
+	batch *stagedBatch // nil when the hook did not run
+}
+
+// stagedBatch is one hook call's output. The committer ends each batch it
+// receives with done, whether or not the batch commits.
+type stagedBatch struct {
+	ops         *metastore.OpBatch
+	afterCommit func()
+	afterDone   func(error)
+	err         error // the hook's
+}
+
+// done runs afterDone once, with the outcome of the batch's commit.
+func (sb *stagedBatch) done(err error) {
+	if sb == nil || sb.afterDone == nil {
+		return
+	}
+	f := sb.afterDone
+	sb.afterDone = nil
+	f(err)
+}
+
 func openDirect(cfg Config) (*Writer, error) {
 	cfg.Namespace = cmp.Or(cfg.Namespace, catalog.Main)
 	cfg.SeqKey = catalog.SeqKey(cfg.Namespace)
@@ -187,13 +221,15 @@ func openDirect(cfg Config) (*Writer, error) {
 		cancel:    cancel,
 		uploads:   make(chan struct{}, dc.UploadConcurrency),
 		wake:      make(chan struct{}, 1),
-		done:      make(chan struct{}),
+		staged:    make(chan stagedItem),
 		nextSeq:   next,
 		witnessed: witnessedFloor{us: floor},
 		changed:   make(chan struct{}),
 	}
 	w.direct = d
 	cfg.Metrics.setNextSeq(next)
+	d.loops.Add(2)
+	go d.stageLoop()
 	go d.commitLoop()
 	w.cfg.Logger.Info("opened direct writer", "next_seq", next, "epoch", dc.Session.Epoch())
 	return w, nil
@@ -382,38 +418,99 @@ func (d *directWriter) prepare(b *directBlock) {
 	}
 }
 
-func (d *directWriter) commitLoop() {
-	defer close(d.done)
+// stageLoop hands the queue to the committer in order. It waits for each
+// block's upload and runs the hook for each block and checkpoint on the
+// way, while the committer commits the item before.
+func (d *directWriter) stageLoop() {
+	defer d.loops.Done()
+	// stopped is set once an item is bound to fail: nothing after it
+	// commits, so nothing after it runs the hook.
+	stopped := false
 	for {
 		it := d.dequeue()
+		s := stagedItem{directItem: it}
 		switch {
-		case it.stop:
-			return
-		case it.barrier != nil:
-			it.barrier <- d.failure()
-		case d.failure() != nil:
-			// Nothing after a failure commits: the next session starts at
-			// the committed seq key.
 		case it.block != nil:
-			if err := d.commitBlock(it.block); err != nil {
-				d.fail(err)
+			<-it.block.ready
+			if it.block.err != nil {
+				stopped = true
+			} else if !stopped && d.failure() == nil {
+				s.batch = d.stage(it.block.last()+1, false, it.block.prepareValue)
 			}
 		case it.meta != nil:
-			if err := d.commitMeta(it.meta); err != nil {
-				d.fail(err)
+			if !stopped && d.failure() == nil {
+				s.batch = d.stage(it.meta.nextSeq, true, it.meta.prepareValue)
 			}
-		case it.seal:
-			if err := d.direct.Sealer.Seal(d.ctx); err != nil {
+		}
+		if s.batch != nil && s.batch.err != nil {
+			stopped = true
+		}
+		d.staged <- s
+		if it.stop {
+			return
+		}
+	}
+}
+
+// stage runs the hook for one durable batch. It returns nil when there is
+// no hook.
+func (d *directWriter) stage(nextSeq uint64, force bool, prepareValue any) *stagedBatch {
+	hook := d.hook()
+	if hook == nil {
+		return nil
+	}
+	sb := &stagedBatch{ops: metastore.NewOpBatch(nil)}
+	_ = obs.Span(d.ctx, func(ctx context.Context) error {
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.String("namespace", string(d.cfg.Namespace)),
+			attribute.Int64("next_seq", int64(nextSeq)),
+			attribute.Bool("force", force))
+		sb.afterCommit, sb.afterDone, sb.err = hook(ctx, sb.ops, nextSeq, force, prepareValue)
+		return sb.err
+	})
+	return sb
+}
+
+func (d *directWriter) commitLoop() {
+	defer d.loops.Done()
+	for {
+		s := <-d.staged
+		switch {
+		case s.stop:
+			return
+		case s.barrier != nil:
+			s.barrier <- d.failure()
+		default:
+			if err := d.commit(s); err != nil {
 				d.fail(err)
 			}
 		}
-		if it.meta != nil {
+		if s.meta != nil {
 			d.mu.Lock()
 			d.checkpts--
 			d.signalLocked()
 			d.mu.Unlock()
 		}
 	}
+}
+
+// commit commits one block, checkpoint, or seal, unless the writer failed.
+func (d *directWriter) commit(s stagedItem) error {
+	if err := d.failure(); err != nil {
+		// Nothing after a failure commits: the next session starts at the
+		// committed seq key.
+		s.batch.done(err)
+		return nil
+	}
+	switch {
+	case s.block != nil:
+		return d.commitBlock(s.block, s.batch)
+	case s.meta != nil:
+		return d.commitMeta(s.batch)
+	case s.seal:
+		return d.direct.Sealer.Seal(d.ctx)
+	}
+	return nil
 }
 
 func (d *directWriter) dequeue() directItem {
@@ -442,61 +539,69 @@ func (d *directWriter) hook() DurableBatchHook {
 // durable watermark, then the rotation rule. The rule also runs before the
 // commit: an earlier session may have committed the block that crossed the
 // threshold and ended before its seal.
-func (d *directWriter) commitBlock(b *directBlock) error {
-	<-b.ready
+func (d *directWriter) commitBlock(b *directBlock, sb *stagedBatch) error {
 	if b.err != nil {
+		// The stager staged nothing for it.
 		return b.err
-	}
-	if err := d.crash(crashpoint.AfterDirectBlockUploadBeforeCommit); err != nil {
-		return err
 	}
 	return obs.Span(d.ctx, func(ctx context.Context) error {
 		trace.SpanFromContext(ctx).SetAttributes(
 			attribute.String("namespace", string(d.cfg.Namespace)),
 			attribute.Int64("first_seq", int64(b.first)),
 			attribute.Int("events", len(b.events)))
-		if err := d.direct.Sealer.RotateIfFull(ctx); err != nil {
+		res, err := d.commitStaged(ctx, b, sb)
+		if err != nil {
+			sb.done(err)
 			return err
 		}
-		ops := metastore.NewOpBatch(nil)
-		var afterCommit func()
-		// err is the commit's outcome, which is all afterDone reports: a
-		// failure after the commit landed fails the writer, not the batch.
-		var err error
-		if hook := d.hook(); hook != nil {
-			var afterDone func(error)
-			afterCommit, afterDone, err = hook(ctx, ops, b.last()+1, false, b.prepareValue)
-			if afterDone != nil {
-				defer func() { afterDone(err) }()
-			}
-			if err != nil {
-				return fmt.Errorf("ingest: on_durable_batch: %w", err)
-			}
-		}
-		var res catalog.BlockCommit
-		res, err = d.direct.Session.CommitBlock(ctx, catalog.Block{
-			Namespace: d.cfg.Namespace,
-			Info:      b.info,
-			Object:    b.ref,
-			Meta:      ops.Ops(),
-		})
-		if err != nil {
-			return fmt.Errorf("ingest: commit block [%d,%d]: %w", b.first, b.last(), err)
-		}
+		// afterDone reports only the commit's outcome: a failure after the
+		// commit landed fails the writer, not the batch.
+		defer sb.done(nil)
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("revision", int64(res.Revision)))
-		if cerr := d.crash(crashpoint.AfterDirectBlockCommitBeforeAck); cerr != nil {
-			return cerr
+		if err := d.crash(crashpoint.AfterDirectBlockCommitBeforeAck); err != nil {
+			return err
 		}
-		if cerr := d.direct.Sealer.Committed(res, b.ref, b.frame); cerr != nil {
-			return cerr
+		if err := d.direct.Sealer.Committed(res, b.ref, b.frame); err != nil {
+			return err
 		}
 		d.committed(b)
-		if afterCommit != nil {
-			afterCommit()
+		if sb != nil && sb.afterCommit != nil {
+			sb.afterCommit()
 		}
+		// Done before the rotation rule: the next block's hook may be
+		// waiting on this batch (the backfill hook waits for the write
+		// staged ahead of its own), and a seal would hold it up.
+		sb.done(nil)
 		d.cfg.Metrics.incBlocksFlushed()
 		return d.direct.Sealer.RotateIfFull(ctx)
 	})
+}
+
+// commitStaged applies the rotation rule and commits b with sb's metadata.
+func (d *directWriter) commitStaged(ctx context.Context, b *directBlock, sb *stagedBatch) (catalog.BlockCommit, error) {
+	if err := d.crash(crashpoint.AfterDirectBlockUploadBeforeCommit); err != nil {
+		return catalog.BlockCommit{}, err
+	}
+	if err := d.direct.Sealer.RotateIfFull(ctx); err != nil {
+		return catalog.BlockCommit{}, err
+	}
+	var meta []metastore.Op
+	if sb != nil {
+		if sb.err != nil {
+			return catalog.BlockCommit{}, fmt.Errorf("ingest: on_durable_batch: %w", sb.err)
+		}
+		meta = sb.ops.Ops()
+	}
+	res, err := d.direct.Session.CommitBlock(ctx, catalog.Block{
+		Namespace: d.cfg.Namespace,
+		Info:      b.info,
+		Object:    b.ref,
+		Meta:      meta,
+	})
+	if err != nil {
+		return res, fmt.Errorf("ingest: commit block [%d,%d]: %w", b.first, b.last(), err)
+	}
+	return res, nil
 }
 
 // committed advances the durable watermark past b and releases its room
@@ -509,30 +614,26 @@ func (d *directWriter) committed(b *directBlock) {
 	d.signalLocked()
 }
 
-// commitMeta commits the hook's output with no events. There is nothing to
-// commit, and so no transaction, when the hook stages nothing.
-func (d *directWriter) commitMeta(m *hotMeta) error {
-	hook := d.hook()
-	if hook == nil {
+// commitMeta commits a checkpoint's hook output with no events. There is
+// nothing to commit, and so no transaction, when the hook stages nothing.
+func (d *directWriter) commitMeta(sb *stagedBatch) error {
+	if sb == nil {
 		return nil
 	}
-	ops := metastore.NewOpBatch(nil)
-	afterCommit, afterDone, err := hook(d.ctx, ops, m.nextSeq, true, m.prepareValue)
-	if err != nil {
-		return fmt.Errorf("ingest: on_durable_batch: %w", err)
+	if sb.err != nil {
+		sb.done(sb.err)
+		return fmt.Errorf("ingest: on_durable_batch: %w", sb.err)
 	}
-	if ops.Len() > 0 {
-		_, err = d.direct.Session.CommitMeta(d.ctx, ops.Ops())
+	if sb.ops.Len() > 0 {
+		if _, err := d.direct.Session.CommitMeta(d.ctx, sb.ops.Ops()); err != nil {
+			sb.done(err)
+			return fmt.Errorf("ingest: commit durable metadata: %w", err)
+		}
 	}
-	if afterDone != nil {
-		defer afterDone(err)
+	if sb.afterCommit != nil {
+		sb.afterCommit()
 	}
-	if err != nil {
-		return fmt.Errorf("ingest: commit durable metadata: %w", err)
-	}
-	if afterCommit != nil {
-		afterCommit()
-	}
+	sb.done(nil)
 	return nil
 }
 
@@ -695,7 +796,7 @@ func (d *directWriter) close() error {
 	d.enqueueLocked(directItem{stop: true})
 	d.mu.Unlock()
 
-	<-d.done
+	d.loops.Wait()
 	d.cancel()
 	d.encoders.Wait()
 	return d.failure()

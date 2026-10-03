@@ -16,10 +16,10 @@ tiers: disagg
 diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
 --- a/internal/catalog/scripts.go
 +++ b/internal/catalog/scripts.go
-@@ -383,7 +383,7 @@ func (s *Session) Fold(ctx context.Context, b Block) (BlockCommit, error) {
- 	}
+@@ -494,7 +494,7 @@
  	var out BlockCommit
- 	rev, err := s.run(ctx, TxFold, func(tx Tx, rev uint64) error {
+ 	br := newBlockReads(b)
+ 	rev, err := s.run(ctx, TxFold, br.reads(), func(tx Tx, rev uint64) error {
 -		spans, err := tx.DeleteHotBatches(ctx, b.Info.MinSeq, b.Info.MaxSeq)
 +		spans, err := tx.DeleteHotBatches(ctx, b.Info.MinSeq+1, b.Info.MaxSeq)
  		if err != nil {

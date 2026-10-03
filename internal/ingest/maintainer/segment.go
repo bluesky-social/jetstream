@@ -29,7 +29,8 @@ type SegmentConfig struct {
 	Namespace catalog.Namespace
 	// Uploader stores footers (design §7.3).
 	Uploader ingest.ObjectUploader
-	// Objects reads active blocks back for a seal: protocol.Reader.
+	// Objects reads back, for a seal, the active blocks an earlier session
+	// committed: protocol.Reader.
 	Objects objstore.Store
 	// Cache receives every committed block and footer. Nil disables it.
 	Cache *objcache.Cache
@@ -53,6 +54,13 @@ type SegmentConfig struct {
 // it for main in hot mode, and the direct writer for either namespace in
 // direct mode (§10.6), so both seal the same way.
 //
+// It indexes each block the session commits for the footer as the block
+// commits, off the owner's goroutine. A seal then decodes only the blocks
+// an earlier session committed, rather than all of a 256MiB segment while
+// every commit waits behind it. The indexes hold each block's distinct DIDs
+// until the seal, about 200MiB for a full segment of live traffic: no more
+// than a seal holds at once anyway, only for longer.
+//
 // A Segment is not safe for concurrent use. One goroutine owns it: the
 // maintainer's, or the direct writer's committer. Its methods do not end
 // the session on failure; the owner does.
@@ -62,6 +70,27 @@ type Segment struct {
 	index  uint64
 	blocks []catalog.SealBlock
 	framed int64
+	// indexes are the footer indexes of the blocks this session committed,
+	// the last len(indexes) of blocks.
+	indexes []*blockIndex
+}
+
+// blockIndex is one committed block's footer index, computed in the
+// background.
+type blockIndex struct {
+	done chan struct{}
+	// Set before done closes.
+	ix  *segment.BlockIndex
+	err error
+}
+
+func indexBlock(frame []byte) *blockIndex {
+	b := &blockIndex{done: make(chan struct{})}
+	go func() {
+		defer close(b.done)
+		b.ix, b.err = segment.IndexBlock(frame)
+	}()
+	return b
 }
 
 var _ ingest.SegmentSealer = (*Segment)(nil)
@@ -142,7 +171,8 @@ func (s *Segment) FramedBytes() int64 { return s.framed }
 // Committed implements ingest.SegmentSealer: it records a block the session
 // committed to the active segment, from ref's upload of frame. The commit
 // appended to whatever the catalog holds as active; a seal's block list is
-// built from memory, so the two must agree.
+// built from memory, so the two must agree. The Segment keeps frame, which
+// the caller must not modify.
 func (s *Segment) Committed(c catalog.BlockCommit, ref catalog.ObjectRef, frame []byte) error {
 	if c.Segment != s.index || c.Ordinal != len(s.blocks) {
 		return catalog.Corruptf(catalog.SourceInvariant, "%s block landed at segment %d ordinal %d; expected %d/%d",
@@ -150,6 +180,7 @@ func (s *Segment) Committed(c catalog.BlockCommit, ref catalog.ObjectRef, frame 
 	}
 	s.cfg.Cache.Add(ref.SHA256, frame)
 	s.blocks = append(s.blocks, catalog.SealBlock{ObjectID: c.ObjectID, CompressedLength: int64(len(frame))})
+	s.indexes = append(s.indexes, indexBlock(frame))
 	s.framed += 8 + int64(len(frame))
 	s.cfg.Metrics.setActiveBytes(s.framed)
 	return nil
@@ -174,13 +205,13 @@ func (s *Segment) Seal(ctx context.Context) error {
 	ns := s.cfg.Namespace
 	return obs.Span(ctx, func(ctx context.Context) error {
 		start := time.Now()
+		readBack := len(s.blocks) - len(s.indexes)
 		trace.SpanFromContext(ctx).SetAttributes(
 			attribute.String("namespace", string(ns)),
 			attribute.Int64("segment", int64(s.index)),
-			attribute.Int("blocks", len(s.blocks)))
-		src := newFrameSource(ctx, s.cfg.Objects, s.blocks, s.cfg.ReadConcurrency)
-		header, footer, h, err := segment.BuildSealed(src)
-		src.close()
+			attribute.Int("blocks", len(s.blocks)),
+			attribute.Int("read_back", readBack))
+		header, footer, h, err := s.build(ctx, readBack)
 		if err != nil {
 			return fmt.Errorf("maintainer: build seal of %s segment %d: %w", ns, s.index, err)
 		}
@@ -213,6 +244,7 @@ func (s *Segment) Seal(ctx context.Context) error {
 		s.cfg.Cache.Add(refs[0].SHA256, footer)
 		s.index++
 		s.blocks = nil
+		s.indexes = nil
 		s.framed = 0
 		s.cfg.Metrics.setActiveBytes(0)
 		s.cfg.Metrics.observeSeal(time.Since(start))
@@ -220,8 +252,42 @@ func (s *Segment) Seal(ctx context.Context) error {
 	})
 }
 
-// frameSource yields the active blocks' frames in order for BuildSealed,
-// keeping up to window reads in flight ahead of it.
+// build computes the sealed header and footer: from the first readBack
+// blocks, which an earlier session committed, read back from the object
+// store, then from the indexes of the blocks this session committed.
+func (s *Segment) build(ctx context.Context, readBack int) (header, footer []byte, h segment.Header, err error) {
+	b := segment.NewSealBuilder()
+	if readBack > 0 {
+		src := newFrameSource(ctx, s.cfg.Objects, s.blocks[:readBack], s.cfg.ReadConcurrency)
+		defer src.close()
+		for {
+			frame, err := src.NextFrame()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return nil, nil, segment.Header{}, err
+			}
+			if err := b.AddFrame(frame); err != nil {
+				return nil, nil, segment.Header{}, err
+			}
+		}
+	}
+	for i, bi := range s.indexes {
+		<-bi.done
+		if bi.err != nil {
+			n := readBack + i
+			return nil, nil, segment.Header{}, fmt.Errorf("maintainer: index block %d (object %d): %w", n, s.blocks[n].ObjectID, bi.err)
+		}
+		if err := b.Add(bi.ix); err != nil {
+			return nil, nil, segment.Header{}, err
+		}
+	}
+	return b.Finish()
+}
+
+// frameSource yields active blocks' frames in order for a seal, keeping up
+// to window reads in flight ahead of it.
 type frameSource struct {
 	ctx     context.Context
 	cancel  context.CancelFunc

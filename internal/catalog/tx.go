@@ -49,54 +49,61 @@ const (
 	TxGC         TxKind = "gc"
 )
 
-// Tx is one leader write transaction. Each method is one statement against
-// the design §8 schema. The primitives do no checking of their own beyond
-// what the schema's constraints enforce: every correctness check lives in
-// the scripts (scripts.go), so a backend cannot hide a bug in one.
+// Tx is one leader write transaction. Each method, and each Read, is one
+// statement against the design §8 schema. The primitives do no checking of
+// their own beyond what the schema's constraints enforce: every correctness
+// check lives in the scripts (scripts.go), so a backend cannot hide a bug in
+// one.
 //
 // A Tx is not safe for concurrent use. After any method returns an error the
 // only valid call is Rollback.
 //
-// A method that returns only an error and writes (ApplyMeta, InsertHotBatch,
-// InsertActiveBlock, InsertGenerationBlocks, InsertSegment, DeleteNamespace,
-// Notify) may be queued and sent with a later statement, to save a round
-// trip. Its failure is then reported by the first later call, at the latest
-// Commit, and the transaction aborts as it would have anyway. Scripts treat
-// every error alike, so none depends on which call reports it.
+// A method that returns only an error and writes (ApplyMeta, InsertObjects,
+// SetObjectsAvailable, ClearUnreferenced, InsertHotBatch, InsertActiveBlock,
+// InsertGenerationBlocks, InsertSegment, DeleteNamespace, Notify) may be
+// queued and sent with a later statement, to save a round trip. Its failure
+// is then reported by the first later call, at the latest Commit, and the
+// transaction aborts as it would have anyway. Scripts treat every error
+// alike, so none depends on which call reports it.
+//
+// Reads are batched the same way: FenceBump carries a script's reads in the
+// fence's round trip, and Read sends several in one. Over a WAN link the
+// archive row lock is held for as many round trips as a script makes after
+// its fence, so a script that knows its reads up front makes one.
 type Tx interface {
-	// FenceBump runs the §6.4 fence. ok=false means no row matched: the
-	// epoch is stale.
-	FenceBump(ctx context.Context, epoch uint64) (revision uint64, ok bool, err error)
+	// FenceBump runs the §6.4 fence, then reads, in one round trip. The
+	// reads run after the fence, so under its row lock: they see every
+	// transaction that committed before this one took the lock. ok=false
+	// means no row matched: the epoch is stale, the reads did not run and
+	// locked nothing, and the transaction is aborted, so Rollback is the
+	// only call left.
+	FenceBump(ctx context.Context, epoch uint64, reads ...Read) (revision uint64, ok bool, err error)
+	// Read runs reads in one round trip, after every queued statement. With
+	// no reads it does nothing.
+	Read(ctx context.Context, reads ...Read) error
 
-	// MetaGetForUpdate reads and row-locks one metadata_kv key.
-	MetaGetForUpdate(ctx context.Context, key []byte) (value []byte, found bool, err error)
 	// ApplyMeta applies ops in order, with metastore.Batch semantics.
 	ApplyMeta(ctx context.Context, ops []metastore.Op) error
 
-	// FindAvailableObject returns the available object with sha256 sha. A
-	// positive maxUnrefAge also requires unreferenced_at to be NULL or newer
-	// than now()-maxUnrefAge (§7.3 step 2).
-	FindAvailableObject(ctx context.Context, sha [32]byte, maxUnrefAge time.Duration) (ObjectRow, bool, error)
-	// InsertObjects inserts uploading rows and returns their object IDs in
-	// argument order.
-	InsertObjects(ctx context.Context, objs []NewObject) ([]uint64, error)
-	// SetObjectAvailable moves an uploading row to available. ok=false when
-	// no uploading row has that ID.
-	SetObjectAvailable(ctx context.Context, id uint64) (ok bool, err error)
-	// RefCheck runs the §7.4 statement for every ID and returns the ones
-	// that matched no available row. Duplicate IDs are allowed.
-	RefCheck(ctx context.Context, ids []uint64) (missing []uint64, err error)
+	// InsertObjects inserts uploading rows. ids, of len(objs), receives
+	// their object IDs in argument order when the statement's round trip
+	// returns: they are valid once a later call that is not queued (Read, a
+	// method that returns more than an error, or Commit) has returned nil.
+	InsertObjects(ctx context.Context, objs []NewObject, ids []uint64) error
+	// SetObjectsAvailable moves the uploading rows among ids to available
+	// (§7.3 step 6). A script reads each row, row-locked, before queuing
+	// this, so it knows what the statement will change.
+	SetObjectsAvailable(ctx context.Context, ids []uint64) error
+	// ClearUnreferenced is the §7.4 statement's write: it sets
+	// unreferenced_at NULL on the available rows among ids. A script reads
+	// each row, row-locked, to check it before queuing this.
+	ClearUnreferenced(ctx context.Context, ids []uint64) error
 
 	InsertHotBatch(ctx context.Context, row HotBatchRow) error
 	// DeleteHotBatches deletes the hot batches with first_seq in [lo, hi]
 	// and returns them in first_seq order.
 	DeleteHotBatches(ctx context.Context, lo, hi uint64) ([]HotBatchSpan, error)
 
-	// ActiveSegment returns ns's active segment row, row-locked.
-	ActiveSegment(ctx context.Context, ns Namespace) (SegmentRow, bool, error)
-	// LastActiveBlock returns the highest-ordinal active block of a
-	// segment.
-	LastActiveBlock(ctx context.Context, ns Namespace, idx uint64) (ActiveBlockRow, bool, error)
 	// ActiveBlocksForUpdate returns a segment's active blocks in ordinal
 	// order, row-locked.
 	ActiveBlocksForUpdate(ctx context.Context, ns Namespace, idx uint64) ([]ActiveBlockRow, error)

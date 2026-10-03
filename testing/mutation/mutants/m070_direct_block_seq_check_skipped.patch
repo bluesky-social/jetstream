@@ -18,13 +18,13 @@ tiers: disagg
 diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
 --- a/internal/catalog/scripts.go
 +++ b/internal/catalog/scripts.go
-@@ -405,9 +405,6 @@ func (s *Session) CommitBlock(ctx context.Context, b Block) (BlockCommit, error)
- 	}
+@@ -470,9 +470,6 @@
  	var out BlockCommit
- 	rev, err := s.run(ctx, TxBlock, func(tx Tx, rev uint64) error {
--		if err := checkSeq(ctx, tx, b.Namespace, b.Info.MinSeq); err != nil {
+ 	seq, br := seqRead(b.Namespace), newBlockReads(b)
+ 	rev, err := s.run(ctx, TxBlock, append([]Read{seq}, br.reads()...), func(tx Tx, rev uint64) error {
+-		if err := checkSeq(seq, b.Info.MinSeq); err != nil {
 -			return err
 -		}
- 		if err := insertActiveBlock(ctx, tx, rev, b, &out); err != nil {
+ 		if err := insertActiveBlock(ctx, tx, rev, b, br, &out); err != nil {
  			return err
  		}

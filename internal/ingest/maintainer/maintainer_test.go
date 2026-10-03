@@ -288,13 +288,10 @@ func TestMaintainer_SealMatchesLocal(t *testing.T) {
 			}
 			require.Equal(t, len(evs), next)
 
-			// ForceRotate's fold and footer uploads each read back once. A
-			// cached seal reads no block from the blob store.
-			want := int64(2)
-			if !cached {
-				want += int64(len(gens[len(gens)-1].frames))
-			}
-			require.Equal(t, want, gets)
+			// ForceRotate's fold and footer uploads each read back once.
+			// The seal reads no block back, cached or not: each was
+			// indexed as it folded.
+			require.Equal(t, int64(2), gets)
 		})
 	}
 }

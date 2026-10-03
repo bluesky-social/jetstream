@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
+	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/maintainer"
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -127,8 +129,9 @@ func (st directState) events() []segment.Event {
 }
 
 // directHook checks the durable batch hook contract in direct mode: one call
-// per block, nextSeq grows, the prepare value is the freeze-time sample, and
-// afterCommit runs after the block's transaction and in order.
+// per block, nextSeq grows, the prepare value is the freeze-time sample,
+// afterCommit runs after the block's transaction and in order, afterDone runs
+// in order, and at most one batch is open when the next is staged.
 type directHook struct {
 	t       *testing.T
 	e       *env
@@ -141,6 +144,8 @@ type directHook struct {
 	forces        int
 	committed     int
 	lastCommitted uint64
+	open          int
+	lastDone      uint64
 	doneErrs      []error
 }
 
@@ -154,6 +159,8 @@ func (h *directHook) prepare() any { return h.lastApp.Load() }
 func (h *directHook) hook(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, pv any) (func(), func(error), error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	require.LessOrEqual(h.t, h.open, 1, "the writer stages one batch ahead of the commit")
+	h.open++
 	if force {
 		h.forces++
 		require.GreaterOrEqual(h.t, nextSeq, h.last)
@@ -177,8 +184,11 @@ func (h *directHook) hook(_ context.Context, b metastore.Batch, nextSeq uint64, 
 	}
 	done := func(err error) {
 		h.mu.Lock()
+		defer h.mu.Unlock()
+		require.GreaterOrEqual(h.t, nextSeq, h.lastDone, "afterDone runs in order")
+		h.lastDone = nextSeq
+		h.open--
 		h.doneErrs = append(h.doneErrs, err)
-		h.mu.Unlock()
 	}
 	return after, done, nil
 }
@@ -526,6 +536,246 @@ func TestDirect_CommitFailure(t *testing.T) {
 			require.Len(t, e.directState(catalog.Main).events(), int(want)-1+blockEvents)
 		})
 	}
+}
+
+// crashFunc is a crashpoint.Injector from a function.
+type crashFunc func(context.Context, crashpoint.Point) error
+
+func (f crashFunc) SimulateCrash(ctx context.Context, p crashpoint.Point) error { return f(ctx, p) }
+
+// hookLog is a durable batch hook that records its calls and callbacks in
+// order. fail, if set, fails the n-th call.
+type hookLog struct {
+	mu    sync.Mutex
+	log   []string
+	calls int
+	fail  map[int]error
+	// called receives each call's number.
+	called chan int
+}
+
+func newHookLog() *hookLog { return &hookLog{called: make(chan int, 64)} }
+
+func (h *hookLog) note(format string, args ...any) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.log = append(h.log, fmt.Sprintf(format, args...))
+}
+
+func (h *hookLog) entries() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.log...)
+}
+
+func (h *hookLog) hook(_ context.Context, b metastore.Batch, nextSeq uint64, force bool, _ any) (func(), func(error), error) {
+	h.mu.Lock()
+	h.calls++
+	n, err := h.calls, h.fail[h.calls]
+	h.log = append(h.log, fmt.Sprintf("hook %d", n))
+	h.mu.Unlock()
+	h.called <- n
+	if !force {
+		b.Set([]byte("test/hook"), catalog.EncodeSeq(nextSeq))
+	}
+	done := func(err error) { h.note("done %d: %v", n, err) }
+	if err != nil {
+		return nil, done, err
+	}
+	return func() { h.note("commit %d", n) }, done, nil
+}
+
+// waitCalled waits for the hook's n-th call, failing the test if it does not
+// come while the writer holds a commit for it.
+func (h *hookLog) waitCalled(t *testing.T, n int) {
+	for {
+		select {
+		case got := <-h.called:
+			if got >= n {
+				return
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("hook call %d did not run while the commit before it waited", n)
+			return
+		}
+	}
+}
+
+// holdCommits holds the i-th block's commit until holds[i] returns.
+func holdCommits(holds ...func()) crashpoint.Injector {
+	var mu sync.Mutex
+	n := 0
+	return crashFunc(func(_ context.Context, p crashpoint.Point) error {
+		if p != crashpoint.AfterDirectBlockUploadBeforeCommit {
+			return nil
+		}
+		mu.Lock()
+		i := n
+		n++
+		mu.Unlock()
+		if i < len(holds) {
+			holds[i]()
+		}
+		return nil
+	})
+}
+
+// The writer runs the next block's hook while the block before it commits:
+// the backfill hook reads the catalog, and so does a commit. Hooks,
+// commits, and callbacks still run in order.
+func TestDirect_HookOverlapsPreviousCommit(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	h := newHookLog()
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{OnDurableBatch: h.hook}, ingest.DirectConfig{
+		Crash: holdCommits(func() { h.waitCalled(t, 2) }),
+	})
+	evs := testEvents(rand.New(rand.NewPCG(21, 21)), 3*blockEvents)
+	require.NoError(t, w.AppendBatch(t.Context(), evs))
+	require.NoError(t, w.Flush(t.Context()))
+	require.Equal(t, []string{
+		"hook 1", "hook 2", "commit 1", "done 1: <nil>",
+		"commit 2", "done 2: <nil>", "commit 3", "done 3: <nil>",
+	}, slices.DeleteFunc(h.entries(), func(s string) bool { return s == "hook 3" }))
+	require.Equal(t, uint64(3*blockEvents+1), e.seqKey(catalog.Main))
+	require.NoError(t, w.Close())
+	require.Len(t, e.directState(catalog.Main).events(), 3*blockEvents)
+}
+
+// A failed commit fails the batch staged behind it, which never commits,
+// and nothing after it runs the hook.
+func TestDirect_FailedCommitFailsStagedBatch(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	fault := &storagefake.Fault{Kind: storagefake.FaultCommitFails, TxKind: catalog.TxBlock, Ordinal: 1}
+	e.db.InjectFaults(fault)
+	h := newHookLog()
+	var failures atomic.Int32
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{OnDurableBatch: h.hook}, ingest.DirectConfig{
+		Crash:     holdCommits(func() { h.waitCalled(t, 2) }),
+		OnFailure: func(error) { failures.Add(1) },
+	})
+	evs := testEvents(rand.New(rand.NewPCG(22, 22)), 3*blockEvents)
+	require.NoError(t, w.AppendBatch(t.Context(), evs))
+	require.Error(t, w.Flush(t.Context()))
+	require.Error(t, w.Close())
+	require.True(t, fault.Fired())
+	require.Equal(t, int32(1), failures.Load())
+	log := h.entries()
+	require.Len(t, log, 4, "%q", log)
+	require.Equal(t, []string{"hook 1", "hook 2"}, log[:2])
+	require.Contains(t, log[2], "done 1: ")
+	require.Contains(t, log[3], "done 2: ")
+	require.NotContains(t, log[2], "<nil>")
+	require.NotContains(t, log[3], "<nil>", "the staged batch failed with the writer")
+	require.Equal(t, uint64(1), e.seqKey(catalog.Main))
+	_, err := e.db.MetaStore(nil).Get(t.Context(), []byte("test/hook"))
+	require.ErrorIs(t, err, metastore.ErrNotFound)
+}
+
+// A hook that fails while the block before it commits leaves that block's
+// commit alone, then fails the writer. Nothing after it runs the hook, even
+// while the committer has yet to reach the failure.
+func TestDirect_HookFailureAfterOverlappedCommit(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	h := newHookLog()
+	boom := errors.New("hook failed")
+	h.fail = map[int]error{2: boom}
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{OnDurableBatch: h.hook}, ingest.DirectConfig{
+		Crash: holdCommits(func() { h.waitCalled(t, 2) }, func() { time.Sleep(50 * time.Millisecond) }),
+	})
+	evs := testEvents(rand.New(rand.NewPCG(23, 23)), 3*blockEvents)
+	require.NoError(t, w.AppendBatch(t.Context(), evs))
+	require.ErrorIs(t, w.Flush(t.Context()), boom)
+	require.ErrorIs(t, w.Close(), boom)
+	require.Equal(t, []string{
+		"hook 1", "hook 2", "commit 1", "done 1: <nil>", "done 2: ingest: on_durable_batch: hook failed",
+	}, h.entries(), "the block before commits; nothing after runs the hook")
+	require.Equal(t, uint64(blockEvents+1), e.seqKey(catalog.Main))
+}
+
+// A block whose upload failed is not staged, and fails the writer once the
+// block before it commits.
+func TestDirect_UploadFailureAfterOverlappedCommit(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	h := newHookLog()
+	boom := errors.New("upload failed")
+	held := make(chan struct{})
+	release := make(chan struct{})
+	uploadFailed := make(chan struct{})
+	var failUpload atomic.Bool
+	var once sync.Once
+	crash := crashFunc(func(_ context.Context, p crashpoint.Point) error {
+		switch p {
+		case crashpoint.AfterDirectBlockCutBeforeUpload:
+			if failUpload.Load() {
+				close(uploadFailed)
+				return boom
+			}
+		case crashpoint.AfterDirectBlockUploadBeforeCommit:
+			once.Do(func() {
+				close(held)
+				<-release
+			})
+		}
+		return nil
+	})
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{OnDurableBatch: h.hook}, ingest.DirectConfig{Crash: crash})
+	rng := rand.New(rand.NewPCG(24, 24))
+	require.NoError(t, w.AppendBatch(t.Context(), testEvents(rng, blockEvents)))
+	<-held
+	failUpload.Store(true)
+	require.NoError(t, w.AppendBatch(t.Context(), testEvents(rng, blockEvents)))
+	<-uploadFailed
+	close(release)
+	require.ErrorIs(t, w.Flush(t.Context()), boom)
+	require.ErrorIs(t, w.Close(), boom)
+	require.Equal(t, []string{"hook 1", "commit 1", "done 1: <nil>"}, h.entries())
+	require.Equal(t, uint64(blockEvents+1), e.seqKey(catalog.Main))
+}
+
+// A seal reads back only the blocks an earlier session committed: this
+// session's were indexed as they committed. Either way the generation is
+// byte-identical to a local seal of its events.
+func TestDirect_SealReadsBackOnlyEarlierSessionsBlocks(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	rng := rand.New(rand.NewPCG(31, 31))
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{}, ingest.DirectConfig{})
+	require.NoError(t, w.AppendBatch(t.Context(), testEvents(rng, 3*blockEvents)))
+	require.NoError(t, w.Close())
+
+	e.restart()
+	w = e.directWriter(catalog.Main, 1<<20, ingest.Config{}, ingest.DirectConfig{})
+	require.NoError(t, w.AppendBatch(t.Context(), testEvents(rng, 2*blockEvents)))
+	require.NoError(t, w.Flush(t.Context()))
+	before := e.gets.n.Load()
+	require.NoError(t, w.ForceRotate(t.Context()))
+	require.Equal(t, int64(3+1), e.gets.n.Load()-before, "the earlier session's 3 blocks, and the footer upload's read-back")
+	require.NoError(t, w.Close())
+
+	gens := e.generations(e.snapshot())
+	require.Len(t, gens, 1)
+	got := verify(t, gens[0])
+	require.Len(t, got, 5*blockEvents)
+	require.Equal(t, localSeal(t, got), gens[0].file())
+}
+
+// A seal fails on a committed block whose frame does not index, rather than
+// seal a footer that leaves it out.
+func TestSegment_SealFailsOnUnindexableBlock(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	seg, err := maintainer.OpenSegment(t.Context(), maintainer.SegmentConfig{Session: e.s, Uploader: e.up, Objects: e.reader})
+	require.NoError(t, err)
+	c := catalog.BlockCommit{Segment: seg.Index(), Ordinal: 0, ObjectID: 1}
+	require.NoError(t, seg.Committed(c, catalog.ObjectRef{ID: 1}, []byte("not a zstd frame")))
+	err = seg.Seal(t.Context())
+	require.ErrorContains(t, err, "index block 0 (object 1)")
+	require.Equal(t, 1, seg.Blocks(), "nothing sealed")
+	require.Empty(t, e.generations(e.snapshot()))
 }
 
 // A block's commit that lands after the segment reached the threshold, in a

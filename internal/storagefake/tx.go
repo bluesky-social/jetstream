@@ -35,6 +35,12 @@ type tx struct {
 	stmts   int
 	done    bool
 	aborted error
+
+	// queuing is set while a queued statement runs. results holds what
+	// queued statements return, delivered as pgstore delivers them: with
+	// the next statement that is not queued, or Commit.
+	queuing bool
+	results []func()
 }
 
 var _ catalog.Tx = (*tx)(nil)
@@ -63,6 +69,9 @@ func (t *tx) stmt(ctx context.Context, name string, write bool) error {
 		t.release()
 		return t.abort(fmt.Errorf("%s: %w", name, ErrConnLost))
 	}
+	if !t.queuing {
+		t.deliver()
+	}
 	if write && !t.locked {
 		if err := t.db.lockArchive(ctx); err != nil {
 			return t.abort(err)
@@ -73,15 +82,29 @@ func (t *tx) stmt(ctx context.Context, name string, write bool) error {
 	return nil
 }
 
-// queued reports a queued write's failure the way pgstore does: not from
-// the call, which pgstore sends nowhere, but from the next statement or
-// Commit (catalog.Tx). The transaction is already aborted, so either one
-// returns it.
-func (t *tx) queued(err error) error {
+// errFenced aborts a transaction whose fence matched nothing.
+var errFenced = errors.New("storagefake: the fence matched no row")
+
+// queue runs a queued statement. It reports the statement's failure the
+// way pgstore does: not from the call, which pgstore sends nowhere, but
+// from the next statement or Commit (catalog.Tx). The transaction is
+// already aborted, so either one returns it.
+func (t *tx) queue(stmt func() error) error {
+	t.queuing = true
+	err := stmt()
+	t.queuing = false
 	if err != nil {
 		_ = t.abort(err)
 	}
 	return nil
+}
+
+// deliver hands queued statements' results to the script.
+func (t *tx) deliver() {
+	for _, f := range t.results {
+		f()
+	}
+	t.results = nil
 }
 
 // abort puts the transaction in the aborted state. Locks stay held until
@@ -110,32 +133,101 @@ func (t *tx) view() *state {
 
 func (t *tx) now() time.Time { return t.db.now() }
 
-func (t *tx) FenceBump(ctx context.Context, epoch uint64) (uint64, bool, error) {
+func (t *tx) FenceBump(ctx context.Context, epoch uint64, reads ...catalog.Read) (uint64, bool, error) {
 	held := t.locked
 	if err := t.stmt(ctx, "fence", true); err != nil {
 		return 0, false, err
 	}
 	if t.s.archive.WriterEpoch != epoch {
-		// No row matched, so the UPDATE locked nothing.
+		// No row matched, so the UPDATE locked nothing, and pgstore's fence
+		// then fails the statement so that nothing pipelined after it runs.
 		if !held {
 			t.release()
 		}
+		_ = t.abort(errFenced)
 		return 0, false, nil
 	}
 	t.s.archive.CatalogRevision++
-	return t.s.archive.CatalogRevision, true, nil
+	rev := t.s.archive.CatalogRevision
+	if err := t.Read(ctx, reads...); err != nil {
+		return 0, false, err
+	}
+	return rev, true, nil
 }
 
-func (t *tx) MetaGetForUpdate(ctx context.Context, key []byte) ([]byte, bool, error) {
-	if err := t.stmt(ctx, "meta_get_for_update", true); err != nil {
-		return nil, false, err
+// Read runs each read as its own statement, which is what PostgreSQL does
+// with a pipeline: other transactions can run between them, and only locks
+// keep them out.
+func (t *tx) Read(ctx context.Context, reads ...catalog.Read) error {
+	for _, r := range reads {
+		if err := t.read(ctx, r); err != nil {
+			return err
+		}
 	}
-	v, ok := t.s.meta.get(string(key))
-	return cloneBytes(v), ok, nil
+	return nil
+}
+
+func (t *tx) read(ctx context.Context, r catalog.Read) error {
+	switch r := r.(type) {
+	case *catalog.MetaRead:
+		if err := t.stmt(ctx, "meta_get_for_update", true); err != nil {
+			return err
+		}
+		v, ok := t.s.meta.get(string(r.Key))
+		r.Value, r.Found = cloneBytes(v), ok
+	case *catalog.ActiveSegmentRead:
+		if err := t.stmt(ctx, "active_segment", true); err != nil {
+			return err
+		}
+		r.Row, r.Found = catalog.SegmentRow{}, false
+		if idx, ok := t.s.oneActive.get(string(r.Namespace)); ok {
+			r.Row, r.Found = t.s.segments.get(segKey(r.Namespace, idx))
+		}
+	case *catalog.LastActiveBlockRead:
+		if err := t.stmt(ctx, "last_active_block", false); err != nil {
+			return err
+		}
+		s := t.view()
+		r.Row, r.Found = catalog.ActiveBlockRow{}, false
+		if idx, ok := s.oneActive.get(string(r.Namespace)); ok {
+			if rows := blocksOf(s, r.Namespace, idx); len(rows) > 0 {
+				r.Row, r.Found = rows[len(rows)-1], true
+			}
+		}
+	case *catalog.AvailableObjectsRead:
+		if err := t.stmt(ctx, "available_objects", true); err != nil {
+			return err
+		}
+		r.Rows = map[[32]byte]catalog.ObjectRow{}
+		for _, sha := range r.SHA256 {
+			id, ok := t.s.objectsBySHA.get(string(sha[:]))
+			if !ok {
+				continue
+			}
+			row, _ := t.s.objects.get(id)
+			if r.MaxUnrefAge > 0 && !row.UnreferencedAt.IsZero() && !row.UnreferencedAt.After(t.now().Add(-r.MaxUnrefAge)) {
+				continue
+			}
+			r.Rows[sha] = row
+		}
+	case *catalog.ObjectsRead:
+		if err := t.stmt(ctx, "objects_for_update", true); err != nil {
+			return err
+		}
+		r.Rows = map[uint64]catalog.ObjectRow{}
+		for _, id := range r.IDs {
+			if row, ok := t.s.objects.get(id); ok {
+				r.Rows[id] = row
+			}
+		}
+	default:
+		return t.abort(fmt.Errorf("storagefake: unknown read %T", r))
+	}
+	return nil
 }
 
 func (t *tx) ApplyMeta(ctx context.Context, ops []metastore.Op) error {
-	return t.queued(t.applyMeta(ctx, ops))
+	return t.queue(func() error { return t.applyMeta(ctx, ops) })
 }
 
 func (t *tx) applyMeta(ctx context.Context, ops []metastore.Op) error {
@@ -170,31 +262,22 @@ func applyMeta(m *layer[string, []byte], ops []metastore.Op) {
 	}
 }
 
-func (t *tx) FindAvailableObject(ctx context.Context, sha [32]byte, maxUnrefAge time.Duration) (catalog.ObjectRow, bool, error) {
-	if err := t.stmt(ctx, "find_available_object", false); err != nil {
-		return catalog.ObjectRow{}, false, err
-	}
-	s := t.view()
-	id, ok := s.objectsBySHA.get(string(sha[:]))
-	if !ok {
-		return catalog.ObjectRow{}, false, nil
-	}
-	row, _ := s.objects.get(id)
-	if maxUnrefAge > 0 && !row.UnreferencedAt.IsZero() && !row.UnreferencedAt.After(t.now().Add(-maxUnrefAge)) {
-		return catalog.ObjectRow{}, false, nil
-	}
-	return row, true, nil
+func (t *tx) InsertObjects(ctx context.Context, objs []catalog.NewObject, ids []uint64) error {
+	return t.queue(func() error { return t.insertObjects(ctx, objs, ids) })
 }
 
-func (t *tx) InsertObjects(ctx context.Context, objs []catalog.NewObject) ([]uint64, error) {
+func (t *tx) insertObjects(ctx context.Context, objs []catalog.NewObject, ids []uint64) error {
 	if err := t.stmt(ctx, "insert_objects", true); err != nil {
-		return nil, err
+		return err
 	}
-	ids := make([]uint64, len(objs))
+	if len(ids) != len(objs) {
+		return t.abort(fmt.Errorf("storagefake: %d ids for %d objects", len(ids), len(objs)))
+	}
+	got := make([]uint64, len(objs))
 	now := t.now()
 	for i, o := range objs {
 		if o.Length <= 0 {
-			return nil, t.abort(violation("objects_byte_length_check", "byte_length %d", o.Length))
+			return t.abort(violation("objects_byte_length_check", "byte_length %d", o.Length))
 		}
 		// The sequence advances even if the statement fails, as nextval does.
 		t.db.mu.Lock()
@@ -202,53 +285,59 @@ func (t *tx) InsertObjects(ctx context.Context, objs []catalog.NewObject) ([]uin
 		t.db.nextObj++
 		t.db.mu.Unlock()
 		if _, dup := t.s.objectKeys.get(string(o.Key[:])); dup {
-			return nil, t.abort(violation("objects_key_key", "key %x exists", o.Key))
+			return t.abort(violation("objects_key_key", "key %x exists", o.Key))
 		}
 		t.s.objectKeys.set(string(o.Key[:]), id)
 		t.s.objects.set(id, catalog.ObjectRow{
 			ID: id, Key: o.Key, SHA256: o.SHA256, Length: o.Length,
 			State: catalog.ObjectUploading, CreatedAt: now,
 		})
-		ids[i] = id
+		got[i] = id
 	}
-	return ids, nil
+	t.results = append(t.results, func() { copy(ids, got) })
+	return nil
 }
 
-func (t *tx) SetObjectAvailable(ctx context.Context, id uint64) (bool, error) {
-	if err := t.stmt(ctx, "set_object_available", true); err != nil {
-		return false, err
-	}
-	row, ok := t.s.objects.get(id)
-	if !ok || row.State != catalog.ObjectUploading {
-		return false, nil
-	}
-	sha := string(row.SHA256[:])
-	if other, dup := t.s.objectsBySHA.get(sha); dup {
-		return false, t.abort(violation("objects_sha256_available", "object %d already has sha256 %x", other, row.SHA256))
-	}
-	row.State = catalog.ObjectAvailable
-	t.s.objects.set(id, row)
-	t.s.objectsBySHA.set(sha, id)
-	return true, nil
+func (t *tx) SetObjectsAvailable(ctx context.Context, ids []uint64) error {
+	return t.queue(func() error { return t.setObjectsAvailable(ctx, ids) })
 }
 
-func (t *tx) RefCheck(ctx context.Context, ids []uint64) ([]uint64, error) {
-	if err := t.stmt(ctx, "ref_check", true); err != nil {
-		return nil, err
+func (t *tx) setObjectsAvailable(ctx context.Context, ids []uint64) error {
+	if err := t.stmt(ctx, "set_objects_available", true); err != nil {
+		return err
 	}
-	var missing []uint64
 	for _, id := range ids {
 		row, ok := t.s.objects.get(id)
-		if !ok || row.State != catalog.ObjectAvailable {
-			missing = append(missing, id)
+		if !ok || row.State != catalog.ObjectUploading {
 			continue
 		}
-		if !row.UnreferencedAt.IsZero() {
+		sha := string(row.SHA256[:])
+		if other, dup := t.s.objectsBySHA.get(sha); dup {
+			return t.abort(violation("objects_sha256_available", "object %d already has sha256 %x", other, row.SHA256))
+		}
+		row.State = catalog.ObjectAvailable
+		t.s.objects.set(id, row)
+		t.s.objectsBySHA.set(sha, id)
+	}
+	return nil
+}
+
+func (t *tx) ClearUnreferenced(ctx context.Context, ids []uint64) error {
+	return t.queue(func() error { return t.clearUnreferenced(ctx, ids) })
+}
+
+func (t *tx) clearUnreferenced(ctx context.Context, ids []uint64) error {
+	if err := t.stmt(ctx, "clear_unreferenced", true); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		row, ok := t.s.objects.get(id)
+		if ok && row.State == catalog.ObjectAvailable && !row.UnreferencedAt.IsZero() {
 			row.UnreferencedAt = time.Time{}
 			t.s.objects.set(id, row)
 		}
 	}
-	return missing, nil
+	return nil
 }
 
 func (t *tx) objectFK(table string, id uint64) error {
@@ -259,7 +348,7 @@ func (t *tx) objectFK(table string, id uint64) error {
 }
 
 func (t *tx) InsertHotBatch(ctx context.Context, row catalog.HotBatchRow) error {
-	return t.queued(t.insertHotBatch(ctx, row))
+	return t.queue(func() error { return t.insertHotBatch(ctx, row) })
 }
 
 func (t *tx) insertHotBatch(ctx context.Context, row catalog.HotBatchRow) error {
@@ -310,18 +399,6 @@ func (t *tx) DeleteHotBatches(ctx context.Context, lo, hi uint64) ([]catalog.Hot
 	return out, nil
 }
 
-func (t *tx) ActiveSegment(ctx context.Context, ns catalog.Namespace) (catalog.SegmentRow, bool, error) {
-	if err := t.stmt(ctx, "active_segment", true); err != nil {
-		return catalog.SegmentRow{}, false, err
-	}
-	idx, ok := t.s.oneActive.get(string(ns))
-	if !ok {
-		return catalog.SegmentRow{}, false, nil
-	}
-	row, ok := t.s.segments.get(segKey(ns, idx))
-	return row, ok, nil
-}
-
 // blocksOf returns a segment's active blocks in ordinal order.
 func blocksOf(s *state, ns catalog.Namespace, idx uint64) []catalog.ActiveBlockRow {
 	prefix := blockPrefix(ns, idx)
@@ -336,17 +413,6 @@ func blocksOf(s *state, ns catalog.Namespace, idx uint64) []catalog.ActiveBlockR
 		out = append(out, row)
 	}
 	return out
-}
-
-func (t *tx) LastActiveBlock(ctx context.Context, ns catalog.Namespace, idx uint64) (catalog.ActiveBlockRow, bool, error) {
-	if err := t.stmt(ctx, "last_active_block", false); err != nil {
-		return catalog.ActiveBlockRow{}, false, err
-	}
-	rows := blocksOf(t.view(), ns, idx)
-	if len(rows) == 0 {
-		return catalog.ActiveBlockRow{}, false, nil
-	}
-	return rows[len(rows)-1], true, nil
 }
 
 func (t *tx) ActiveBlocksForUpdate(ctx context.Context, ns catalog.Namespace, idx uint64) ([]catalog.ActiveBlockRow, error) {
@@ -364,7 +430,7 @@ func (t *tx) segmentFK(table string, ns catalog.Namespace, idx uint64) error {
 }
 
 func (t *tx) InsertActiveBlock(ctx context.Context, row catalog.ActiveBlockRow) error {
-	return t.queued(t.insertActiveBlock(ctx, row))
+	return t.queue(func() error { return t.insertActiveBlock(ctx, row) })
 }
 
 func (t *tx) insertActiveBlock(ctx context.Context, row catalog.ActiveBlockRow) error {
@@ -433,7 +499,7 @@ func (t *tx) InsertGeneration(ctx context.Context, row catalog.GenerationRow) (u
 }
 
 func (t *tx) InsertGenerationBlocks(ctx context.Context, rows []catalog.GenerationBlockRow) error {
-	return t.queued(t.insertGenerationBlocks(ctx, rows))
+	return t.queue(func() error { return t.insertGenerationBlocks(ctx, rows) })
 }
 
 func (t *tx) insertGenerationBlocks(ctx context.Context, rows []catalog.GenerationBlockRow) error {
@@ -479,7 +545,7 @@ func (t *tx) SealSegment(ctx context.Context, ns catalog.Namespace, idx, gen, re
 }
 
 func (t *tx) InsertSegment(ctx context.Context, row catalog.SegmentRow) error {
-	return t.queued(t.insertSegment(ctx, row))
+	return t.queue(func() error { return t.insertSegment(ctx, row) })
 }
 
 func (t *tx) insertSegment(ctx context.Context, row catalog.SegmentRow) error {
@@ -512,7 +578,7 @@ func (t *tx) insertSegment(ctx context.Context, row catalog.SegmentRow) error {
 }
 
 func (t *tx) DeleteNamespace(ctx context.Context, ns catalog.Namespace) error {
-	return t.queued(t.deleteNamespace(ctx, ns))
+	return t.queue(func() error { return t.deleteNamespace(ctx, ns) })
 }
 
 func (t *tx) deleteNamespace(ctx context.Context, ns catalog.Namespace) error {
@@ -749,7 +815,7 @@ func (t *tx) ForgetObjects(ctx context.Context, ids []uint64) (int, error) {
 }
 
 func (t *tx) Notify(ctx context.Context, revision uint64) error {
-	return t.queued(t.notifyStmt(ctx, revision))
+	return t.queue(func() error { return t.notifyStmt(ctx, revision) })
 }
 
 func (t *tx) notifyStmt(ctx context.Context, revision uint64) error {
@@ -778,6 +844,7 @@ func (t *tx) Commit(ctx context.Context) error {
 		t.finish()
 		return fmt.Errorf("commit: %w", ErrConnLost)
 	}
+	t.deliver()
 	if !t.locked {
 		t.finish()
 		return nil

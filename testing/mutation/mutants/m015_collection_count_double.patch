@@ -3,8 +3,9 @@ target: segment/seal.go
 failure-mode: |
   The per-collection event count in the footer is incremented by 2 instead
   of 1, corrupting the collection index. Models a stray increment. (The
-  increment moved into the shared internCollection helper in #175; the count
-  is now guarded by countEvent so sentinel ids do not inflate it.)
+  increment moved into the shared internCollection helper in #175, then, for
+  the seal path, into IndexBlock's per-block count when seals began adding
+  blocks indexed as they committed; sentinel ids still do not count.)
 expected-detection: |
   KILLED@default: the oracle's sealed segment observer now re-derives footer
   collection counts from decoded rows and compares them with the persisted
@@ -14,15 +15,14 @@ expected-tier: default
 tiers: default,stress
 
 diff --git a/segment/seal.go b/segment/seal.go
-index de8c9c9..7326dd0 100644
 --- a/segment/seal.go
 +++ b/segment/seal.go
-@@ -256,7 +256,7 @@ func (res *blockWalkResult) internCollection(collection string, countEvent bool,
- 		res.collectionIDByName[col] = id
+@@ -419,7 +419,7 @@
+ 			ix.collections = append(ix.collections, blockCollection{name: name})
+ 		}
+ 		if real {
+-			ix.collections[i].events++
++			ix.collections[i].events += 2
+ 		}
  	}
- 	if countEvent {
--		res.collectionEventCounts[id]++
-+		res.collectionEventCounts[id] += 2
- 	}
- 	blockCollections[id] = struct{}{}
- 	return nil
+ 	for i := range events {

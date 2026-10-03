@@ -3,6 +3,7 @@ package backfill
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -20,6 +21,17 @@ type completionBatcher struct {
 	queued       []queuedCompletion
 	cursors      map[string]queuedHostCursor
 	nextCursorID uint64
+	// inflight are the staged batches that have not finished. A pipelined
+	// writer stages a batch while the one before it commits; what an
+	// unfinished batch carries is not staged again, since that batch
+	// commits first or the writer fails.
+	inflight []*inflightBatch
+}
+
+// inflightBatch is what one StageDurable call staged.
+type inflightBatch struct {
+	completions map[atmos.DID]queuedCompletion
+	cursors     map[uint64]struct{} // by queuedHostCursor.id
 }
 
 type queuedHostCursor struct {
@@ -163,6 +175,9 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch metastore.Ba
 	b.mu.Lock()
 	staged := make([]queuedCompletion, 0, len(b.queued))
 	for _, completion := range b.queued {
+		if b.inflightLocked(completion) {
+			continue
+		}
 		if !completion.watermark.appended || completion.watermark.lastSeq < nextSeq {
 			staged = append(staged, completion)
 			continue
@@ -188,10 +203,17 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch metastore.Ba
 	}
 	stagedCursors := make([]queuedHostCursor, 0, len(b.cursors))
 	for _, cursor := range b.cursors {
+		if b.cursorInflightLocked(cursor) {
+			continue
+		}
 		ready := true
 		for did, dep := range cursor.deps {
 			current, stillQueued := queuedCompletionForDID(b.queued, did)
 			if !stillQueued {
+				continue
+			}
+			// An unfinished batch commits its completions before this one.
+			if queuedCompletionEqual(dep, current) && b.inflightLocked(current) {
 				continue
 			}
 			stagedDep, included := stagedByDID[did]
@@ -210,13 +232,23 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch metastore.Ba
 			return nil, nil, fmt.Errorf("backfill: forced durable batch cannot stage host cursor %s: covered completions are not durable", cursor.host)
 		}
 	}
-	b.mu.Unlock()
-
 	if len(staged) == 0 && len(stagedCursors) == 0 {
+		b.mu.Unlock()
 		return nil, nil, nil
 	}
+	flight := &inflightBatch{
+		completions: stagedByDID,
+		cursors:     make(map[uint64]struct{}, len(stagedCursors)),
+	}
+	for _, cursor := range stagedCursors {
+		flight.cursors[cursor.id] = struct{}{}
+	}
+	b.inflight = append(b.inflight, flight)
+	b.mu.Unlock()
+
 	durableDone, err := b.store.stageDurableBatch(ctx, batch, staged, stagedCursors)
 	if err != nil {
+		b.land(flight)
 		b.metrics.incCompletionStageErrors()
 		return nil, nil, err
 	}
@@ -231,6 +263,7 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch metastore.Ba
 						delete(b.cursors, cursor.host)
 					}
 				}
+				b.landLocked(flight)
 				b.metrics.setCompletionQueueDepth(len(b.queued))
 				b.mu.Unlock()
 
@@ -242,10 +275,43 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch metastore.Ba
 				}
 			})
 		}, func(err error) {
+			// A failed batch's entries stay queued, to be staged again.
+			b.land(flight)
 			if durableDone != nil {
 				durableDone(err)
 			}
 		}, nil
+}
+
+// inflightLocked reports whether an unfinished batch carries c.
+func (b *completionBatcher) inflightLocked(c queuedCompletion) bool {
+	for _, f := range b.inflight {
+		if s, ok := f.completions[c.did]; ok && queuedCompletionEqual(s, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// cursorInflightLocked reports whether an unfinished batch carries c.
+func (b *completionBatcher) cursorInflightLocked(c queuedHostCursor) bool {
+	for _, f := range b.inflight {
+		if _, ok := f.cursors[c.id]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// land records that f finished. It may run more than once.
+func (b *completionBatcher) land(f *inflightBatch) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.landLocked(f)
+}
+
+func (b *completionBatcher) landLocked(f *inflightBatch) {
+	b.inflight = slices.DeleteFunc(b.inflight, func(g *inflightBatch) bool { return g == f })
 }
 
 func queuedCompletionForDID(queued []queuedCompletion, did atmos.DID) (queuedCompletion, bool) {
