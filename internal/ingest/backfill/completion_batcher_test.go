@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/metastore"
+	"github.com/bluesky-social/jetstream/internal/metastore/memstore"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -674,6 +676,157 @@ func TestCompletionBatcherOldAfterCommitDoesNotRemoveNewerQueuedCompletion(t *te
 	require.NoError(t, err)
 	require.NotNil(t, rs)
 	require.Equal(t, "rev-new", rs.Backfill.Rev)
+}
+
+// newPipelinedBatcher is a batcher over a store whose segment writer stages
+// a durable batch while the one before it commits.
+func newPipelinedBatcher(t *testing.T) (metastore.Store, *Store, *completionBatcher) {
+	t.Helper()
+	db := memstore.New()
+	bs := newSeededStore(t, db, nil)
+	bs.hookAhead = true
+	cb := NewCompletionBatcher(bs, nil)
+	bs.SetCompletionBatcher(cb)
+	return db, bs, cb
+}
+
+// A pipelined writer stages a host cursor behind the open batch that
+// carries the completion it covers: that batch commits first, or the writer
+// fails and neither commits.
+func TestCompletionBatcherPipelinedCursorFollowsOpenCompletion(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db, bs, cb := newPipelinedBatcher(t)
+	const hostname = "pds.pipelined-cursor.test"
+	require.NoError(t, bs.OnHost(ctx, atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
+	did := atmos.DID("did:plc:pipelined-cursor")
+	require.NoError(t, bs.onDiscover(ctx, hostname, testListReposEntry(did)))
+	cb.RecordWatermark(did, 10, true)
+	require.NoError(t, cb.QueueComplete(ctx, did, hostname, &repo.Commit{DID: string(did), Rev: "rev1"}))
+
+	first := stageOne(cb, db)
+	require.NoError(t, first.err)
+	require.NoError(t, cb.QueueHostCursor(ctx, hostname, "cursor-after-repo"))
+	ahead := stageAhead(cb, db)
+	requireStageBlocked(t, ahead)
+	require.NoError(t, first.finish(nil))
+	second := <-ahead
+	require.NoError(t, second.err)
+	require.ElementsMatch(t, []string{countsKey, string(pdsHostKey(hostname))}, second.keys(),
+		"the cursor alone: its completion commits in the batch before")
+	require.NoError(t, second.finish(nil))
+
+	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
+	host, _, err := bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Equal(t, "cursor-after-repo", host.ListReposCursor)
+	require.Empty(t, cb.queued)
+	require.Empty(t, cb.cursors)
+	require.Empty(t, cb.inflight)
+}
+
+// A host cursor in an open batch is not staged again behind it: a write to
+// the host's row between the two would be undone by the stale cursor.
+func TestCompletionBatcherPipelinedDoesNotRestageOpenCursor(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db, bs, cb := newPipelinedBatcher(t)
+	const hostname = "pds.pipelined-open-cursor.test"
+	require.NoError(t, bs.OnHost(ctx, atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
+	require.NoError(t, cb.QueueHostDrained(ctx, hostname, "last-page"))
+
+	first := stageOne(cb, db)
+	require.NoError(t, first.err)
+	require.Contains(t, first.keys(), string(pdsHostKey(hostname)))
+	var second pipelinedStage
+	select {
+	case second = <-stageAhead(cb, db):
+	case <-time.After(5 * time.Second):
+		t.Fatal("the batch behind waits on the open one: it staged the cursor again")
+	}
+	require.NoError(t, second.err)
+	require.Empty(t, second.keys(), "the open batch carries the cursor")
+	require.Nil(t, second.afterDone)
+	require.NoError(t, first.finish(nil))
+	host, _, err := bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Equal(t, string(atmosbackfill.HostStateDrained), host.State)
+	require.Empty(t, cb.cursors)
+	requireAggregatesMatchRows(t, db)
+}
+
+// When the open batch fails, the writer fails the batch staged behind it,
+// and what both carried stays queued for the next writer.
+func TestCompletionBatcherPipelinedFailureKeepsBothBatchesQueued(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db, bs, cb := newPipelinedBatcher(t)
+	const hostname = "pds.pipelined-failure.test"
+	require.NoError(t, bs.OnHost(ctx, atmosbackfill.HostInfo{Hostname: hostname, RelayStatus: "active"}))
+	did := atmos.DID("did:plc:pipelined-failure")
+	require.NoError(t, bs.onDiscover(ctx, hostname, testListReposEntry(did)))
+	cb.RecordWatermark(did, 10, true)
+	require.NoError(t, cb.QueueComplete(ctx, did, hostname, &repo.Commit{DID: string(did), Rev: "rev1"}))
+
+	first := stageOne(cb, db)
+	require.NoError(t, first.err)
+	require.NoError(t, cb.QueueHostCursor(ctx, hostname, "cursor-after-repo"))
+	ahead := stageAhead(cb, db)
+	requireStageBlocked(t, ahead)
+	failed := errors.New("block commit failed")
+	require.ErrorIs(t, first.finish(failed), failed)
+	second := <-ahead
+	require.NoError(t, second.err, "the hook staged again on the store")
+	require.ErrorIs(t, second.finish(failed), failed)
+	requireLookupState(t, bs, did, atmosbackfill.StateDiscovered)
+	require.Len(t, cb.queued, 1)
+	require.Contains(t, cb.cursors, hostname)
+	require.Empty(t, cb.inflight)
+
+	third := stageOne(cb, db)
+	require.NoError(t, third.err)
+	require.Contains(t, third.keys(), string(repoKey(did)))
+	require.Contains(t, third.keys(), string(pdsHostKey(hostname)))
+	require.NoError(t, third.finish(nil))
+	requireLookupState(t, bs, did, atmosbackfill.StateComplete)
+	host, _, err := bs.loadPDSHost(hostname)
+	require.NoError(t, err)
+	require.Equal(t, "cursor-after-repo", host.ListReposCursor)
+	requireAggregatesMatchRows(t, db)
+}
+
+// A completion queued again while its earlier one is in an open batch is a
+// new completion: the batch staged ahead carries it, on top of the open one.
+func TestCompletionBatcherPipelinedStagesNewerCompletionBehindOpenOne(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db, bs, cb := newPipelinedBatcher(t)
+	did := atmos.DID("did:plc:pipelined-requeued")
+	require.NoError(t, bs.OnDiscover(ctx, testListReposEntry(did)))
+	cb.RecordWatermark(did, 41, true)
+	require.NoError(t, cb.QueueComplete(ctx, did, "", &repo.Commit{DID: string(did), Rev: "rev-old"}))
+
+	first := stageOne(cb, db)
+	require.NoError(t, first.err)
+	cb.RecordWatermark(did, 42, true)
+	require.NoError(t, cb.QueueComplete(ctx, did, "", &repo.Commit{DID: string(did), Rev: "rev-new"}))
+	ahead := stageAhead(cb, db)
+	requireStageBlocked(t, ahead)
+	require.NoError(t, first.finish(nil))
+	second := <-ahead
+	require.NoError(t, second.err)
+	require.Contains(t, second.keys(), string(repoKey(did)))
+	require.NoError(t, second.finish(nil))
+
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, "rev-new", rs.Backfill.Rev)
+	require.Empty(t, cb.queued)
+	require.Empty(t, cb.inflight)
+	counts, _, err := LoadCounts(db)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), counts.Complete)
+	requireAggregatesMatchRows(t, db)
 }
 
 func testListReposEntry(did atmos.DID) atmossync.ListReposEntry {

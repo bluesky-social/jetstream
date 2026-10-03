@@ -452,6 +452,118 @@ func TestStore_HookRefusesReentry(t *testing.T) {
 	requireAggregatesMatchRows(t, db)
 }
 
+// pipelinedStage is one StageDurable call made as a pipelined segment
+// writer's stager makes it, with the batch it staged into.
+type pipelinedStage struct {
+	ops         *metastore.OpBatch
+	afterCommit func()
+	afterDone   func(error)
+	err         error
+}
+
+func stageOne(cb *completionBatcher, db metastore.Store) pipelinedStage {
+	s := pipelinedStage{ops: metastore.NewOpBatch(func(ctx context.Context, ops []metastore.Op) error {
+		return applyOps(ctx, db, ops)
+	})}
+	s.afterCommit, s.afterDone, s.err = cb.StageDurable(context.Background(), s.ops, 1<<40, false, nil)
+	return s
+}
+
+// stageAhead runs stageOne on its own goroutine, as the stager does while
+// the batch before it commits.
+func stageAhead(cb *completionBatcher, db metastore.Store) <-chan pipelinedStage {
+	ch := make(chan pipelinedStage, 1)
+	go func() { ch <- stageOne(cb, db) }()
+	return ch
+}
+
+// finish commits s, or fails it with fail, and runs its callbacks as the
+// segment writer does.
+func (s pipelinedStage) finish(fail error) error {
+	err := fail
+	if err == nil {
+		err = s.ops.Commit(context.Background())
+	}
+	if err == nil && s.afterCommit != nil {
+		s.afterCommit()
+	}
+	if s.afterDone != nil {
+		s.afterDone(err)
+	}
+	return err
+}
+
+func (s pipelinedStage) keys() []string {
+	var out []string
+	for _, op := range s.ops.Ops() {
+		out = append(out, string(op.Key))
+	}
+	return out
+}
+
+func requireStageBlocked(t *testing.T, ch <-chan pipelinedStage) {
+	t.Helper()
+	select {
+	case s := <-ch:
+		t.Fatalf("the batch staged ahead returned before the batch before it finished: %v", s.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// A pipelined segment writer stages the next durable batch while the one
+// before it commits. The hook stages on top of the open batch without
+// staging its completions again, waits for it, and refuses a third batch.
+func TestStore_PipelinedHookStagesOneAhead(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db := memstore.New()
+	st := newSeededStore(t, db, nil)
+	st.hookAhead = true
+	const host = "pds.example.test"
+	a, b, c := atmos.DID("did:plc:aheada"), atmos.DID("did:plc:aheadb"), atmos.DID("did:plc:aheadc")
+	require.NoError(t, st.AtmosStore().OnDiscover(ctx, host, discoverEntries(a, b, c)))
+	cb := NewCompletionBatcher(st, nil)
+	st.SetCompletionBatcher(cb)
+	complete := func(did atmos.DID, seq uint64) {
+		cb.RecordWatermark(did, seq, true)
+		require.NoError(t, cb.QueueComplete(ctx, did, host, &repo.Commit{DID: string(did), Rev: "rev"}))
+	}
+
+	complete(a, 3)
+	first := stageOne(cb, db)
+	require.NoError(t, first.err)
+	require.Contains(t, first.keys(), string(repoKey(a)))
+	complete(b, 4)
+	ahead := stageAhead(cb, db)
+	requireStaged(t, st, repoKey(b))
+	requireStageBlocked(t, ahead)
+
+	complete(c, 5)
+	select {
+	case third := <-stageAhead(cb, db):
+		require.ErrorIs(t, third.err, errHookReentered, "one batch staged ahead, not two")
+	case <-time.After(5 * time.Second):
+		t.Fatal("a third batch waited instead of being refused")
+	}
+
+	require.NoError(t, first.finish(nil))
+	second := <-ahead
+	require.NoError(t, second.err)
+	require.Contains(t, second.keys(), string(repoKey(b)))
+	require.NotContains(t, second.keys(), string(repoKey(a)), "the open batch's completion is not staged again")
+	require.NotContains(t, second.keys(), string(repoKey(c)), "the refused call staged nothing")
+	require.NoError(t, second.finish(nil))
+	require.NoError(t, commitHook(t, db, cb), "c stages once the batches finished")
+
+	requireAggregatesMatchRows(t, db)
+	counts, _, err := LoadCounts(db)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), counts.Complete)
+	require.Empty(t, cb.queued)
+	require.Empty(t, cb.inflight)
+	require.Zero(t, st.hookOpen.Load())
+}
+
 // randomFaults fails a seeded fraction of batch commits.
 type randomFaults struct {
 	mu  sync.Mutex
@@ -509,22 +621,35 @@ func (j *jitterStore) NewBatch() metastore.Batch {
 // its DIDs, as atmos's per-DID locks guarantee in production, but every write
 // shares the counts row and host aggregates. Once quiet, every aggregate must
 // match a recount of the rows: a lost update, or a write that committed on
-// rows that never landed, would leave one off.
+// rows that never landed, would leave one off. Every queued completion must
+// commit exactly once, whether the segment writer commits its durable
+// batches one at a time or stages each while the one before commits.
 func TestStore_CommitPipeSwarm(t *testing.T) {
 	t.Parallel()
-	for seed := range uint64(12) {
-		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
-			t.Parallel()
-			runCommitPipeSwarm(t, seed)
-		})
+	for _, pipelined := range []bool{false, true} {
+		for seed := range uint64(12) {
+			t.Run(fmt.Sprintf("pipelined=%t/seed=%d", pipelined, seed), func(t *testing.T) {
+				t.Parallel()
+				runCommitPipeSwarm(t, seed, pipelined)
+			})
+		}
 	}
 }
 
-func runCommitPipeSwarm(t *testing.T, seed uint64) {
+func runCommitPipeSwarm(t *testing.T, seed uint64, pipelined bool) {
 	ctx := t.Context()
 	faults := &randomFaults{rng: rand.New(rand.NewPCG(seed, 0xfa17)), p: 0.1}
 	db := &jitterStore{Store: metastore.WithFaults(memstore.New(), faults), rng: rand.New(rand.NewPCG(seed, 0x7177))}
 	st := newSeededStore(t, db, nil)
+	st.hookAhead = pipelined
+	var completedMu sync.Mutex
+	completed := map[atmos.DID]int{}
+	st.afterComplete = func(_ context.Context, did atmos.DID) error {
+		completedMu.Lock()
+		defer completedMu.Unlock()
+		completed[did]++
+		return nil
+	}
 	cb := NewCompletionBatcher(st, nil)
 	st.SetCompletionBatcher(cb)
 	adapter := st.AtmosStore()
@@ -617,37 +742,104 @@ func runCommitPipeSwarm(t *testing.T, seed uint64) {
 		})
 	}
 
-	// The segment writer: one hook call and commit at a time, failures
-	// included, until the workers stop.
+	// The segment writer, until the workers stop, failures included.
 	stop := make(chan struct{})
 	writerDone := make(chan struct{})
+	if pipelined {
+		go pipelinedSwarmWriter(t, db, cb, stop, writerDone)
+	} else {
+		go func() {
+			defer close(writerDone)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := commitHook(t, db, cb); err != nil && !errors.Is(err, errRandomFault) {
+					t.Errorf("hook commit: %v", err)
+					return
+				}
+				time.Sleep(50 * time.Microsecond)
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-writerDone
+
+	faults.off.Store(true)
+	for i := 0; cb.hasPendingDurability(); i++ {
+		require.Less(t, i, 100, "queued completions never stage")
+		require.NoError(t, commitHook(t, db, cb))
+	}
+	require.Empty(t, st.pipe.staged)
+	require.Nil(t, st.pipe.tail)
+	require.Empty(t, cb.inflight)
+	require.Zero(t, st.hookOpen.Load())
+	requireAggregatesMatchRows(t, db)
+	counts, _, err := LoadCounts(db)
+	require.NoError(t, err)
+	require.Equal(t, uint64(queued.Load()), counts.Complete, "every queued completion committed")
+	require.Len(t, completed, int(queued.Load()))
+	for did, n := range completed {
+		require.Equal(t, 1, n, "%s completed %d times", did, n)
+	}
+}
+
+// pipelinedSwarmWriter commits durable batches as direct mode does: a stager
+// runs the hook for the next batch while a committer commits the one before,
+// in order. A failed commit fails the batch staged behind it too, as it fails
+// the writer, and the next batch starts over as a new writer would.
+func pipelinedSwarmWriter(t *testing.T, db metastore.Store, cb *completionBatcher, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	type staged struct {
+		b           metastore.Batch
+		afterCommit func()
+		afterDone   func(error)
+		err         error
+	}
+	handoff := make(chan staged)
 	go func() {
-		defer close(writerDone)
+		defer close(handoff)
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			if err := commitHook(t, db, cb); err != nil && !errors.Is(err, errRandomFault) {
-				t.Errorf("hook commit: %v", err)
-				return
-			}
+			var s staged
+			s.b = db.NewBatch()
+			s.afterCommit, s.afterDone, s.err = cb.StageDurable(context.Background(), s.b, 1<<40, false, nil)
+			handoff <- s
 			time.Sleep(50 * time.Microsecond)
 		}
 	}()
-	wg.Wait()
-	close(stop)
-	<-writerDone
-
-	faults.off.Store(true)
-	for cb.hasPendingDurability() {
-		require.NoError(t, commitHook(t, db, cb))
+	failNext := false
+	for s := range handoff {
+		if s.err != nil {
+			// A hook that staged on a failed write fails the writer. Nothing
+			// was open behind it, so the next batch starts over.
+			if !errors.Is(s.err, errRandomFault) {
+				t.Errorf("hook: %v", s.err)
+			}
+			failNext = false
+			continue
+		}
+		err := errRandomFault
+		if !failNext {
+			err = s.b.Commit(context.Background())
+		}
+		if err == nil && s.afterCommit != nil {
+			s.afterCommit()
+		}
+		if s.afterDone != nil {
+			s.afterDone(err)
+		}
+		if err != nil && !errors.Is(err, errRandomFault) {
+			t.Errorf("hook commit: %v", err)
+		}
+		// The next batch was staged while this one was open.
+		failNext = err != nil && !failNext
 	}
-	require.Empty(t, st.pipe.staged)
-	require.Nil(t, st.pipe.tail)
-	requireAggregatesMatchRows(t, db)
-	counts, _, err := LoadCounts(db)
-	require.NoError(t, err)
-	require.Equal(t, uint64(queued.Load()), counts.Complete, "every queued completion committed")
 }

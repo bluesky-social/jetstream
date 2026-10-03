@@ -15,10 +15,10 @@ expected-tier: pdsbackfill
 tiers: pdsbackfill
 
 diff --git a/internal/ingest/backfill/completion_batcher.go b/internal/ingest/backfill/completion_batcher.go
-index c86bb1c..25cfe4d 100644
+index 7c7781b..fac6cab 100644
 --- a/internal/ingest/backfill/completion_batcher.go
 +++ b/internal/ingest/backfill/completion_batcher.go
-@@ -191,7 +191,7 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch metastore.Ba
+@@ -209,7 +209,7 @@ func (b *completionBatcher) StageDurable(ctx context.Context, batch metastore.Ba
  		ready := true
  		for did, dep := range cursor.deps {
  			current, stillQueued := queuedCompletionForDID(b.queued, did)
@@ -26,4 +26,4 @@ index c86bb1c..25cfe4d 100644
 +			if stillQueued {
  				continue
  			}
- 			stagedDep, included := stagedByDID[did]
+ 			// An unfinished batch commits its completions before this one.

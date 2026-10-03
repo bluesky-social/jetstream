@@ -955,6 +955,10 @@ As built (S3.1, `internal/ingest/direct.go`):
 - The writer does its own encode and upload, as the hot writer does, instead of
   reusing `AsyncFlushWorkers`. Frozen blocks encode and upload concurrently, up
   to `UploadConcurrency`. One committer goroutine commits them in seq order.
+  A stager goroutine ahead of it runs the DurableBatchHook for each block and
+  checkpoint in order, one item ahead, so a block's hook overlaps the previous
+  block's commit (`Writer.PipelinesDurableBatches`). The backfill hook reads
+  the catalog, which on pop2 was about 16% of the commit loop.
 - Admission: an append waits while `MaxPendingBlocks` blocks (default twice the
   upload concurrency) are frozen but not committed. It waits before it appends
   anything, so an `AppendBatch` still gets contiguous seqs.
