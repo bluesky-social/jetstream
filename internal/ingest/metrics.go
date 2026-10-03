@@ -45,6 +45,10 @@ type Metrics struct {
 	HotPendingBytes   *prometheus.GaugeVec
 	HotInlineTokens   prometheus.Gauge
 	AdmissionWait     *prometheus.HistogramVec
+	// Direct mode backpressure: appends waiting for room under
+	// MaxPendingBlocks or for a queued checkpoint (design §10.6).
+	DirectAppendWaiters prometheus.Gauge
+	DirectAppendWait    prometheus.Histogram
 }
 
 // NewMetrics registers the ingest counters/gauges against reg.
@@ -180,6 +184,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:      "Time a hot mode append (live) or bulk chunk waited on admission caps and permits, by class.",
 			Buckets:   []float64{0, .001, .005, .02, .1, .5, 2, 10, 60},
 		}, []string{"class"}),
+		DirectAppendWaiters: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "direct_append_waiters",
+			Help: "Direct mode appends waiting for room under MaxPendingBlocks or for a queued checkpoint, across every direct writer.",
+		}),
+		DirectAppendWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "direct_append_wait_seconds",
+			Help:    "Time a direct mode append waited for room under MaxPendingBlocks or for a queued checkpoint.",
+			Buckets: []float64{0, .001, .005, .02, .1, .5, 2, 10, 60},
+		}),
 	}
 	reg.MustRegister(
 		m.EventsAppended, m.BlocksFlushed, m.SegmentsRotated,
@@ -191,6 +206,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.SeqGapsRegistered, m.SeqGapValuesRegistered,
 		m.HotBatches, m.HotBatchEvents, m.HotCommitBatches,
 		m.HotUnfoldedEvents, m.HotPendingBytes, m.HotInlineTokens, m.AdmissionWait,
+		m.DirectAppendWaiters, m.DirectAppendWait,
 	)
 	return m
 }
@@ -355,5 +371,19 @@ func (m *Metrics) resetHot() {
 func (m *Metrics) observeAdmissionWait(c Class, d time.Duration) {
 	if m != nil {
 		m.AdmissionWait.WithLabelValues(c.String()).Observe(d.Seconds())
+	}
+}
+
+// addDirectAppendWaiters moves the waiter gauge by delta. Every direct
+// writer in the process shares it, so each adds and removes its own.
+func (m *Metrics) addDirectAppendWaiters(delta float64) {
+	if m != nil {
+		m.DirectAppendWaiters.Add(delta)
+	}
+}
+
+func (m *Metrics) observeDirectAppendWait(d time.Duration) {
+	if m != nil {
+		m.DirectAppendWait.Observe(d.Seconds())
 	}
 }

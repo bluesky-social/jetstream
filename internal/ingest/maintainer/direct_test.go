@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -478,6 +481,222 @@ func TestDirect_CancelledWaitKeepsWriter(t *testing.T) {
 	require.NoError(t, e.s.Err(), "the session survives")
 	require.Zero(t, failures.Load())
 	require.Len(t, e.directState(catalog.Main).events(), 2*blockEvents)
+}
+
+// Appends waiting for room under MaxPendingBlocks take it in the order
+// they began waiting, as each block before them commits, and the
+// backpressure metrics follow them.
+func TestDirect_WaitingAppendsTakeTurns(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, false)
+	rng := rand.New(rand.NewPCG(13, 13))
+	m := ingest.NewMetrics(prometheus.NewRegistry())
+	blockHeld := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var held atomic.Bool
+	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{
+		Metrics: m,
+		OnDurableBatch: func(context.Context, metastore.Batch, uint64, bool, any) (func(), func(error), error) {
+			if held.CompareAndSwap(false, true) {
+				close(blockHeld)
+				<-release
+			}
+			return nil, nil, nil
+		},
+	}, ingest.DirectConfig{UploadConcurrency: 1, MaxPendingBlocks: 1})
+
+	const waiters = 6
+	evs := testEvents(rng, (1+waiters)*blockEvents)
+	require.NoError(t, w.AppendBatch(t.Context(), evs[:blockEvents]))
+	<-blockHeld // the full block is pending, so every later append waits
+
+	done := make([]chan error, waiters)
+	for i := range waiters {
+		batch := evs[(1+i)*blockEvents : (2+i)*blockEvents]
+		done[i] = make(chan error, 1)
+		go func() { done[i] <- w.AppendBatch(t.Context(), batch) }()
+		require.Eventually(t, func() bool {
+			return testutil.ToFloat64(m.DirectAppendWaiters) == float64(i+1)
+		}, 5*time.Second, time.Millisecond, "append %d waits", i)
+	}
+	unblock()
+	for i := range waiters {
+		select {
+		case err := <-done[i]:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("append %d still waiting after 10s: a wakeup was lost", i)
+		}
+		require.Equal(t, uint64(1+(1+i)*blockEvents), evs[(1+i)*blockEvents].Seq, "append %d took its turn", i)
+	}
+	require.Zero(t, testutil.ToFloat64(m.DirectAppendWaiters))
+	var hist dto.Metric
+	require.NoError(t, m.DirectAppendWait.Write(&hist))
+	require.Equal(t, uint64(1+waiters), hist.GetHistogram().GetSampleCount(), "every append observes its wait")
+	require.NoError(t, w.Close())
+	require.Len(t, e.directState(catalog.Main).events(), (1+waiters)*blockEvents)
+}
+
+// Close and a writer failure release every waiting append at once, with
+// ErrClosed or the failure. Close does so while the commit the appends wait
+// behind is still held.
+func TestDirect_WaitingAppendsReleasedOnCloseAndFailure(t *testing.T) {
+	t.Parallel()
+	errHook := errors.New("hook failed")
+	for _, failing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "close", true: "failure"}[failing], func(t *testing.T) {
+			t.Parallel()
+			e := newEnv(t, false)
+			rng := rand.New(rand.NewPCG(17, 17))
+			m := ingest.NewMetrics(prometheus.NewRegistry())
+			blockHeld := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			defer unblock()
+			var held atomic.Bool
+			w := e.directWriter(catalog.Main, 1<<20, ingest.Config{
+				Metrics: m,
+				OnDurableBatch: func(context.Context, metastore.Batch, uint64, bool, any) (func(), func(error), error) {
+					if !held.CompareAndSwap(false, true) {
+						return nil, nil, nil
+					}
+					close(blockHeld)
+					<-release
+					if failing {
+						return nil, nil, errHook
+					}
+					return nil, nil, nil
+				},
+			}, ingest.DirectConfig{UploadConcurrency: 1, MaxPendingBlocks: 1, OnFailure: func(error) {}})
+
+			const waiters = 4
+			evs := testEvents(rng, (1+waiters)*blockEvents)
+			require.NoError(t, w.AppendBatch(t.Context(), evs[:blockEvents]))
+			<-blockHeld
+			done := make([]chan error, waiters)
+			for i := range waiters {
+				done[i] = make(chan error, 1)
+				go func() { done[i] <- w.AppendBatch(t.Context(), evs[(1+i)*blockEvents:(2+i)*blockEvents]) }()
+			}
+			require.Eventually(t, func() bool {
+				return testutil.ToFloat64(m.DirectAppendWaiters) == waiters
+			}, 5*time.Second, time.Millisecond)
+			closed := make(chan error, 1)
+			if failing {
+				unblock()
+			} else {
+				go func() { closed <- w.Close() }()
+			}
+			for i := range waiters {
+				select {
+				case err := <-done[i]:
+					if failing {
+						require.ErrorIs(t, err, errHook)
+					} else {
+						require.ErrorIs(t, err, ingest.ErrClosed)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatalf("append %d still waiting 5s after the writer ended", i)
+				}
+			}
+			require.Zero(t, testutil.ToFloat64(m.DirectAppendWaiters))
+			if !failing {
+				unblock()
+				require.NoError(t, <-closed)
+				require.Len(t, e.directState(catalog.Main).events(), blockEvents, "only the block before Close commits")
+			}
+		})
+	}
+}
+
+// Many appends contend for little room, some cancelled while they wait,
+// among flushes and checkpoints. None waits forever, and exactly the
+// appends that succeeded commit, gap-free.
+func TestDirect_WaitingAppendsSwarm(t *testing.T) {
+	t.Parallel()
+	seeds := 8
+	if !testing.Short() {
+		seeds = 64
+	}
+	for seed := range seeds {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			t.Parallel()
+			runWaitingAppendsSwarm(t, rand.New(rand.NewPCG(uint64(seed), 0x3a17)))
+		})
+	}
+}
+
+func runWaitingAppendsSwarm(t *testing.T, rng *rand.Rand) {
+	e := newEnv(t, false)
+	m := ingest.NewMetrics(prometheus.NewRegistry())
+	h := &directHook{t: t, e: e, ns: catalog.Main}
+	w := e.directWriter(catalog.Main, int64(2000+rng.IntN(8000)), ingest.Config{
+		MaxEventsPerBlock:        1 + rng.IntN(8),
+		Metrics:                  m,
+		OnAppend:                 h.onAppend,
+		OnDurableBatch:           h.hook,
+		DurableBatchPrepareValue: h.prepare,
+	}, ingest.DirectConfig{UploadConcurrency: 1 + rng.IntN(2), MaxPendingBlocks: 1 + rng.IntN(2)})
+
+	var mu sync.Mutex
+	var want []segment.Event
+	var wg sync.WaitGroup
+	for p := range 8 + rng.IntN(56) {
+		prng := rand.New(rand.NewPCG(rng.Uint64(), uint64(p)))
+		wg.Go(func() {
+			for range 1 + prng.IntN(6) {
+				switch prng.IntN(10) {
+				case 0:
+					assert.NoError(t, w.DrainDurability(t.Context()))
+				case 1:
+					assert.NoError(t, w.Flush(t.Context()))
+				default:
+					evs := testEvents(prng, 1+prng.IntN(12))
+					ctx := t.Context()
+					if prng.IntN(3) == 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, time.Duration(prng.IntN(2000))*time.Microsecond)
+						defer cancel()
+					}
+					if err := w.AppendBatch(ctx, evs); err != nil {
+						// A cancelled append appended nothing.
+						assert.ErrorIs(t, err, ingest.ErrAppendCancelled)
+						continue
+					}
+					mu.Lock()
+					want = append(want, evs...)
+					mu.Unlock()
+				}
+			}
+		})
+	}
+	finished := make(chan struct{})
+	go func() { wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("appends still waiting after 30s: a wakeup was lost")
+	}
+	require.Zero(t, testutil.ToFloat64(m.DirectAppendWaiters))
+	next := w.NextSeq()
+	require.NoError(t, w.Close())
+	require.Equal(t, next, e.seqKey(catalog.Main))
+	require.NoError(t, e.s.Err())
+
+	got := e.directState(catalog.Main).events()
+	require.Len(t, got, len(want))
+	bySeq := make(map[uint64]segment.Event, len(want))
+	for _, ev := range want {
+		bySeq[ev.Seq] = ev
+	}
+	for i, ev := range got {
+		require.Equal(t, uint64(i+1), ev.Seq, "committed seqs are gap-free from 1")
+		requireSameEvent(t, bySeq[ev.Seq], ev)
+	}
 }
 
 // A failed block commit ends the writer and the session. The next session
