@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -134,10 +135,12 @@ type directWriter struct {
 	queue     []directItem
 	pending   int // blocks frozen and not yet committed
 	checkpts  int // metadata-only commits queued and not yet run
-	waiters   int
-	changed   chan struct{} // closed and replaced when pending or checkpts drops
-	closed    bool
-	err       error // sticky failure
+	// room holds the appends waiting for room under MaxPendingBlocks or for
+	// a queued checkpoint. Each commit wakes one, and each append wakes the
+	// next if it left room.
+	room   waitQueue
+	closed bool
+	err    error // sticky failure
 }
 
 type directBlock struct {
@@ -224,8 +227,10 @@ func openDirect(cfg Config) (*Writer, error) {
 		staged:    make(chan stagedItem),
 		nextSeq:   next,
 		witnessed: witnessedFloor{us: floor},
-		changed:   make(chan struct{}),
 	}
+	// Failure and Close wake every waiter (wakeAll), and no append waits
+	// once either has happened, so room is all a signal looks for.
+	d.room = waitQueue{mu: &d.mu, ready: d.roomLocked}
 	w.direct = d
 	cfg.Metrics.setNextSeq(next)
 	d.loops.Add(2)
@@ -279,21 +284,17 @@ func (d *directWriter) appendBatch(ctx context.Context, events []segment.Event) 
 	return d.appendN(ctx, len(events), func(i int) *segment.Event { return &events[i] })
 }
 
-// appendN waits for room below MaxPendingBlocks and for queued checkpoints
-// (see drainDurability), then appends all n events under one hold of mu, so a
-// batch's seqs are contiguous as in local mode.
+// appendN waits its turn for room below MaxPendingBlocks and for queued
+// checkpoints (see drainDurability), then appends all n events under one
+// hold of mu, so a batch's seqs are contiguous as in local mode.
 func (d *directWriter) appendN(ctx context.Context, n int, at func(int) *segment.Event) (err error) {
 	d.mu.Lock()
 	defer d.endIfFailed(&err)
 	defer d.mu.Unlock()
-	for d.pending >= d.direct.MaxPendingBlocks || d.checkpts > 0 {
-		if err := d.usableLocked(); err != nil {
-			d.cfg.Metrics.incAppendErrors()
-			return err
-		}
-		if err := d.waitLocked(ctx); err != nil {
-			return err
-		}
+	// Whatever room this append leaves is the next waiter's.
+	defer d.room.signal()
+	if err := d.awaitRoomLocked(ctx); err != nil {
+		return err
 	}
 	for i := range n {
 		if err := d.appendLocked(at(i)); err != nil {
@@ -301,6 +302,48 @@ func (d *directWriter) appendN(ctx context.Context, n int, at func(int) *segment
 		}
 	}
 	return nil
+}
+
+// awaitRoomLocked waits, releasing mu while it does, until the append may
+// take room. Appends take it in the order they began waiting, so one that
+// finds others waiting queues behind them even when there is room.
+func (d *directWriter) awaitRoomLocked(ctx context.Context) error {
+	var start time.Time
+	defer func() {
+		if !start.IsZero() {
+			d.cfg.Metrics.addDirectAppendWaiters(-1)
+		}
+	}()
+	turn := false // woken by a signal, ahead of every waiter left
+	for {
+		if d.roomLocked() && (turn || d.room.len() == 0) {
+			var waited time.Duration
+			if !start.IsZero() {
+				waited = time.Since(start)
+			}
+			d.cfg.Metrics.observeDirectAppendWait(waited)
+			return nil
+		}
+		if err := d.usableLocked(); err != nil {
+			d.cfg.Metrics.incAppendErrors()
+			return err
+		}
+		if start.IsZero() {
+			start = time.Now()
+			d.cfg.Metrics.addDirectAppendWaiters(1)
+		}
+		if err := d.room.wait(ctx, turn); err != nil {
+			return fmt.Errorf("%w: %w", ErrAppendCancelled, err)
+		}
+		turn = true
+	}
+}
+
+// roomLocked reports whether an append may proceed: fewer than
+// MaxPendingBlocks blocks are frozen and uncommitted, and no checkpoint is
+// queued.
+func (d *directWriter) roomLocked() bool {
+	return d.pending < d.direct.MaxPendingBlocks && d.checkpts == 0
 }
 
 func (d *directWriter) appendLocked(ev *segment.Event) error {
@@ -488,7 +531,7 @@ func (d *directWriter) commitLoop() {
 		if s.meta != nil {
 			d.mu.Lock()
 			d.checkpts--
-			d.signalLocked()
+			d.room.signal()
 			d.mu.Unlock()
 		}
 	}
@@ -611,7 +654,7 @@ func (d *directWriter) committed(b *directBlock) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.pending--
-	d.signalLocked()
+	d.room.signal()
 }
 
 // commitMeta commits a checkpoint's hook output with no events. There is
@@ -668,7 +711,7 @@ func (d *directWriter) failLocked(err error) bool {
 		return false
 	}
 	d.err = err
-	d.signalLocked()
+	d.room.wakeAll()
 	return true
 }
 
@@ -692,30 +735,6 @@ func (d *directWriter) failed(err error) {
 	if d.direct.OnFailure != nil {
 		d.direct.OnFailure(err)
 	}
-}
-
-// waitLocked releases mu until the next signal or ctx's end.
-func (d *directWriter) waitLocked(ctx context.Context) error {
-	ch := d.changed
-	d.waiters++
-	d.mu.Unlock()
-	var err error
-	select {
-	case <-ch:
-	case <-ctx.Done():
-		err = fmt.Errorf("%w: %w", ErrAppendCancelled, ctx.Err())
-	}
-	d.mu.Lock()
-	d.waiters--
-	return err
-}
-
-func (d *directWriter) signalLocked() {
-	if d.waiters == 0 {
-		return
-	}
-	close(d.changed)
-	d.changed = make(chan struct{})
 }
 
 // barrier queues a marker behind everything already queued and waits for
@@ -792,7 +811,7 @@ func (d *directWriter) close() error {
 		d.enqueueMetaLocked()
 	}
 	d.closed = true
-	d.signalLocked()
+	d.room.wakeAll()
 	d.enqueueLocked(directItem{stop: true})
 	d.mu.Unlock()
 

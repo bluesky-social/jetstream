@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -335,7 +336,9 @@ func TestHandler_RejectsInvalidCursor(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
-func newActiveTimestampServer(t *testing.T, v2 bool, blockSize int) (*httptest.Server, *ingest.Writer) {
+// newActiveTimestampServer serves a writer's active segment. seqs, if
+// given, wraps the writer as the handler's SeqSource.
+func newActiveTimestampServer(t *testing.T, v2 bool, blockSize int, seqs ...func(*ingest.Writer) subscribe.SeqSource) (*httptest.Server, *ingest.Writer) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := pebblestore.Open(dir, pebblestore.NewMetrics(prometheus.NewRegistry()))
@@ -371,19 +374,83 @@ func newActiveTimestampServer(t *testing.T, v2 bool, blockSize int) (*httptest.S
 	require.NoError(t, err)
 	tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
 
-	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{
+	sub := subscribe.Subscription{
 		Tail: tail, Store: st, Manifest: m, Writer: w,
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:  metrics,
 		Lookback: 36 * time.Hour,
 		V2:       v2,
-	}))
+	}
+	for _, wrap := range seqs {
+		sub.Seqs = wrap(w)
+	}
+	srv := httptest.NewServer(subscribe.NewHandler(sub))
 	t.Cleanup(func() {
 		srv.Close()
 		_ = w.Close()
 		_ = st.Close()
 	})
 	return srv, w
+}
+
+// appendOnNextSeq is the writer as a SeqSource that appends one event
+// right after the handler reads NextSeq to resolve the first cursor: a
+// commit between resolving the cursor and starting the stream.
+type appendOnNextSeq struct {
+	*ingest.Writer
+	t    *testing.T
+	once sync.Once
+	seq  atomic.Uint64
+}
+
+func (a *appendOnNextSeq) NextSeq() uint64 {
+	next := a.Writer.NextSeq()
+	a.once.Do(func() {
+		a.seq.Store(appendTimestampEvent(a.t, a.Writer, time.Now().UnixMicro(), "did:plc:in-the-window"))
+	})
+	return next
+}
+
+// A cursor at the writer's next seq is a caught-up client reconnecting. The
+// stream starts at that seq, not at the live tip when the stream starts:
+// an event committed in between is the client's next event.
+func TestHandler_NextSeqCursorKeepsEventsCommittedDuringConnect(t *testing.T) {
+	t.Parallel()
+	for _, v2 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "v1", true: "v2"}[v2], func(t *testing.T) {
+			t.Parallel()
+			var window *appendOnNextSeq
+			srv, w := newActiveTimestampServer(t, v2, 4, func(w *ingest.Writer) subscribe.SeqSource {
+				window = &appendOnNextSeq{Writer: w, t: t}
+				return window
+			})
+			now := time.Now().UnixMicro()
+			appendTimestampEvent(t, w, now, "did:plc:before-1")
+			appendTimestampEvent(t, w, now, "did:plc:before-2")
+			next := w.NextSeq()
+
+			conn := dialTimestampCursor(t, srv, "/", int64(next))
+			require.Equal(t, next, window.seq.Load(), "the event landed between the cursor and the stream")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, body, err := conn.Read(ctx)
+			require.NoError(t, err, "the event committed while the client connected never arrived")
+			var frame struct {
+				DID     string `json:"did"`
+				Payload struct {
+					Seq uint64 `json:"seq"`
+					DID string `json:"did"`
+				} `json:"payload"`
+			}
+			require.NoError(t, json.Unmarshal(body, &frame))
+			if v2 {
+				require.Equal(t, next, frame.Payload.Seq)
+				require.Equal(t, "did:plc:in-the-window", frame.Payload.DID)
+			} else {
+				require.Equal(t, "did:plc:in-the-window", frame.DID)
+			}
+		})
+	}
 }
 
 func appendTimestampEvent(t *testing.T, w *ingest.Writer, witnessedAt int64, did string) uint64 {

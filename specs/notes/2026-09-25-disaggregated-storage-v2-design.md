@@ -961,7 +961,12 @@ As built (S3.1, `internal/ingest/direct.go`):
   the catalog, which on pop2 was about 16% of the commit loop.
 - Admission: an append waits while `MaxPendingBlocks` blocks (default twice the
   upload concurrency) are frozen but not committed. It waits before it appends
-  anything, so an `AppendBatch` still gets contiguous seqs.
+  anything, so an `AppendBatch` still gets contiguous seqs. Waiting appends take
+  turns in arrival order. Each commit wakes only the oldest, and each append
+  wakes the next if it left room. A broadcast to about 500 waiting backfill
+  appends made the committer queue on the writer's mutex behind them on pop2.
+  `jetstream_ingest_direct_append_waiters` and
+  `jetstream_ingest_direct_append_wait_seconds` show the backpressure.
 - The active segment is a `maintainer.Segment`, the same type the maintainer
   seals with in hot mode. The committer is its only caller, so seals serialize
   with block commits. The rotation rule runs after each block commit, and also

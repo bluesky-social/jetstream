@@ -230,17 +230,22 @@ func TestResolveCursor_FutureSeqDropsToLive(t *testing.T) {
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 	require.True(t, p.Clamped, "Clamped is informational here; future-cursor is a special clamp case")
 	require.Equal(t, subscribe.NoticeFutureSeq, p.Notice)
+	require.Zero(t, p.StartSeq, "a future cursor starts at the live tip")
 }
 
 // TestResolveCursor_NextSeqCursorIsNotFuture: a cursor equal to NextSeq is a
 // client resuming just after the newest event, the ordinary reconnect, so it
-// must not be announced as a future cursor.
+// must not be announced as a future cursor. The stream starts exactly at
+// the cursor, not at whatever the tip is once it starts, so events committed
+// while the client connects still reach it.
 func TestResolveCursor_NextSeqCursorIsNotFuture(t *testing.T) {
 	t.Parallel()
 	p, err := subscribe.ResolveCursor("1000", subscribe.CursorEnv{NextSeq: 1000})
 	require.NoError(t, err)
 	require.Equal(t, subscribe.ModeLive, p.Mode)
 	require.Equal(t, subscribe.NoticeNone, p.Notice)
+	require.Equal(t, uint64(1000), p.StartSeq)
+	require.False(t, p.Clamped, "the stream starts where the client asked")
 }
 
 // TestResolveCursor_ZeroNextSeqDropsToLive pins the CursorEnv.NextSeq contract:

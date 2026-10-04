@@ -27,6 +27,7 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -86,6 +87,9 @@ func TestOracle_ObservedSeqIsNotReusedAfterSIGKILL(t *testing.T) {
 			require.NoError(t, err)
 		}
 		if time.Now().After(deadline) {
+			// The child writes output until it exits.
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 			t.Fatalf("timed out waiting for child subscriber observation\n%s", output.String())
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -177,6 +181,15 @@ func runSeqLeaseSubscriberChild() {
 	}
 	if err != nil {
 		fail(err)
+	}
+	// A live subscriber starts at the tip when its stream starts, after the
+	// dial returns. Append before then and the subscriber starts past the
+	// event and never sees it.
+	for testutil.ToFloat64(metrics.Subscribers.WithLabelValues("none")) == 0 {
+		if ctx.Err() != nil {
+			fail(fmt.Errorf("subscriber stream never started: %w", ctx.Err()))
+		}
+		time.Sleep(time.Millisecond)
 	}
 	ev := leaseOracleEvent("did:plc:observed-before-crash")
 	if err := w.Append(ctx, &ev); err != nil {

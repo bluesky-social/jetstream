@@ -483,7 +483,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 
 	startSeq := cursorPlan.StartSeq
-	if cursorPlan.Mode == ModeLive {
+	if cursorPlan.Mode == ModeLive && startSeq == 0 {
 		startSeq = deps.Tail.Tip()
 	}
 
