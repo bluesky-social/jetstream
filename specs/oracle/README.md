@@ -72,3 +72,9 @@ naming the failure mode (not the test).
   catalog load listed `backfill/live_segments` before the session's writer
   created it, then statted it after, and failed startup. Fixed by trusting
   the listing's not-exist error.
+- [2026-10-04 — a live subscriber starts past an event appended while it connected](2026-10-04-live-start-races-first-append.md):
+  CI's race job. The seq-lease oracle's child appended right after its dial
+  returned, and the handler took the live tip after that. The same window
+  dropped events for a client resuming with a cursor equal to the next seq.
+  Fixed by starting such a cursor exactly where it points, and by having the
+  child wait for its stream to start.

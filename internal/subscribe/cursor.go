@@ -52,8 +52,11 @@ type CursorPlan struct {
 	// Mode controls the dispatch. ModeLive bypasses the replay engine.
 	Mode CursorMode
 
-	// StartSeq is the first seq the replay engine should emit. Set
-	// only for replay modes.
+	// StartSeq is the first seq the replay engine should emit. In
+	// ModeLive it is zero, meaning the live tip when the stream starts,
+	// unless the cursor named the next seq the writer would assign: then
+	// it is that seq. Events can commit between resolving the cursor and
+	// starting the stream, and a resuming client must not skip them.
 	StartSeq uint64
 
 	// Requested is the raw integer parsed from the query string. Timestamp
@@ -198,10 +201,14 @@ func ResolveCursor(raw string, env CursorEnv) (CursorPlan, error) {
 		// future", so it also drops to live rather than falling through to
 		// seq replay or the RejectBelowFloor too-old rejection.
 		if env.NextSeq == 0 || uint64(n) >= env.NextSeq {
+			// A cursor at NextSeq is a client resuming after the last event,
+			// and the stream starts exactly there. Only one past it names
+			// seqs this archive has never assigned.
+			if env.NextSeq > 0 && uint64(n) == env.NextSeq {
+				return CursorPlan{Mode: ModeLive, Requested: n, StartSeq: env.NextSeq}, nil
+			}
 			live := CursorPlan{Mode: ModeLive, Requested: n, Clamped: true}
-			// A cursor at NextSeq is a client resuming after the last event;
-			// only one past it names seqs this archive has never assigned.
-			if env.NextSeq > 0 && uint64(n) > env.NextSeq {
+			if env.NextSeq > 0 {
 				live.Notice = NoticeFutureSeq
 			}
 			return live, nil
