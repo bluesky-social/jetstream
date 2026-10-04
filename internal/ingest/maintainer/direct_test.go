@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,7 +45,10 @@ func (e *env) directWriter(ns catalog.Namespace, maxSegment int64, cfg ingest.Co
 		ReadConcurrency: 2,
 	})
 	require.NoError(e.t, err)
-	dc.Session, dc.Uploader, dc.Sealer = e.s, e.up, seg
+	if dc.Uploader == nil {
+		dc.Uploader = e.up
+	}
+	dc.Session, dc.Sealer = e.s, seg
 	cfg.Namespace = ns
 	cfg.Direct = &dc
 	if cfg.MaxEventsPerBlock == 0 {
@@ -132,13 +137,16 @@ func (st directState) events() []segment.Event {
 }
 
 // directHook checks the durable batch hook contract in direct mode: one call
-// per block, nextSeq grows, the prepare value is the freeze-time sample,
-// afterCommit runs after the block's transaction and in order, afterDone runs
-// in order, and at most one batch is open when the next is staged.
+// per block with a prepare value sampler, or per group of blocks committed
+// together without one, nextSeq grows, the prepare value is the
+// freeze-time sample, afterCommit runs after the block's transaction and in
+// order, afterDone runs in order, and at most one batch is open when the
+// next is staged.
 type directHook struct {
 	t       *testing.T
 	e       *env
 	ns      catalog.Namespace
+	sampled bool
 	lastApp atomic.Uint64
 
 	mu            sync.Mutex
@@ -172,7 +180,11 @@ func (h *directHook) hook(_ context.Context, b metastore.Batch, nextSeq uint64, 
 	} else {
 		h.blocks++
 		require.Greater(h.t, nextSeq, h.last)
-		require.Equal(h.t, nextSeq-1, pv, "prepare value belongs to this block")
+		if h.sampled {
+			require.Equal(h.t, nextSeq-1, pv, "prepare value belongs to this block")
+		} else {
+			require.Nil(h.t, pv)
+		}
 		require.Less(h.t, h.e.seqKey(h.ns), nextSeq, "the hook runs before its block commits")
 	}
 	h.last = nextSeq
@@ -210,6 +222,31 @@ func TestDirect_Swarm(t *testing.T) {
 	}
 }
 
+// commitSizes is the direct block transactions m counted, and the blocks
+// they committed.
+func commitSizes(t *testing.T, m *ingest.Metrics) (txns, blocks uint64) {
+	t.Helper()
+	var hist dto.Metric
+	require.NoError(t, m.DirectCommitBlocks.Write(&hist))
+	return hist.GetHistogram().GetSampleCount(), uint64(hist.GetHistogram().GetSampleSum())
+}
+
+// requireCommitsAtMost checks that no transaction m counted committed more
+// than limit blocks, as far as the histogram's buckets tell: exactly for
+// the bucket bounds 1, 2, 4, ....
+func requireCommitsAtMost(t *testing.T, m *ingest.Metrics, limit int) {
+	t.Helper()
+	var hist dto.Metric
+	require.NoError(t, m.DirectCommitBlocks.Write(&hist))
+	h := hist.GetHistogram()
+	for _, b := range h.GetBucket() {
+		if b.GetUpperBound() >= float64(limit) {
+			require.Equal(t, h.GetSampleCount(), b.GetCumulativeCount(), "a transaction committed more than %d blocks", limit)
+			return
+		}
+	}
+}
+
 // skewed stamps events up to 5ms early, as a source that stamps before it
 // waits for the writer does.
 func skewed(rng *rand.Rand, evs []segment.Event) []segment.Event {
@@ -229,7 +266,8 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 	}
 	maxSegment := int64(1500 + rng.IntN(8000))
 	maxBlock := 1 + rng.IntN(16)
-	dc := ingest.DirectConfig{UploadConcurrency: 1 + rng.IntN(4), MaxPendingBlocks: rng.IntN(4)}
+	dc := ingest.DirectConfig{UploadConcurrency: 1 + rng.IntN(4), MaxPendingBlocks: rng.IntN(4), MaxCommitBlocks: rng.IntN(4)}
+	sampled := rng.IntN(2) == 0
 
 	var want []segment.Event
 	var wantMu sync.Mutex
@@ -245,14 +283,19 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 		if session > 0 {
 			e.restart()
 		}
-		h := &directHook{t: t, e: e, ns: ns}
+		h := &directHook{t: t, e: e, ns: ns, sampled: sampled}
 		start := e.seqKey(ns)
-		w := e.directWriter(ns, maxSegment, ingest.Config{
-			MaxEventsPerBlock:        maxBlock,
-			OnAppend:                 h.onAppend,
-			OnDurableBatch:           h.hook,
-			DurableBatchPrepareValue: h.prepare,
-		}, dc)
+		m := ingest.NewMetrics(prometheus.NewRegistry())
+		cfg := ingest.Config{
+			MaxEventsPerBlock: maxBlock,
+			OnAppend:          h.onAppend,
+			OnDurableBatch:    h.hook,
+			Metrics:           m,
+		}
+		if sampled {
+			cfg.DurableBatchPrepareValue = h.prepare
+		}
+		w := e.directWriter(ns, maxSegment, cfg, dc)
 		require.Equal(t, start, w.NextSeq(), "a session starts at the committed seq key")
 
 		var wg sync.WaitGroup
@@ -311,6 +354,15 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 		v, err := e.db.MetaStore(nil).Get(t.Context(), []byte("test/hook/"+string(ns)))
 		require.NoError(t, err)
 		require.Equal(t, next, binary.LittleEndian.Uint64(v), "hook metadata commits with its block")
+
+		txns, sizes := commitSizes(t, m)
+		require.Equal(t, testutil.ToFloat64(m.BlocksFlushed), float64(sizes), "every flushed block committed in a counted transaction")
+		if sampled || dc.MaxCommitBlocks == 1 {
+			require.Equal(t, txns, sizes, "one block per transaction")
+		}
+		if dc.MaxCommitBlocks > 0 {
+			requireCommitsAtMost(t, m, dc.MaxCommitBlocks)
+		}
 	}
 
 	st := e.directState(ns)
@@ -633,14 +685,18 @@ func TestDirect_WaitingAppendsSwarm(t *testing.T) {
 func runWaitingAppendsSwarm(t *testing.T, rng *rand.Rand) {
 	e := newEnv(t, false)
 	m := ingest.NewMetrics(prometheus.NewRegistry())
-	h := &directHook{t: t, e: e, ns: catalog.Main}
-	w := e.directWriter(catalog.Main, int64(2000+rng.IntN(8000)), ingest.Config{
-		MaxEventsPerBlock:        1 + rng.IntN(8),
-		Metrics:                  m,
-		OnAppend:                 h.onAppend,
-		OnDurableBatch:           h.hook,
-		DurableBatchPrepareValue: h.prepare,
-	}, ingest.DirectConfig{UploadConcurrency: 1 + rng.IntN(2), MaxPendingBlocks: 1 + rng.IntN(2)})
+	h := &directHook{t: t, e: e, ns: catalog.Main, sampled: rng.IntN(2) == 0}
+	cfg := ingest.Config{
+		MaxEventsPerBlock: 1 + rng.IntN(8),
+		Metrics:           m,
+		OnAppend:          h.onAppend,
+		OnDurableBatch:    h.hook,
+	}
+	if h.sampled {
+		cfg.DurableBatchPrepareValue = h.prepare
+	}
+	w := e.directWriter(catalog.Main, int64(2000+rng.IntN(8000)), cfg,
+		ingest.DirectConfig{UploadConcurrency: 1 + rng.IntN(2), MaxPendingBlocks: 1 + rng.IntN(2)})
 
 	var mu sync.Mutex
 	var want []segment.Event
@@ -710,7 +766,7 @@ func TestDirect_CommitFailure(t *testing.T) {
 			fault := &storagefake.Fault{Kind: kind, TxKind: catalog.TxBlock, Ordinal: 3}
 			e.db.InjectFaults(fault)
 			var failures atomic.Int32
-			h := &directHook{t: t, e: e, ns: catalog.Main}
+			h := &directHook{t: t, e: e, ns: catalog.Main, sampled: true}
 			w := e.directWriter(catalog.Main, 1<<20, ingest.Config{
 				OnDurableBatch:           h.hook,
 				OnAppend:                 h.onAppend,
@@ -768,6 +824,7 @@ type hookLog struct {
 	mu    sync.Mutex
 	log   []string
 	calls int
+	nexts []uint64 // each call's nextSeq
 	fail  map[int]error
 	// called receives each call's number.
 	called chan int
@@ -792,6 +849,7 @@ func (h *hookLog) hook(_ context.Context, b metastore.Batch, nextSeq uint64, for
 	h.calls++
 	n, err := h.calls, h.fail[h.calls]
 	h.log = append(h.log, fmt.Sprintf("hook %d", n))
+	h.nexts = append(h.nexts, nextSeq)
 	h.mu.Unlock()
 	h.called <- n
 	if !force {
@@ -847,7 +905,8 @@ func TestDirect_HookOverlapsPreviousCommit(t *testing.T) {
 	e := newEnv(t, false)
 	h := newHookLog()
 	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{OnDurableBatch: h.hook}, ingest.DirectConfig{
-		Crash: holdCommits(func() { h.waitCalled(t, 2) }),
+		Crash:           holdCommits(func() { h.waitCalled(t, 2) }),
+		MaxCommitBlocks: 1,
 	})
 	evs := testEvents(rand.New(rand.NewPCG(21, 21)), 3*blockEvents)
 	require.NoError(t, w.AppendBatch(t.Context(), evs))
@@ -871,8 +930,9 @@ func TestDirect_FailedCommitFailsStagedBatch(t *testing.T) {
 	h := newHookLog()
 	var failures atomic.Int32
 	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{OnDurableBatch: h.hook}, ingest.DirectConfig{
-		Crash:     holdCommits(func() { h.waitCalled(t, 2) }),
-		OnFailure: func(error) { failures.Add(1) },
+		Crash:           holdCommits(func() { h.waitCalled(t, 2) }),
+		OnFailure:       func(error) { failures.Add(1) },
+		MaxCommitBlocks: 1,
 	})
 	evs := testEvents(rand.New(rand.NewPCG(22, 22)), 3*blockEvents)
 	require.NoError(t, w.AppendBatch(t.Context(), evs))
@@ -902,7 +962,8 @@ func TestDirect_HookFailureAfterOverlappedCommit(t *testing.T) {
 	boom := errors.New("hook failed")
 	h.fail = map[int]error{2: boom}
 	w := e.directWriter(catalog.Main, 1<<20, ingest.Config{OnDurableBatch: h.hook}, ingest.DirectConfig{
-		Crash: holdCommits(func() { h.waitCalled(t, 2) }, func() { time.Sleep(50 * time.Millisecond) }),
+		Crash:           holdCommits(func() { h.waitCalled(t, 2) }, func() { time.Sleep(50 * time.Millisecond) }),
+		MaxCommitBlocks: 1,
 	})
 	evs := testEvents(rand.New(rand.NewPCG(23, 23)), 3*blockEvents)
 	require.NoError(t, w.AppendBatch(t.Context(), evs))
@@ -953,6 +1014,262 @@ func TestDirect_UploadFailureAfterOverlappedCommit(t *testing.T) {
 	require.ErrorIs(t, w.Close(), boom)
 	require.Equal(t, []string{"hook 1", "commit 1", "done 1: <nil>"}, h.entries())
 	require.Equal(t, uint64(blockEvents+1), e.seqKey(catalog.Main))
+}
+
+// groupScenario commits block 1 of groupBlocks alone, and holds that
+// commit while the rest freeze and upload, block 2 last: the stager, which
+// waits for block 2, then finds blocks 2 on ready together. It runs in a
+// synctest bubble. failBlock, if not zero, fails that block's upload.
+type groupScenario struct {
+	cfg       ingest.Config
+	dc        ingest.DirectConfig
+	failBlock int
+	// atCommit, if set, runs before each block transaction after the
+	// first, by its number from 1.
+	atCommit func(n int32)
+}
+
+const groupBlocks = 8
+
+var errUploadFailed = errors.New("upload failed")
+
+// blockUploader runs each block's upload through at, by block number from
+// 1, before uploading it.
+type blockUploader struct {
+	up ingest.ObjectUploader
+	at func(block int) error
+}
+
+func (u blockUploader) Upload(ctx context.Context, s *catalog.Session, objs [][]byte) ([]catalog.ObjectRef, error) {
+	evs, err := segment.DecodeBlockFrame(objs[0])
+	if err != nil {
+		return nil, err
+	}
+	if err := u.at(int(evs[0].Seq-1)/blockEvents + 1); err != nil {
+		return nil, err
+	}
+	return u.up.Upload(ctx, s, objs)
+}
+
+// run appends the blocks and flushes. It returns the Flush error.
+func (sc groupScenario) run(t *testing.T, e *env, maxSegment int64) (*ingest.Writer, error) {
+	t.Helper()
+	commitHeld, releaseCommit, releaseBlock2 := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var commits atomic.Int32
+	sc.dc.Crash = crashFunc(func(_ context.Context, p crashpoint.Point) error {
+		if p != crashpoint.AfterDirectBlockUploadBeforeCommit {
+			return nil
+		}
+		switch n := commits.Add(1); {
+		case n == 1:
+			close(commitHeld)
+			<-releaseCommit
+		case sc.atCommit != nil:
+			sc.atCommit(n)
+		}
+		return nil
+	})
+	sc.dc.Uploader = blockUploader{up: e.up, at: func(block int) error {
+		if block == 2 {
+			<-releaseBlock2
+		}
+		if block == sc.failBlock {
+			return errUploadFailed
+		}
+		return nil
+	}}
+	w := e.directWriter(catalog.Main, maxSegment, sc.cfg, sc.dc)
+	evs := testEvents(rand.New(rand.NewPCG(31, 31)), groupBlocks*blockEvents)
+	require.NoError(t, w.AppendBatch(t.Context(), evs[:blockEvents]))
+	<-commitHeld
+	require.NoError(t, w.AppendBatch(t.Context(), evs[blockEvents:]))
+	synctest.Wait() // blocks 3 on are uploaded; the stager waits for block 2
+	close(releaseBlock2)
+	synctest.Wait() // the stager staged what it found ready
+	close(releaseCommit)
+	return w, w.Flush(t.Context())
+}
+
+// Blocks whose uploads finish while the block before them commits commit
+// together, in one transaction with one hook call: nextSeq past the last
+// of them. The hook's callbacks still run in order, after the commit.
+func TestDirect_GroupCommit(t *testing.T) {
+	t.Parallel()
+	all := uint64(groupBlocks*blockEvents + 1)
+	for name, tc := range map[string]struct {
+		dc      ingest.DirectConfig
+		sampled bool
+		txns    uint64
+		nexts   []uint64
+	}{
+		"group":                 {txns: 2, nexts: []uint64{blockEvents + 1, all}},
+		"capped":                {dc: ingest.DirectConfig{MaxCommitBlocks: 3}, txns: 4, nexts: []uint64{blockEvents + 1, 4*blockEvents + 1, 7*blockEvents + 1, all}},
+		"sampler commits alone": {sampled: true, txns: groupBlocks},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				e := newEnv(t, false)
+				h := newHookLog()
+				m := ingest.NewMetrics(prometheus.NewRegistry())
+				cfg := ingest.Config{OnDurableBatch: h.hook, Metrics: m}
+				if tc.sampled {
+					cfg.DurableBatchPrepareValue = func() any { return nil }
+					for i := range groupBlocks {
+						tc.nexts = append(tc.nexts, uint64((i+1)*blockEvents+1))
+					}
+				}
+				w, err := groupScenario{cfg: cfg, dc: tc.dc}.run(t, e, 1<<20)
+				require.NoError(t, err)
+				txns, blocks := commitSizes(t, m)
+				require.Equal(t, tc.txns, txns)
+				require.Equal(t, uint64(groupBlocks), blocks)
+				h.mu.Lock()
+				require.Equal(t, tc.nexts, h.nexts, "one hook call per transaction, past its last block")
+				h.mu.Unlock()
+				var want []string
+				for n := range tc.txns {
+					want = append(want, fmt.Sprintf("commit %d", n+1), fmt.Sprintf("done %d: <nil>", n+1))
+				}
+				require.Equal(t, want, slices.DeleteFunc(h.entries(), func(s string) bool { return strings.HasPrefix(s, "hook ") }),
+					"callbacks run once per transaction, in order")
+				require.Equal(t, all, e.seqKey(catalog.Main))
+				v, err := e.db.MetaStore(nil).Get(t.Context(), []byte("test/hook"))
+				require.NoError(t, err)
+				require.Equal(t, all, binary.LittleEndian.Uint64(v), "the hook's metadata committed with the group")
+				require.NoError(t, w.Close())
+				st := e.directState(catalog.Main)
+				require.Equal(t, groupBlocks, st.activeRows)
+				require.Len(t, st.events(), groupBlocks*blockEvents)
+			})
+		})
+	}
+}
+
+// A group commit splits where the rotation rule fires: the segment ends on
+// the block that reached the threshold and seals before the rest of the
+// group commits, so segments end on the same blocks as with one commit per
+// block. The hook's metadata commits with the group's last block.
+func TestDirect_GroupCommitSplitsAtRotation(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		// The frames are deterministic, so a first run sizes the segment
+		// to end on block 4, inside the group of blocks 2 to 8.
+		probe := newEnv(t, false)
+		w, err := groupScenario{}.run(t, probe, 1<<20)
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+		var maxSegment int64
+		for _, r := range probe.snapshot().ActiveBlocks[:4] {
+			maxSegment += 8 + r.CompressedLength
+		}
+
+		runs := map[string]directState{}
+		for name, dc := range map[string]ingest.DirectConfig{"grouped": {}, "one per commit": {MaxCommitBlocks: 1}} {
+			e := newEnv(t, false)
+			h := newHookLog()
+			m := ingest.NewMetrics(prometheus.NewRegistry())
+			sc := groupScenario{cfg: ingest.Config{OnDurableBatch: h.hook, Metrics: m}, dc: dc}
+			if name == "grouped" {
+				sc.atCommit = func(n int32) {
+					if n != 3 {
+						return
+					}
+					// Between the group's two transactions: blocks 2 to 4
+					// committed without the group's metadata.
+					assert.Equal(t, uint64(4*blockEvents+1), e.seqKey(catalog.Main))
+					v, err := e.db.MetaStore(nil).Get(t.Context(), []byte("test/hook"))
+					if assert.NoError(t, err) {
+						assert.Equal(t, uint64(blockEvents+1), binary.LittleEndian.Uint64(v), "the group's metadata waits for its last block")
+					}
+				}
+			}
+			w, err := sc.run(t, e, maxSegment)
+			require.NoError(t, err, name)
+			if name == "grouped" {
+				txns, _ := commitSizes(t, m)
+				require.Equal(t, uint64(3), txns, "block 1, blocks 2 to 4, and the rest after the seal")
+				require.Equal(t, []string{"hook 1", "hook 2", "commit 1", "done 1: <nil>", "commit 2", "done 2: <nil>"}, h.entries())
+				v, err := e.db.MetaStore(nil).Get(t.Context(), []byte("test/hook"))
+				require.NoError(t, err)
+				require.Equal(t, uint64(groupBlocks*blockEvents+1), binary.LittleEndian.Uint64(v))
+			}
+			require.NoError(t, w.Close())
+			runs[name] = e.directState(catalog.Main)
+		}
+		grouped, single := runs["grouped"], runs["one per commit"]
+		require.NotEmpty(t, grouped.sealed)
+		require.Len(t, grouped.sealed[0], 4*blockEvents, "the first segment ends on block 4")
+		require.Equal(t, single.sealed, grouped.sealed, "segments end on the same blocks")
+		require.Equal(t, single.sealedBytes, grouped.sealedBytes)
+		require.Equal(t, single.active, grouped.active)
+	})
+}
+
+// A failure inside a group fails the writer with nothing of the group
+// committed past it: a failed upload ends the group before that block, and
+// the blocks before it commit; a failed hook or transaction commits none of
+// the group.
+func TestDirect_GroupCommitFailures(t *testing.T) {
+	t.Parallel()
+	errHook := errors.New("hook failed")
+	for name, tc := range map[string]struct {
+		failBlock int
+		hookFail  bool
+		txnFail   bool
+		want      error
+		next      uint64
+		log       []string
+	}{
+		"upload": {
+			failBlock: 5, want: errUploadFailed, next: 4*blockEvents + 1,
+			log: []string{"hook 1", "hook 2", "commit 1", "done 1: <nil>", "commit 2", "done 2: <nil>"},
+		},
+		"hook": {
+			hookFail: true, want: errHook, next: blockEvents + 1,
+			log: []string{"hook 1", "hook 2", "commit 1", "done 1: <nil>", "done 2: ingest: on_durable_batch: hook failed"},
+		},
+		"transaction": {
+			txnFail: true, want: catalog.ErrSessionEnded, next: blockEvents + 1,
+			log: []string{"hook 1", "hook 2", "commit 1", "done 1: <nil>"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				e := newEnv(t, false)
+				h := newHookLog()
+				if tc.hookFail {
+					h.fail = map[int]error{2: errHook}
+				}
+				var fault *storagefake.Fault
+				if tc.txnFail {
+					fault = &storagefake.Fault{Kind: storagefake.FaultCommitFails, TxKind: catalog.TxBlock, Ordinal: 2}
+					e.db.InjectFaults(fault)
+				}
+				var failures atomic.Int32
+				w, err := groupScenario{
+					cfg:       ingest.Config{OnDurableBatch: h.hook},
+					dc:        ingest.DirectConfig{OnFailure: func(error) { failures.Add(1) }},
+					failBlock: tc.failBlock,
+				}.run(t, e, 1<<20)
+				require.ErrorIs(t, err, tc.want)
+				require.ErrorIs(t, w.Close(), tc.want)
+				require.Equal(t, int32(1), failures.Load())
+				log := h.entries()
+				if tc.txnFail {
+					require.True(t, fault.Fired())
+					require.Len(t, log, 5, "%q", log)
+					require.Contains(t, log[4], "done 2: ")
+					require.NotContains(t, log[4], "<nil>", "the group's batch failed with its transaction")
+					log = log[:4]
+				}
+				require.Equal(t, tc.log, log, "nothing after the failure runs the hook")
+				require.Equal(t, tc.next, e.seqKey(catalog.Main))
+				require.Len(t, e.directState(catalog.Main).events(), int(tc.next-1))
+			})
+		})
+	}
 }
 
 // A seal reads back only the blocks an earlier session committed: this
@@ -1065,6 +1382,7 @@ func TestDirect_ConfigValidation(t *testing.T) {
 		"seq lease":      func(c *ingest.Config) { c.ReserveClientVisibleSeqs = true },
 		"async flush":    func(c *ingest.Config) { c.AsyncFlushWorkers = 2 },
 		"negative limit": func(c *ingest.Config) { c.Direct.MaxPendingBlocks = -1 },
+		"negative group": func(c *ingest.Config) { c.Direct.MaxCommitBlocks = -1 },
 		"huge block":     func(c *ingest.Config) { c.MaxEventsPerBlock = 1 << 30 },
 	} {
 		cfg := ok()

@@ -426,7 +426,7 @@ func withSeq(ns Namespace, next uint64, meta []metastore.Op) []metastore.Op {
 }
 
 // Block is one encoded block to commit as an active block, either directly
-// (CommitBlock) or by folding hot batches (Fold).
+// (CommitBlock, CommitBlocks) or by folding hot batches (Fold).
 type Block struct {
 	Namespace Namespace
 	// Info carries the block's bounds and sizes. Offset is ignored.
@@ -437,7 +437,7 @@ type Block struct {
 	Meta []metastore.Op
 }
 
-// BlockCommit is the result of CommitBlock and Fold.
+// BlockCommit is the result of CommitBlock, CommitBlocks, and Fold.
 type BlockCommit struct {
 	Revision uint64
 	Segment  uint64
@@ -464,22 +464,61 @@ func (b Block) validate() error {
 
 // CommitBlock is the §10.6 direct-mode block transaction.
 func (s *Session) CommitBlock(ctx context.Context, b Block) (BlockCommit, error) {
-	if err := b.validate(); err != nil {
-		return BlockCommit{}, s.fail(err)
+	out, err := s.CommitBlocks(ctx, []Block{b})
+	if err != nil {
+		return BlockCommit{}, err
 	}
-	var out BlockCommit
-	seq, br := seqRead(b.Namespace), newBlockReads(b)
+	return out[0], nil
+}
+
+// CommitBlocks commits consecutive direct-mode blocks of one namespace in
+// one §10.6 transaction (group commit): they take the next ordinals of the
+// active segment, every row shares the revision, the blocks' Meta apply in
+// block order, and the seq key moves once, past the last block. Every leader
+// transaction serializes on the fence row, so one transaction per block
+// caps a backfill at about one block per transaction latency (pop2,
+// 2026-10-04). The caller keeps the blocks inside the active segment:
+// the transaction does not apply the rotation rule.
+func (s *Session) CommitBlocks(ctx context.Context, bs []Block) ([]BlockCommit, error) {
+	if len(bs) == 0 {
+		return nil, s.fail(errors.New("catalog: commit of no blocks"))
+	}
+	var meta []metastore.Op
+	for i, b := range bs {
+		if err := b.validate(); err != nil {
+			return nil, s.fail(err)
+		}
+		if i > 0 {
+			prev := bs[i-1]
+			if b.Namespace != prev.Namespace {
+				return nil, s.fail(fmt.Errorf("catalog: block group spans namespaces %q and %q", prev.Namespace, b.Namespace))
+			}
+			if b.Info.MinSeq != prev.Info.MaxSeq+1 {
+				return nil, s.fail(fmt.Errorf("catalog: block [%d,%d] does not follow [%d,%d]",
+					b.Info.MinSeq, b.Info.MaxSeq, prev.Info.MinSeq, prev.Info.MaxSeq))
+			}
+		}
+		meta = append(meta, b.Meta...)
+	}
+	first, last := bs[0], bs[len(bs)-1]
+	out := make([]BlockCommit, len(bs))
+	seq, br := seqRead(first.Namespace), newBlockReads(bs...)
 	rev, err := s.run(ctx, TxBlock, append([]Read{seq}, br.reads()...), func(tx Tx, rev uint64) error {
-		if err := checkSeq(seq, b.Info.MinSeq); err != nil {
+		if err := checkSeq(seq, first.Info.MinSeq); err != nil {
 			return err
 		}
-		if err := insertActiveBlock(ctx, tx, rev, b, br, &out); err != nil {
+		if err := insertActiveBlocks(ctx, tx, rev, bs, br, out); err != nil {
 			return err
 		}
-		return tx.ApplyMeta(ctx, withSeq(b.Namespace, b.Info.MaxSeq+1, b.Meta))
+		return tx.ApplyMeta(ctx, withSeq(first.Namespace, last.Info.MaxSeq+1, meta))
 	})
-	out.Revision = rev
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Revision = rev
+	}
+	return out, nil
 }
 
 // Fold is the §10.7 fold transaction: it replaces the hot batches covering
@@ -491,7 +530,7 @@ func (s *Session) Fold(ctx context.Context, b Block) (BlockCommit, error) {
 	if b.Namespace != Main || len(b.Meta) > 0 {
 		return BlockCommit{}, s.fail(errors.New("catalog: fold is main-only and carries no metadata"))
 	}
-	var out BlockCommit
+	out := make([]BlockCommit, 1)
 	br := newBlockReads(b)
 	rev, err := s.run(ctx, TxFold, br.reads(), func(tx Tx, rev uint64) error {
 		spans, err := tx.DeleteHotBatches(ctx, b.Info.MinSeq, b.Info.MaxSeq)
@@ -501,10 +540,10 @@ func (s *Session) Fold(ctx context.Context, b Block) (BlockCommit, error) {
 		if err := checkCoverage(spans, b.Info.MinSeq, b.Info.MaxSeq); err != nil {
 			return err
 		}
-		return insertActiveBlock(ctx, tx, rev, b, br, &out)
+		return insertActiveBlocks(ctx, tx, rev, []Block{b}, br, out)
 	})
-	out.Revision = rev
-	return out, err
+	out[0].Revision = rev
+	return out[0], err
 }
 
 // checkCoverage checks that the deleted hot batches tile [lo, hi] exactly.
@@ -525,18 +564,23 @@ func checkCoverage(spans []HotBatchSpan, lo, hi uint64) error {
 	return nil
 }
 
-// blockReads are the reads insertActiveBlock takes, sent with the fence.
+// blockReads are the reads insertActiveBlocks takes, sent with the fence.
 type blockReads struct {
 	seg  ActiveSegmentRead
 	last LastActiveBlockRead
 	obj  *objectReads
 }
 
-func newBlockReads(b Block) *blockReads {
+// newBlockReads reads for blocks of one namespace.
+func newBlockReads(bs ...Block) *blockReads {
+	refs := make([]ObjectRef, len(bs))
+	for i, b := range bs {
+		refs[i] = b.Object
+	}
 	return &blockReads{
-		seg:  ActiveSegmentRead{Namespace: b.Namespace},
-		last: LastActiveBlockRead{Namespace: b.Namespace},
-		obj:  newObjectReads(b.Object),
+		seg:  ActiveSegmentRead{Namespace: bs[0].Namespace},
+		last: LastActiveBlockRead{Namespace: bs[0].Namespace},
+		obj:  newObjectReads(refs...),
 	}
 }
 
@@ -544,13 +588,14 @@ func (r *blockReads) reads() []Read {
 	return append([]Read{&r.seg, &r.last}, r.obj.reads()...)
 }
 
-// insertActiveBlock appends b to its namespace's active segment. The block
-// must continue the segment's last block. The first block of a segment is
-// checked by the seq key (direct mode) or the hot batch coverage (fold),
-// together with CheckInvariants.
-func insertActiveBlock(ctx context.Context, tx Tx, rev uint64, b Block, r *blockReads, out *BlockCommit) error {
+// insertActiveBlocks appends consecutive blocks of one namespace to its
+// active segment, filling out. The first must continue the segment's last
+// block. The first block of a segment is checked by the seq key (direct
+// mode) or the hot batch coverage (fold), together with CheckInvariants.
+func insertActiveBlocks(ctx context.Context, tx Tx, rev uint64, bs []Block, r *blockReads, out []BlockCommit) error {
+	ns := bs[0].Namespace
 	if !r.seg.Found {
-		return Corruptf(SourceInvariant, "namespace %s has no active segment", b.Namespace)
+		return Corruptf(SourceInvariant, "namespace %s has no active segment", ns)
 	}
 	seg := r.seg.Row
 	ordinal := 0
@@ -558,11 +603,11 @@ func insertActiveBlock(ctx context.Context, tx Tx, rev uint64, b Block, r *block
 		last := r.last.Row
 		if last.Segment != seg.Index {
 			return Corruptf(SourceInvariant, "%s last active block is in segment %d; the active segment is %d",
-				b.Namespace, last.Segment, seg.Index)
+				ns, last.Segment, seg.Index)
 		}
-		if last.MaxSeq+1 != b.Info.MinSeq {
+		if last.MaxSeq+1 != bs[0].Info.MinSeq {
 			return Corruptf(SourceInvariant, "%s segment %d block %d ends at %d; new block starts at %d",
-				b.Namespace, seg.Index, last.Ordinal, last.MaxSeq, b.Info.MinSeq)
+				ns, seg.Index, last.Ordinal, last.MaxSeq, bs[0].Info.MinSeq)
 		}
 		ordinal = last.Ordinal + 1
 	}
@@ -570,25 +615,26 @@ func insertActiveBlock(ctx context.Context, tx Tx, rev uint64, b Block, r *block
 	if err != nil {
 		return err
 	}
-	id := ids[0]
-	row := ActiveBlockRow{
-		Namespace:          b.Namespace,
-		Segment:            seg.Index,
-		Ordinal:            ordinal,
-		ObjectID:           id,
-		EventCount:         b.Info.EventCount,
-		MinSeq:             b.Info.MinSeq,
-		MaxSeq:             b.Info.MaxSeq,
-		MinWitnessedUS:     b.Info.MinWitnessedAt,
-		MaxWitnessedUS:     b.Info.MaxWitnessedAt,
-		CompressedLength:   int64(b.Info.CompressedSize),
-		UncompressedLength: int64(b.Info.UncompressedSize),
-		Revision:           rev,
+	for i, b := range bs {
+		row := ActiveBlockRow{
+			Namespace:          ns,
+			Segment:            seg.Index,
+			Ordinal:            ordinal + i,
+			ObjectID:           ids[i],
+			EventCount:         b.Info.EventCount,
+			MinSeq:             b.Info.MinSeq,
+			MaxSeq:             b.Info.MaxSeq,
+			MinWitnessedUS:     b.Info.MinWitnessedAt,
+			MaxWitnessedUS:     b.Info.MaxWitnessedAt,
+			CompressedLength:   int64(b.Info.CompressedSize),
+			UncompressedLength: int64(b.Info.UncompressedSize),
+			Revision:           rev,
+		}
+		if err := tx.InsertActiveBlock(ctx, row); err != nil {
+			return err
+		}
+		out[i] = BlockCommit{Segment: seg.Index, Ordinal: row.Ordinal, ObjectID: row.ObjectID}
 	}
-	if err := tx.InsertActiveBlock(ctx, row); err != nil {
-		return err
-	}
-	*out = BlockCommit{Segment: seg.Index, Ordinal: ordinal, ObjectID: id}
 	return nil
 }
 

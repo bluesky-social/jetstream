@@ -925,15 +925,16 @@ Direct mode is local mode's block flush, pointed at S3 and PostgreSQL:
    blocks/s at about 740 events per block. On a disk-backed PostgreSQL the
    fence leaves bootstrap far less than that, because discovery takes most of
    the leader's transactions (§22.3).
-3. Commit blocks strictly in order, one transaction each:
+3. Commit blocks strictly in order. One transaction commits consecutive
+   blocks that are ready together (group commit, see "As built"):
 
 ```
 BEGIN
   fence
-  check seq key == block.min_seq (FOR UPDATE)
-  reference check on block.object_id
-  INSERT INTO active_segment_blocks (..., ordinal = next ordinal, revision = rev)
-  apply metadata batch: seq key = block.max_seq + 1, plus DurableBatchHook output
+  check seq key == first block.min_seq (FOR UPDATE)
+  reference check on every block.object_id
+  INSERT INTO active_segment_blocks (..., ordinal = next ordinals, revision = rev)
+  apply metadata batch: seq key = last block.max_seq + 1, plus DurableBatchHook output
 COMMIT
 ```
 
@@ -955,10 +956,23 @@ As built (S3.1, `internal/ingest/direct.go`):
 - The writer does its own encode and upload, as the hot writer does, instead of
   reusing `AsyncFlushWorkers`. Frozen blocks encode and upload concurrently, up
   to `UploadConcurrency`. One committer goroutine commits them in seq order.
-  A stager goroutine ahead of it runs the DurableBatchHook for each block and
-  checkpoint in order, one item ahead, so a block's hook overlaps the previous
-  block's commit (`Writer.PipelinesDurableBatches`). The backfill hook reads
-  the catalog, which on pop2 was about 16% of the commit loop.
+  A stager goroutine ahead of it runs the DurableBatchHook for each item in
+  order, one item ahead, so an item's hook overlaps the previous item's
+  commit (`Writer.PipelinesDurableBatches`). The backfill hook reads the
+  catalog, which on pop2 was about 16% of the commit loop.
+- Group commit: the stager takes, with a block, every block queued behind it
+  whose upload has finished (at most `MaxCommitBlocks`, default 64), runs the
+  hook once for the group with nextSeq past its last block, and the
+  committer commits the group in one transaction (`Session.CommitBlocks`).
+  It never waits for more blocks: a group is what is ready when the stager
+  gets to it, so groups grow with load. On pop2 at v0.3.4 the committer ran
+  one block per transaction, about 26 blocks/s at a 38ms block transaction,
+  while about 1,500 backfill appends waited for room. A writer with a
+  `DurableBatchPrepareValue` still commits one block per transaction: every
+  sample must reach the hook, and the hook may hold only one batch open
+  while the next is staged. Only the backfill writer, which has no sampler,
+  needs the throughput. `jetstream_ingest_direct_commit_blocks` is the
+  blocks per transaction.
 - Admission: an append waits while `MaxPendingBlocks` blocks (default twice the
   upload concurrency) are frozen but not committed. It waits before it appends
   anything, so an `AppendBatch` still gets contiguous seqs. Waiting appends take
@@ -971,7 +985,11 @@ As built (S3.1, `internal/ingest/direct.go`):
   seals with in hot mode. The committer is its only caller, so seals serialize
   with block commits. The rotation rule runs after each block commit, and also
   before it. The earlier run covers an earlier session that committed the
-  threshold-crossing block and ended before its seal.
+  threshold-crossing block and ended before its seal. A group that reaches
+  the threshold commits in two transactions, split after the block that
+  reaches it, with the seal between them and the hook's metadata in the
+  second (`SegmentSealer.BlocksBeforeRotation`). Segments therefore end on
+  the same blocks as with one commit per block.
 - Flush and DrainDurability commit a short block and do not rotate unless the
   rule fires, as in local mode. ForceRotate and SealActiveAndClose seal the
   active segment. Close leaves it active: the next direct writer, or the hot

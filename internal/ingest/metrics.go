@@ -49,6 +49,9 @@ type Metrics struct {
 	// MaxPendingBlocks or for a queued checkpoint (design §10.6).
 	DirectAppendWaiters prometheus.Gauge
 	DirectAppendWait    prometheus.Histogram
+	// DirectCommitBlocks is the blocks per direct mode block transaction
+	// (group commit, design §10.6).
+	DirectCommitBlocks prometheus.Histogram
 }
 
 // NewMetrics registers the ingest counters/gauges against reg.
@@ -195,6 +198,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Time a direct mode append waited for room under MaxPendingBlocks or for a queued checkpoint.",
 			Buckets: []float64{0, .001, .005, .02, .1, .5, 2, 10, 60},
 		}),
+		DirectCommitBlocks: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "direct_commit_blocks",
+			Help:    "Blocks committed per direct mode block transaction.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+		}),
 	}
 	reg.MustRegister(
 		m.EventsAppended, m.BlocksFlushed, m.SegmentsRotated,
@@ -206,7 +215,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.SeqGapsRegistered, m.SeqGapValuesRegistered,
 		m.HotBatches, m.HotBatchEvents, m.HotCommitBatches,
 		m.HotUnfoldedEvents, m.HotPendingBytes, m.HotInlineTokens, m.AdmissionWait,
-		m.DirectAppendWaiters, m.DirectAppendWait,
+		m.DirectAppendWaiters, m.DirectAppendWait, m.DirectCommitBlocks,
 	)
 	return m
 }
@@ -255,6 +264,12 @@ func (m *Metrics) incEventsAppended() {
 func (m *Metrics) incBlocksFlushed() {
 	if m != nil {
 		m.BlocksFlushed.Inc()
+	}
+}
+
+func (m *Metrics) addBlocksFlushed(n int) {
+	if m != nil {
+		m.BlocksFlushed.Add(float64(n))
 	}
 }
 
@@ -385,5 +400,11 @@ func (m *Metrics) addDirectAppendWaiters(delta float64) {
 func (m *Metrics) observeDirectAppendWait(d time.Duration) {
 	if m != nil {
 		m.DirectAppendWait.Observe(d.Seconds())
+	}
+}
+
+func (m *Metrics) observeDirectCommitBlocks(n int) {
+	if m != nil {
+		m.DirectCommitBlocks.Observe(float64(n))
 	}
 }

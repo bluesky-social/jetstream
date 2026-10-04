@@ -36,9 +36,11 @@ func TestNewMetrics_RegistersCounters(t *testing.T) {
 	m.incSeqGapRegistered(12)
 	m.addDirectAppendWaiters(3)
 	m.addDirectAppendWaiters(-1)
+	m.addBlocksFlushed(4)
+	m.observeDirectCommitBlocks(4)
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.EventsAppended), 0)
-	require.InDelta(t, 1.0, testutil.ToFloat64(m.BlocksFlushed), 0)
+	require.InDelta(t, 5.0, testutil.ToFloat64(m.BlocksFlushed), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.SegmentsRotated), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.AppendErrors), 0)
 	require.InDelta(t, 123.0, testutil.ToFloat64(m.ActiveSegBytes), 0)
@@ -50,6 +52,7 @@ func TestNewMetrics_RegistersCounters(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.SeqGapsRegistered), 0)
 	require.InDelta(t, 12.0, testutil.ToFloat64(m.SeqGapValuesRegistered), 0)
 	require.InDelta(t, 2.0, testutil.ToFloat64(m.DirectAppendWaiters), 0)
+	require.Equal(t, 1, testutil.CollectAndCount(m.DirectCommitBlocks))
 	requireNoDebugMetricFields(t, m)
 	requireNoDebugMetrics(t, reg)
 }
@@ -72,6 +75,8 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.incSeqGapRegistered(4)
 		m.addDirectAppendWaiters(1)
 		m.observeDirectAppendWait(time.Second)
+		m.addBlocksFlushed(2)
+		m.observeDirectCommitBlocks(2)
 	})
 }
 
