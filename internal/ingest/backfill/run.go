@@ -221,6 +221,7 @@ func Run(ctx context.Context, cfg Config) error {
 			}),
 			OnRosterCapped:     gt.Some(func(limit int) { cfg.Metrics.incRosterCapHit() }),
 			OnDownloadSlotWait: gt.Some(func(wait time.Duration) { cfg.Metrics.observeDownloadSlotWait(wait) }),
+			OnRateLimitWait:    gt.Some(func(host string, wait time.Duration) { cfg.Metrics.observeRateLimitWait(host, wait) }),
 			HostMaxAttempts:    gt.Some(hostMaxAttempts),
 		}
 		if cfg.GlobalDownloads > 0 {

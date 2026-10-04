@@ -346,9 +346,10 @@ func TestRetryRunner_RateLimitFromSimulatorParksClampsAndRecovers(t *testing.T) 
 		wantClamp bool
 	}{
 		{
-			name:      "near_future",
-			reset:     func(now time.Time, _ time.Duration) time.Time { return now.Add(2 * time.Hour) },
-			wantNext:  func(now time.Time, _ time.Duration) time.Time { return now.Add(2 * time.Hour) },
+			name:  "near_future",
+			reset: func(now time.Time, _ time.Duration) time.Time { return now.Add(2 * time.Hour) },
+			// RateLimit-Reset names a floored second; the retry waits one more.
+			wantNext:  func(now time.Time, _ time.Duration) time.Time { return now.Add(2*time.Hour + time.Second) },
 			wantClamp: false,
 		},
 		{
@@ -435,6 +436,12 @@ func TestRetryRunner_RateLimitFromSimulatorParksClampsAndRecovers(t *testing.T) 
 			require.InDelta(t, 1.0, testutil.ToFloat64(metrics.RetrySkippedHostParked), 0)
 
 			currentNow = wantNext.Add(time.Millisecond)
+			// The relay client parked on the wall clock, which the runner's
+			// injected clock just passed; a client built now starts clear,
+			// as one would after the real reset.
+			r.syncClient = atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+				Host: srv.URL, HTTPClient: gt.Some(srv.Client()), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+			}})
 			require.NoError(t, r.processCandidate(context.Background(), retryCandidate{DID: first.DID, Host: host, Retry: rs.Backfill.RetryCount}))
 			rs, err = bs.readRepoStatus(first.DID)
 			require.NoError(t, err)

@@ -12,7 +12,7 @@ require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/coder/websocket v1.8.15
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/jcalabro/atmos v0.6.0
+	github.com/jcalabro/atmos v0.7.0
 	github.com/jcalabro/gloom v0.1.0
 	github.com/jcalabro/gt v0.0.14
 	github.com/klauspost/compress v1.19.2

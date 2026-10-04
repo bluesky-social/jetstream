@@ -443,6 +443,8 @@ func TestRetryRunner_RateLimitParksHost(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	reset := now.Add(2 * time.Hour)
+	// RateLimit-Reset names a floored second; the retry waits one more.
+	wantNext := reset.Add(time.Second)
 	var hits atomic.Int64
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -485,14 +487,14 @@ func TestRetryRunner_RateLimitParksHost(t *testing.T) {
 
 	rs, err := bs.readRepoStatus(first)
 	require.NoError(t, err)
-	require.Equal(t, reset, rs.Backfill.NextAttemptAt)
+	require.Equal(t, wantNext, rs.Backfill.NextAttemptAt)
 
 	require.NoError(t, r.processCandidate(ctx, retryCandidate{DID: second, Host: host, Retry: 1}))
 	require.Equal(t, int64(1), hits.Load(), "parked host should suppress additional same-host attempts")
 
 	rs, err = bs.readRepoStatus(second)
 	require.NoError(t, err)
-	require.Equal(t, reset, rs.Backfill.NextAttemptAt)
+	require.Equal(t, wantNext, rs.Backfill.NextAttemptAt)
 	require.Equal(t, 1, rs.Backfill.RetryCount, "a parked skip is not a failed attempt")
 }
 
@@ -636,4 +638,57 @@ func TestRetryRunner_DownloadTimeoutBoundsStalledFetch(t *testing.T) {
 	require.Equal(t, StatusFailed, rs.Backfill.Status)
 	require.Equal(t, 2, rs.Backfill.RetryCount, "timeout must be recorded as a failed attempt")
 	require.True(t, rs.Backfill.NextAttemptAt.After(now), "backoff must be scheduled")
+}
+
+// A PDS client whose getRepo quota a response reported spent defers the
+// candidate to the quota's reset without a request, rather than wait out
+// the window inside the download holding a retry worker.
+func TestRetryRunner_ParkedClientDefers(t *testing.T) {
+	t.Parallel()
+	st, writer, _ := newRetryTestWriter(t)
+	bs := newSeededStore(t, st, nil)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	const rosterHost = "pds-parked.example.com"
+	did := atmos.DID("did:plc:parked-client")
+
+	// The client tracks wall-clock resets, unlike the runner's injected now.
+	reset := time.Now().Add(time.Hour)
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("RateLimit-Limit", "6000")
+		w.Header().Set("RateLimit-Remaining", "0")
+		w.Header().Set("RateLimit-Reset", fmt.Sprintf("%d", reset.Unix()))
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"RepoNotFound"}`))
+	}))
+	t.Cleanup(srv.Close)
+	client := atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+		Host: srv.URL, HTTPClient: gt.Some(srv.Client()), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+		MaxRateLimitWait: gt.Some(2 * time.Hour),
+	}})
+	_, err := client.GetRepoStream(ctx, "did:plc:someoneelse", "")
+	require.Error(t, err)
+	until := client.GetRepoRateLimitedUntil()
+	require.False(t, until.IsZero())
+
+	require.NoError(t, bs.OnHost(ctx, atmosbackfill.HostInfo{Hostname: rosterHost, RelayStatus: "active"}))
+	require.NoError(t, bs.onDiscover(ctx, rosterHost, atmossync.ListReposEntry{DID: did, Active: true}))
+	require.NoError(t, bs.OnFail(ctx, did, rosterHost, errors.New("bootstrap rate limited"), 1))
+	runner, err := newRetryRunner(RetryConfig{
+		Store: st, Writer: writer, HTTPClient: srv.Client(), RelayURL: srv.URL,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Interval: time.Hour,
+		Workers: 1, HostWorkers: 1, MaxDelay: 24 * time.Hour, now: func() time.Time { return now },
+		NewHostClient: func(string) (*atmossync.Client, error) { return client, nil },
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, runner.processCandidate(ctx, retryCandidate{DID: did, Host: rosterHost, PDS: rosterHost}))
+	require.Equal(t, int64(1), hits.Load(), "a parked client sent getRepo")
+	require.True(t, runner.isHostParked(rosterHost, now))
+	rs, err := bs.readRepoStatus(did)
+	require.NoError(t, err)
+	require.Equal(t, until.UTC(), rs.Backfill.NextAttemptAt)
+	require.Zero(t, rs.Backfill.RetryCount, "a parked skip is not a failed attempt")
 }

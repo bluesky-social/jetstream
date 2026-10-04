@@ -36,10 +36,13 @@ type selectedReposConfig struct {
 
 const (
 	selectedDefaultMaxRetries        = 1
-	selectedDefaultRetryRateLimitMax = 1
+	selectedDefaultRetryRateLimitMax = atmosbackfill.DefaultRetryRateLimitMaxAttempts
 	selectedDefaultRetryBaseDelay    = time.Second
 	selectedDefaultRetryMaxDelay     = 30 * time.Second
-	selectedRetryRateLimitCeiling    = 30 * time.Second
+	// selectedRetryRateLimitCeiling bounds a server-directed wait. A PDS
+	// limits getRepo per five-minute window, so a 30s bound woke into a
+	// quota the host said was spent.
+	selectedRetryRateLimitCeiling = atmosbackfill.DefaultRateLimitMaxWait
 )
 
 var errSelectedOnCompleteRecorded = errors.New("selected repo backfill: OnComplete recording failed; handler already ran")
@@ -201,7 +204,8 @@ func (r *selectedRunner) processRepo(ctx context.Context, did atmos.DID) {
 }
 
 // selectedRateLimitDelay mirrors atmos's rateLimitDelay: honor the
-// server-directed reset (clamped), else exponential backoff on baseDelay.
+// server-directed reset (clamped), else exponential backoff on baseDelay up
+// to MaxServerDirectedDelay.
 func selectedRateLimitDelay(err error, baseDelay time.Duration, rlAttempt int, jitter jitterFunc) time.Duration {
 	if ra := xrpc.RetryAfter(err); !ra.IsZero() {
 		if wait := time.Until(ra); wait > 0 {
@@ -211,7 +215,7 @@ func selectedRateLimitDelay(err error, baseDelay time.Duration, rlAttempt int, j
 			return wait
 		}
 	}
-	delay := max(selectedBackoffDelay(baseDelay, selectedRetryRateLimitCeiling, rlAttempt-1, jitter), baseDelay)
+	delay := max(selectedBackoffDelay(baseDelay, xrpc.MaxServerDirectedDelay, rlAttempt-1, jitter), baseDelay)
 	return delay
 }
 
