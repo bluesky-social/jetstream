@@ -557,6 +557,10 @@ func storageFlags() []cli.Flag {
 			Sources: cli.EnvVars("JETSTREAM_HOT_PENDING_BYTES"), Value: int(def.Hot.PendingBytes),
 		},
 		&cli.IntFlag{
+			Name: "direct-max-pending-blocks", Category: cat, Usage: "Direct-mode blocks frozen but not committed, per writer",
+			Sources: cli.EnvVars("JETSTREAM_DIRECT_MAX_PENDING_BLOCKS"), Value: def.Direct.MaxPendingBlocks,
+		},
+		&cli.IntFlag{
 			Name: "hot-max-unfolded-events", Category: cat, Usage: "Committed-but-unfolded event cap",
 			Sources: cli.EnvVars("JETSTREAM_HOT_MAX_UNFOLDED_EVENTS"), Value: def.Hot.MaxUnfoldedEvents,
 		},
@@ -627,6 +631,9 @@ func storageConfigFromCommand(cmd *cli.Command) (jetstreamd.StorageConfig, strin
 			BulkPendingBytes:  int64(cmd.Int("hot-bulk-pending-bytes")),
 			PendingBytes:      int64(cmd.Int("hot-pending-bytes")),
 			MaxUnfoldedEvents: cmd.Int("hot-max-unfolded-events"),
+		},
+		Direct: jetstreamd.DirectConfig{
+			MaxPendingBlocks: cmd.Int("direct-max-pending-blocks"),
 		},
 		BlockMaxAge:                cmd.Duration("block-max-age"),
 		CatalogPollInterval:        cmd.Duration("catalog-poll-interval"),

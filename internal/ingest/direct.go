@@ -29,6 +29,12 @@ type SegmentSealer interface {
 	// of frame. A commit that landed anywhere but where the sealer expects
 	// is corruption.
 	Committed(c catalog.BlockCommit, ref catalog.ObjectRef, frame []byte) error
+	// BlocksBeforeRotation reports how many of the next blocks, given by
+	// their frame lengths in commit order, the active segment takes before
+	// the rotation rule fires: through the first that reaches the
+	// threshold, or all of them. A group commit stops there, so segments
+	// end on the same blocks as with one commit per block.
+	BlocksBeforeRotation(frameLens []int) int
 	// RotateIfFull seals once the active segment reaches the rotation
 	// threshold.
 	RotateIfFull(ctx context.Context) error
@@ -46,12 +52,13 @@ type DirectConfig struct {
 	// Sealer owns the namespace's active segment. It must have been opened
 	// in the same session, for the writer's namespace.
 	Sealer SegmentSealer
-	// UploadConcurrency bounds the writer's block uploads in flight.
-	UploadConcurrency int
-	// MaxPendingBlocks bounds the blocks frozen and not yet committed. An
-	// append waits for room before it appends anything; one AppendBatch
-	// may still freeze several blocks past it. Zero means twice
-	// UploadConcurrency.
+	// MaxCommitBlocks bounds the blocks one transaction commits (group
+	// commit). Zero means DefaultMaxCommitBlocks.
+	MaxCommitBlocks int
+	// MaxPendingBlocks bounds the blocks frozen and not yet committed, and
+	// so the writer's uploads in flight. An append waits for room before it
+	// appends anything; one AppendBatch may still freeze several blocks
+	// past it. Zero means DefaultMaxPendingBlocks.
 	MaxPendingBlocks int
 	// Crash is the test-only crash seam injector. Nil in production.
 	Crash crashpoint.Injector
@@ -83,7 +90,7 @@ func (c *Config) validateDirect() error {
 		return fmt.Errorf("%w: direct mode takes neither AsyncFlushWorkers nor Catalog", ErrInvalidConfig)
 	case c.MaxEventsPerBlock < 0 || c.ReadLogRetentionBytes < 0:
 		return fmt.Errorf("%w: MaxEventsPerBlock and ReadLogRetentionBytes must be >= 0", ErrInvalidConfig)
-	case d.UploadConcurrency < 0 || d.MaxPendingBlocks < 0:
+	case d.MaxPendingBlocks < 0 || d.MaxCommitBlocks < 0:
 		return fmt.Errorf("%w: Direct limits must be >= 0", ErrInvalidConfig)
 	}
 	if _, err := segment.NewBlockBuilder(c.MaxEventsPerBlock); err != nil {
@@ -92,23 +99,52 @@ func (c *Config) validateDirect() error {
 	return nil
 }
 
+// DefaultMaxCommitBlocks is DirectConfig.MaxCommitBlocks' default. It only
+// bounds the size of one transaction: a group is what is ready when the
+// committer gets to it, which MaxPendingBlocks already bounds, except
+// behind an AppendBatch that froze many blocks at once.
+const DefaultMaxCommitBlocks = 64
+
+// DefaultMaxPendingBlocks is DirectConfig.MaxPendingBlocks' default. The
+// blocks in flight set the writer's throughput: each spends an upload, with
+// its objects transaction, and a group commit between freeze and commit, so
+// the writer commits about MaxPendingBlocks blocks per that latency. With
+// 16ms to PostgreSQL, storagebench bootstrap committed 630k events/s at 32,
+// 1.03M at 64, and 1.44M at 128. A pop2 backfill block uploads about
+// 320KB, so 64 in flight cost little beside the repos waiting to append.
+const DefaultMaxPendingBlocks = 64
+
 func (d *DirectConfig) applyDefaults() {
-	d.UploadConcurrency = cmp.Or(d.UploadConcurrency, DefaultUploadConcurrency)
-	d.MaxPendingBlocks = cmp.Or(d.MaxPendingBlocks, 2*d.UploadConcurrency)
+	d.MaxPendingBlocks = cmp.Or(d.MaxPendingBlocks, DefaultMaxPendingBlocks)
+	d.MaxCommitBlocks = cmp.Or(d.MaxCommitBlocks, DefaultMaxCommitBlocks)
 }
 
 // directWriter is the Writer in direct mode (design §10.6): local mode's
 // block flush pointed at the object store and the catalog. Appends assign
 // seqs and fill one open block. A full block, or one a Flush, DrainDurability,
-// ForceRotate, or Close cuts, is frozen: a goroutine encodes and uploads it,
-// several at a time. One committer goroutine commits frozen blocks strictly
-// in seq order, one CommitBlock each carrying the DurableBatchHook's output,
-// then releases what waits on the block and applies the rotation rule.
+// ForceRotate, or Close cuts, is frozen: a goroutine encodes and uploads it.
+// Every frozen block uploads at once: MaxPendingBlocks bounds them, the
+// object store bounds its PUTs process-wide, and concurrent uploads share
+// their objects transactions (catalog.Session.BeginUploads). A writer
+// bound of its own, held through the objects transaction an upload waits
+// for, would cap the blocks in flight below MaxPendingBlocks. One committer
+// goroutine commits frozen blocks strictly in seq order, carrying the
+// DurableBatchHook's output, then releases what waits on the blocks and
+// applies the rotation rule.
 //
 // A stager goroutine feeds the committer the queue in order, running the
-// hook for each block and checkpoint first. It runs one item ahead, so a
-// block's hook overlaps the previous block's commit: the backfill hook reads
-// the catalog, and a commit is several WAN round trips.
+// hook for each item first. It runs one item ahead, so an item's hook
+// overlaps the previous item's commit: the backfill hook reads the catalog,
+// and a commit is two WAN round trips.
+//
+// Blocks commit in groups (group commit): the stager takes, with a block,
+// every block queued behind it whose upload has finished, and the committer
+// commits them in one transaction. Every leader transaction serializes on
+// the fence row, so a block per transaction capped pop2's backfill at about
+// one block per transaction latency. A writer with a
+// DurableBatchPrepareValue commits one block per transaction: every sample
+// must reach the hook, and a hook may hold only one batch open while the
+// next is staged (Writer.PipelinesDurableBatches).
 type directWriter struct {
 	cfg     *Config
 	direct  *DirectConfig
@@ -120,7 +156,6 @@ type directWriter struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	uploads  chan struct{} // upload concurrency semaphore
 	encoders sync.WaitGroup
 	wake     chan struct{} // stager: queue grew
 	// staged hands items from the stager to the committer. It is
@@ -170,10 +205,14 @@ type directItem struct {
 }
 
 // stagedItem is a queue entry the stager hands the committer, with the
-// hook's output for a block or a checkpoint.
+// hook's output for a block group or a checkpoint.
 type stagedItem struct {
 	directItem
-	batch *stagedBatch // nil when the hook did not run
+	// blocks is the group a block item starts: the block, then the blocks
+	// that follow it in the queue, all uploaded. The group commits in
+	// order, and the batch with its last block.
+	blocks []*directBlock
+	batch  *stagedBatch // nil when the hook did not run
 }
 
 // stagedBatch is one hook call's output. The committer ends each batch it
@@ -222,7 +261,6 @@ func openDirect(cfg Config) (*Writer, error) {
 		logger:    w.cfg.Logger,
 		ctx:       ctx,
 		cancel:    cancel,
-		uploads:   make(chan struct{}, dc.UploadConcurrency),
 		wake:      make(chan struct{}, 1),
 		staged:    make(chan stagedItem),
 		nextSeq:   next,
@@ -443,14 +481,7 @@ func (d *directWriter) prepare(b *directBlock) {
 		b.err = err
 		return
 	}
-	select {
-	case d.uploads <- struct{}{}:
-	case <-d.ctx.Done():
-		b.err = d.ctx.Err()
-		return
-	}
 	refs, err := d.direct.Uploader.Upload(d.ctx, d.direct.Session, [][]byte{b.frame})
-	<-d.uploads
 	switch {
 	case err != nil:
 		b.err = fmt.Errorf("ingest: upload block [%d,%d]: %w", b.first, b.last(), err)
@@ -475,10 +506,15 @@ func (d *directWriter) stageLoop() {
 		switch {
 		case it.block != nil:
 			<-it.block.ready
+			s.blocks = []*directBlock{it.block}
 			if it.block.err != nil {
 				stopped = true
 			} else if !stopped && d.failure() == nil {
-				s.batch = d.stage(it.block.last()+1, false, it.block.prepareValue)
+				if d.cfg.DurableBatchPrepareValue == nil {
+					s.blocks = d.dequeueUploaded(s.blocks)
+				}
+				last := s.blocks[len(s.blocks)-1]
+				s.batch = d.stage(last.last()+1, false, last.prepareValue)
 			}
 		case it.meta != nil:
 			if !stopped && d.failure() == nil {
@@ -547,13 +583,41 @@ func (d *directWriter) commit(s stagedItem) error {
 	}
 	switch {
 	case s.block != nil:
-		return d.commitBlock(s.block, s.batch)
+		return d.commitBlocks(s.blocks, s.batch)
 	case s.meta != nil:
 		return d.commitMeta(s.batch)
 	case s.seal:
 		return d.direct.Sealer.Seal(d.ctx)
 	}
 	return nil
+}
+
+// dequeueUploaded appends to group the blocks at the head of the queue whose
+// uploads finished without error, up to MaxCommitBlocks. It never waits: a
+// group is what is ready when the stager gets to it.
+func (d *directWriter) dequeueUploaded(group []*directBlock) []*directBlock {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for len(group) < d.direct.MaxCommitBlocks && len(d.queue) > 0 {
+		b := d.queue[0].block
+		if b == nil || !uploaded(b) {
+			break
+		}
+		d.queue[0] = directItem{}
+		d.queue = d.queue[1:]
+		group = append(group, b)
+	}
+	return group
+}
+
+// uploaded reports whether b's prepare finished without error.
+func uploaded(b *directBlock) bool {
+	select {
+	case <-b.ready:
+		return b.err == nil
+	default:
+		return false
+	}
 }
 
 func (d *directWriter) dequeue() directItem {
@@ -577,83 +641,114 @@ func (d *directWriter) hook() DurableBatchHook {
 	return d.cfg.OnDurableBatch
 }
 
-// commitBlock is design §10.6 steps 3-5 for one block: the block
+// commitBlocks is design §10.6 steps 3-5 for a group of blocks: the block
 // transaction with the hook's metadata, then the hook's callbacks and the
-// durable watermark, then the rotation rule. The rule also runs before the
-// commit: an earlier session may have committed the block that crossed the
-// threshold and ended before its seal.
-func (d *directWriter) commitBlock(b *directBlock, sb *stagedBatch) error {
-	if b.err != nil {
+// durable watermark, then the rotation rule. The group commits in one
+// transaction, or one per segment when the rotation rule fires inside it,
+// with the metadata in the last. The rule also runs before the commit: an
+// earlier session may have committed the block that crossed the threshold
+// and ended before its seal.
+func (d *directWriter) commitBlocks(bs []*directBlock, sb *stagedBatch) (err error) {
+	if bs[0].err != nil {
 		// The stager staged nothing for it.
-		return b.err
+		return bs[0].err
 	}
-	return obs.Span(d.ctx, func(ctx context.Context) error {
-		trace.SpanFromContext(ctx).SetAttributes(
-			attribute.String("namespace", string(d.cfg.Namespace)),
-			attribute.Int64("first_seq", int64(b.first)),
-			attribute.Int("events", len(b.events)))
-		res, err := d.commitStaged(ctx, b, sb)
-		if err != nil {
+	// afterDone reports only whether the batch committed: a failure after
+	// its transaction landed fails the writer, not the batch.
+	batchCommitted := false
+	defer func() {
+		if !batchCommitted {
 			sb.done(err)
+		}
+	}()
+	if sb != nil && sb.err != nil {
+		return fmt.Errorf("ingest: on_durable_batch: %w", sb.err)
+	}
+	ctx := d.ctx
+	for len(bs) > 0 {
+		if err := d.crash(crashpoint.AfterDirectBlockUploadBeforeCommit); err != nil {
 			return err
 		}
-		// afterDone reports only the commit's outcome: a failure after the
-		// commit landed fails the writer, not the batch.
-		defer sb.done(nil)
-		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("revision", int64(res.Revision)))
+		if err := d.direct.Sealer.RotateIfFull(ctx); err != nil {
+			return err
+		}
+		lens := make([]int, len(bs))
+		for i, b := range bs {
+			lens[i] = len(b.frame)
+		}
+		n := max(1, d.direct.Sealer.BlocksBeforeRotation(lens))
+		part := bs[:min(n, len(bs))]
+		bs = bs[len(part):]
+		var batch *stagedBatch
+		if len(bs) == 0 {
+			batch = sb
+		}
+		if err := d.commitPart(ctx, part, batch); err != nil {
+			return err
+		}
+		if batch != nil {
+			batchCommitted = true
+			if batch.afterCommit != nil {
+				batch.afterCommit()
+			}
+			// Done before the rotation rule: the next group's hook may be
+			// waiting on this batch (the backfill hook waits for the write
+			// staged ahead of its own), and a seal would hold it up.
+			batch.done(nil)
+		}
+		if err := d.direct.Sealer.RotateIfFull(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// commitPart commits consecutive blocks in one transaction, with sb's
+// metadata if sb is not nil, and records them with the sealer and the
+// durable watermark.
+func (d *directWriter) commitPart(ctx context.Context, bs []*directBlock, sb *stagedBatch) error {
+	first, last := bs[0], bs[len(bs)-1]
+	return obs.Span(ctx, func(ctx context.Context) error {
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.String("namespace", string(d.cfg.Namespace)),
+			attribute.Int64("first_seq", int64(first.first)),
+			attribute.Int64("last_seq", int64(last.last())),
+			attribute.Int("blocks", len(bs)))
+		blocks := make([]catalog.Block, len(bs))
+		for i, b := range bs {
+			blocks[i] = catalog.Block{Namespace: d.cfg.Namespace, Info: b.info, Object: b.ref}
+		}
+		if sb != nil {
+			blocks[len(blocks)-1].Meta = sb.ops.Ops()
+		}
+		res, err := d.direct.Session.CommitBlocks(ctx, blocks)
+		if err != nil {
+			return fmt.Errorf("ingest: commit blocks [%d,%d]: %w", first.first, last.last(), err)
+		}
+		d.cfg.Metrics.observeDirectCommitBlocks(len(bs))
+		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("revision", int64(res[0].Revision)))
 		if err := d.crash(crashpoint.AfterDirectBlockCommitBeforeAck); err != nil {
 			return err
 		}
-		if err := d.direct.Sealer.Committed(res, b.ref, b.frame); err != nil {
-			return err
+		for i, b := range bs {
+			if err := d.direct.Sealer.Committed(res[i], b.ref, b.frame); err != nil {
+				return err
+			}
 		}
-		d.committed(b)
-		if sb != nil && sb.afterCommit != nil {
-			sb.afterCommit()
-		}
-		// Done before the rotation rule: the next block's hook may be
-		// waiting on this batch (the backfill hook waits for the write
-		// staged ahead of its own), and a seal would hold it up.
-		sb.done(nil)
-		d.cfg.Metrics.incBlocksFlushed()
-		return d.direct.Sealer.RotateIfFull(ctx)
+		d.committed(bs)
+		d.cfg.Metrics.addBlocksFlushed(len(bs))
+		return nil
 	})
 }
 
-// commitStaged applies the rotation rule and commits b with sb's metadata.
-func (d *directWriter) commitStaged(ctx context.Context, b *directBlock, sb *stagedBatch) (catalog.BlockCommit, error) {
-	if err := d.crash(crashpoint.AfterDirectBlockUploadBeforeCommit); err != nil {
-		return catalog.BlockCommit{}, err
-	}
-	if err := d.direct.Sealer.RotateIfFull(ctx); err != nil {
-		return catalog.BlockCommit{}, err
-	}
-	var meta []metastore.Op
-	if sb != nil {
-		if sb.err != nil {
-			return catalog.BlockCommit{}, fmt.Errorf("ingest: on_durable_batch: %w", sb.err)
-		}
-		meta = sb.ops.Ops()
-	}
-	res, err := d.direct.Session.CommitBlock(ctx, catalog.Block{
-		Namespace: d.cfg.Namespace,
-		Info:      b.info,
-		Object:    b.ref,
-		Meta:      meta,
-	})
-	if err != nil {
-		return res, fmt.Errorf("ingest: commit block [%d,%d]: %w", b.first, b.last(), err)
-	}
-	return res, nil
-}
-
-// committed advances the durable watermark past b and releases its room
-// under MaxPendingBlocks.
-func (d *directWriter) committed(b *directBlock) {
-	d.readLog.advanceDurable(b.last() + 1)
+// committed advances the durable watermark past bs and releases their room
+// under MaxPendingBlocks. One signal is enough: the append it wakes wakes
+// the next if it left room.
+func (d *directWriter) committed(bs []*directBlock) {
+	d.readLog.advanceDurable(bs[len(bs)-1].last() + 1)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.pending--
+	d.pending -= len(bs)
 	d.room.signal()
 }
 

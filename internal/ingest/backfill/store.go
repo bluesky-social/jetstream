@@ -229,6 +229,15 @@ func (s *Store) SetCompletionBatcher(b *completionBatcher) {
 	s.completions = b
 }
 
+// SetWriterPipelines tells the store whether its segment writer runs the
+// durable batch hook while the batch before it commits
+// (ingest.Writer.PipelinesDurableBatches): the hook guard then admits one
+// batch staged ahead. Run sets it; a caller that wires the completion
+// batcher to a writer itself must too, before the writer's first batch.
+func (s *Store) SetWriterPipelines(pipelines bool) {
+	s.hookAhead = pipelines
+}
+
 // Lookup reads repo/<did> and projects the on-disk RepoStatus into
 // atmos's StoreEntry shape. A missing row returns StateUnknown — that's
 // how atmos tells the engine to fire OnDiscover.

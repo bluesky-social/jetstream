@@ -1,8 +1,8 @@
 mutant: m070_direct_block_seq_check_skipped
 target: internal/catalog/scripts.go
 failure-mode: |
-  CommitBlock, the direct-mode block transaction, no longer locks and
-  checks its namespace's seq key against the block's first seq (design
+  CommitBlocks, the direct-mode block transaction, no longer locks and
+  checks its namespace's seq key against the group's first seq (design
   §10.6). A leader whose in-memory seq diverged from the catalog would
   commit a block that overlaps or skips the committed range, and the script
   overwrites the seq key anyway.
@@ -18,13 +18,13 @@ tiers: disagg
 diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
 --- a/internal/catalog/scripts.go
 +++ b/internal/catalog/scripts.go
-@@ -470,9 +470,6 @@
- 	var out BlockCommit
- 	seq, br := seqRead(b.Namespace), newBlockReads(b)
+@@ -504,9 +504,6 @@
+ 	out := make([]BlockCommit, len(bs))
+ 	seq, br := seqRead(first.Namespace), newBlockReads(bs...)
  	rev, err := s.run(ctx, TxBlock, append([]Read{seq}, br.reads()...), func(tx Tx, rev uint64) error {
--		if err := checkSeq(seq, b.Info.MinSeq); err != nil {
+-		if err := checkSeq(seq, first.Info.MinSeq); err != nil {
 -			return err
 -		}
- 		if err := insertActiveBlock(ctx, tx, rev, b, br, &out); err != nil {
+ 		if err := insertActiveBlocks(ctx, tx, rev, bs, br, out); err != nil {
  			return err
  		}

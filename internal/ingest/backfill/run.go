@@ -115,7 +115,7 @@ func Run(ctx context.Context, cfg Config) error {
 		st.afterComplete = cfg.AfterRepoComplete
 		st.afterCompleteError = recordFatal
 		st.crashInjector = cfg.CrashInjector
-		st.hookAhead = cfg.Writer.PipelinesDurableBatches()
+		st.SetWriterPipelines(cfg.Writer.PipelinesDurableBatches())
 		completions := NewCompletionBatcher(st, cfg.Metrics)
 		st.SetCompletionBatcher(completions)
 		cfg.Writer.SetDurableBatchHook(completions.StageDurable)

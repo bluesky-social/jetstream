@@ -331,6 +331,157 @@ func TestScripts_DirectBlockCommit(t *testing.T) {
 	})
 }
 
+// directBlock encodes events [lo, hi] and uploads them, as a pending ref
+// the commit makes available.
+func (h *harness) directBlock(ns catalog.Namespace, lo, hi uint64, meta ...metastore.Op) catalog.Block {
+	h.t.Helper()
+	frame, info := block(h.t, lo, hi)
+	return catalog.Block{Namespace: ns, Info: info, Object: h.object(frame), Meta: meta}
+}
+
+// A direct group commit is one transaction: the blocks take consecutive
+// ordinals after the active segment's last, every row shares the revision,
+// the blocks' metadata applies in block order (last write wins), and the
+// seq key moves once, past the last block.
+func TestScripts_CommitBlocksGroup(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		first, err := h.s.CommitBlock(ctx, h.directBlock(catalog.Main, 1, 2))
+		require.NoError(t, err)
+		cursor := func(v string) metastore.Op {
+			return metastore.Op{Kind: metastore.OpSet, Key: []byte("relay/cursor"), Value: []byte(v)}
+		}
+		bs := []catalog.Block{
+			h.directBlock(catalog.Main, 3, 5, cursor("1")),
+			h.directBlock(catalog.Main, 6, 6),
+			h.directBlock(catalog.Main, 7, 9, cursor("3"), metastore.Op{Kind: metastore.OpSet, Key: []byte("other"), Value: []byte("x")}),
+		}
+		out, err := h.s.CommitBlocks(ctx, bs)
+		require.NoError(t, err)
+		require.Len(t, out, 3)
+		require.Greater(t, out[0].Revision, first.Revision)
+		for i, c := range out {
+			require.Equal(t, out[0].Revision, c.Revision, "one transaction")
+			require.Equal(t, uint64(0), c.Segment)
+			require.Equal(t, i+1, c.Ordinal)
+			require.Equal(t, bs[i].Object.ID, c.ObjectID)
+		}
+		v, _ := h.meta(catalog.MainSeqKey)
+		require.Equal(t, catalog.EncodeSeq(10), v)
+		v, _ = h.meta("relay/cursor")
+		require.Equal(t, "3", string(v))
+		_, found := h.meta("other")
+		require.True(t, found)
+
+		snap, err := h.snapshot()
+		require.NoError(t, err)
+		require.Len(t, snap.ActiveBlocks, 4)
+		for i, r := range snap.ActiveBlocks[1:] {
+			require.Equal(t, bs[i].Info.MinSeq, r.MinSeq)
+			require.Equal(t, out[0].Revision, r.Revision)
+		}
+		require.Equal(t, map[catalog.ObjectState]int64{catalog.ObjectAvailable: 4}, h.objectStates(),
+			"the group made every pending upload available")
+		_, err = h.s.CommitBlock(ctx, h.directBlock(catalog.Main, 10, 10))
+		require.NoError(t, err)
+		require.NoError(t, h.s.Err())
+	})
+}
+
+// A group that does not tile, spans namespaces, or is empty is rejected
+// before any transaction and ends the session.
+func TestScripts_CommitBlocksRejects(t *testing.T) {
+	t.Parallel()
+	for name, spans := range map[string][][2]uint64{
+		"empty":   nil,
+		"gap":     {{1, 2}, {4, 4}},
+		"overlap": {{1, 2}, {2, 3}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			eachBackend(t, func(t *testing.T, be backend) {
+				h := newHarness(t, be)
+				var bs []catalog.Block
+				for _, sp := range spans {
+					bs = append(bs, h.directBlock(catalog.Main, sp[0], sp[1]))
+				}
+				_, err := h.s.CommitBlocks(t.Context(), bs)
+				require.Error(t, err)
+				require.Error(t, h.s.Err(), "a rejected script ends the session")
+				snap, err := h.snapshot()
+				require.NoError(t, err)
+				require.Empty(t, snap.ActiveBlocks)
+			})
+		})
+	}
+	t.Run("namespaces", func(t *testing.T) {
+		t.Parallel()
+		eachBackend(t, func(t *testing.T, be backend) {
+			h := newHarness(t, be)
+			_, err := h.s.InitNamespace(t.Context(), catalog.BootstrapLive, nil)
+			require.NoError(t, err)
+			_, err = h.s.CommitBlocks(t.Context(), []catalog.Block{
+				h.directBlock(catalog.Main, 1, 2), h.directBlock(catalog.BootstrapLive, 3, 3),
+			})
+			require.Error(t, err)
+			require.Error(t, h.s.Err())
+		})
+	})
+}
+
+// Any block of a group failing its checks fails the whole group: nothing
+// commits, not even the blocks before it.
+func TestScripts_CommitBlocksAllOrNothing(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		for name, tc := range map[string]struct {
+			mutate func(h *harness, bs []catalog.Block)
+			source string
+		}{
+			"missing reference": {func(h *harness, bs []catalog.Block) { bs[2].Object = catalog.ObjectRef{ID: 1 << 40} }, catalog.SourceRef},
+			"seq mismatch": {func(h *harness, bs []catalog.Block) {
+				_, err := h.s.CommitBlock(h.t.Context(), h.directBlock(catalog.Main, 1, 1))
+				require.NoError(h.t, err)
+			}, catalog.SourceSeq},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				h := newHarness(t, be)
+				bs := []catalog.Block{h.directBlock(catalog.Main, 1, 2), h.directBlock(catalog.Main, 3, 4), h.directBlock(catalog.Main, 5, 5)}
+				tc.mutate(h, bs)
+				before, err := h.snapshot()
+				require.NoError(t, err)
+				_, err = h.s.CommitBlocks(t.Context(), bs)
+				requireCorruption(t, err, tc.source)
+				after, err := h.snapshot()
+				require.NoError(t, err)
+				require.Equal(t, before.ActiveBlocks, after.ActiveBlocks, "nothing in the group committed")
+				require.Equal(t, before.Meta, after.Meta)
+			})
+		}
+	})
+}
+
+// A group's first block must continue the active segment's last block,
+// as a single block must.
+func TestScripts_CommitBlocksDiscontinuity(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		_, err := h.s.CommitBlock(ctx, h.directBlock(catalog.Main, 1, 2))
+		require.NoError(t, err)
+		// The seq key agrees with the group; the active segment does not.
+		_, err = h.s.CommitMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte(catalog.MainSeqKey), Value: catalog.EncodeSeq(4)}})
+		require.NoError(t, err)
+		h.violationOK = true
+		_, err = h.s.CommitBlocks(ctx, []catalog.Block{h.directBlock(catalog.Main, 4, 4), h.directBlock(catalog.Main, 5, 6)})
+		requireCorruption(t, err, catalog.SourceInvariant)
+	})
+}
+
 // InitNamespace is idempotent, and applies its metadata whether or not it
 // created the segment: the orchestrator's first phase write rides on it.
 func TestScripts_InitNamespaceIdempotent(t *testing.T) {

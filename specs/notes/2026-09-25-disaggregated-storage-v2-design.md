@@ -876,8 +876,9 @@ Rules:
    before any of its events lands returns its permits at once.
 7. **Upload concurrency.** At most `JETSTREAM_S3_UPLOAD_CONCURRENCY` (default 8)
    uploads run at once, across all writer and maintainer work. The process-wide
-   bound is the blob store's PUT limit. The writer separately bounds its
-   in-flight uploads, at the same default. A bulk chunk also waits while as
+   bound is the blob store's PUT limit. The hot writer separately bounds its
+   in-flight uploads, at the same default. The direct writer does not: its
+   pending-block cap bounds them (§10.6). A bulk chunk also waits while as
    many bulk batches are frozen and uncommitted as the writer may upload at
    once. Uploads beyond that only queue, and every live batch frozen behind
    them waits for them to commit (§22.2).
@@ -925,15 +926,16 @@ Direct mode is local mode's block flush, pointed at S3 and PostgreSQL:
    blocks/s at about 740 events per block. On a disk-backed PostgreSQL the
    fence leaves bootstrap far less than that, because discovery takes most of
    the leader's transactions (§22.3).
-3. Commit blocks strictly in order, one transaction each:
+3. Commit blocks strictly in order. One transaction commits consecutive
+   blocks that are ready together (group commit, see "As built"):
 
 ```
 BEGIN
   fence
-  check seq key == block.min_seq (FOR UPDATE)
-  reference check on block.object_id
-  INSERT INTO active_segment_blocks (..., ordinal = next ordinal, revision = rev)
-  apply metadata batch: seq key = block.max_seq + 1, plus DurableBatchHook output
+  check seq key == first block.min_seq (FOR UPDATE)
+  reference check on every block.object_id
+  INSERT INTO active_segment_blocks (..., ordinal = next ordinals, revision = rev)
+  apply metadata batch: seq key = last block.max_seq + 1, plus DurableBatchHook output
 COMMIT
 ```
 
@@ -953,14 +955,30 @@ As built (S3.1, `internal/ingest/direct.go`):
   is always the namespace's (`catalog.SeqKey`), and the local-only fields are
   refused.
 - The writer does its own encode and upload, as the hot writer does, instead of
-  reusing `AsyncFlushWorkers`. Frozen blocks encode and upload concurrently, up
-  to `UploadConcurrency`. One committer goroutine commits them in seq order.
-  A stager goroutine ahead of it runs the DurableBatchHook for each block and
-  checkpoint in order, one item ahead, so a block's hook overlaps the previous
-  block's commit (`Writer.PipelinesDurableBatches`). The backfill hook reads
-  the catalog, which on pop2 was about 16% of the commit loop.
-- Admission: an append waits while `MaxPendingBlocks` blocks (default twice the
-  upload concurrency) are frozen but not committed. It waits before it appends
+  reusing `AsyncFlushWorkers`. Frozen blocks encode and upload concurrently, all
+  of them at once: the blob store bounds PUTs process-wide (rule 7), and
+  concurrent uploads share their objects transactions (§7.3 step 3). One
+  committer goroutine commits them in seq order.
+  A stager goroutine ahead of it runs the DurableBatchHook for each item in
+  order, one item ahead, so an item's hook overlaps the previous item's
+  commit (`Writer.PipelinesDurableBatches`). The backfill hook reads the
+  catalog, which on pop2 was about 16% of the commit loop.
+- Group commit: the stager takes, with a block, every block queued behind it
+  whose upload has finished (at most `MaxCommitBlocks`, default 64), runs the
+  hook once for the group with nextSeq past its last block, and the
+  committer commits the group in one transaction (`Session.CommitBlocks`).
+  It never waits for more blocks: a group is what is ready when the stager
+  gets to it, so groups grow with load. On pop2 at v0.3.4 the committer ran
+  one block per transaction, about 26 blocks/s at a 38ms block transaction,
+  while about 1,500 backfill appends waited for room. A writer with a
+  `DurableBatchPrepareValue` still commits one block per transaction: every
+  sample must reach the hook, and the hook may hold only one batch open
+  while the next is staged. Only the backfill writer, which has no sampler,
+  needs the throughput. `jetstream_ingest_direct_commit_blocks` is the
+  blocks per transaction.
+- Admission: an append waits while `MaxPendingBlocks` blocks
+  (`JETSTREAM_DIRECT_MAX_PENDING_BLOCKS`, default 64) are frozen but not
+  committed. It waits before it appends
   anything, so an `AppendBatch` still gets contiguous seqs. Waiting appends take
   turns in arrival order. Each commit wakes only the oldest, and each append
   wakes the next if it left room. A broadcast to about 500 waiting backfill
@@ -971,7 +989,11 @@ As built (S3.1, `internal/ingest/direct.go`):
   seals with in hot mode. The committer is its only caller, so seals serialize
   with block commits. The rotation rule runs after each block commit, and also
   before it. The earlier run covers an earlier session that committed the
-  threshold-crossing block and ended before its seal.
+  threshold-crossing block and ended before its seal. A group that reaches
+  the threshold commits in two transactions, split after the block that
+  reaches it, with the seal between them and the hook's metadata in the
+  second (`SegmentSealer.BlocksBeforeRotation`). Segments therefore end on
+  the same blocks as with one commit per block.
 - Flush and DrainDurability commit a short block and do not rotate unless the
   rule fires, as in local mode. ForceRotate and SealActiveAndClose seal the
   active segment. Close leaves it active: the next direct writer, or the hot
@@ -1955,6 +1977,7 @@ identity, instance role). There is no `JETSTREAM_S3_*` credential variable.
 | `JETSTREAM_HOT_BULK_PENDING_BYTES` | 64MiB | bulk permits |
 | `JETSTREAM_HOT_PENDING_BYTES` | 256MiB | total frozen-uncommitted cap |
 | `JETSTREAM_HOT_MAX_UNFOLDED_EVENTS` | 65536 | committed-but-unfolded cap |
+| `JETSTREAM_DIRECT_MAX_PENDING_BLOCKS` | 64 | direct-mode blocks frozen but not committed, per writer |
 | `JETSTREAM_CATALOG_POLL_INTERVAL` | 250ms | follower poll |
 | `JETSTREAM_MAX_VIEW_AGE` | 30s | not ready when the mirror is older |
 | `JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION` | 1h | archive response cutoff |

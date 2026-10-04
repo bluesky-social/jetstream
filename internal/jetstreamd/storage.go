@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/leader"
 	"github.com/bluesky-social/jetstream/internal/objstore/objcache"
 	"github.com/bluesky-social/jetstream/internal/objstore/s3"
@@ -55,6 +56,7 @@ type StorageConfig struct {
 	S3     S3Config
 	Leader LeaderConfig
 	Hot    HotConfig
+	Direct DirectConfig
 
 	// BlockMaxAge is the open-block age cut in hot mode.
 	BlockMaxAge time.Duration
@@ -116,6 +118,14 @@ type HotConfig struct {
 	MaxUnfoldedEvents int
 }
 
+// DirectConfig is JETSTREAM_DIRECT_*: the direct-mode writer's pipeline
+// depth during bootstrap (design §10.6).
+type DirectConfig struct {
+	// MaxPendingBlocks bounds each direct writer's blocks frozen and not
+	// yet committed, which sets its throughput.
+	MaxPendingBlocks int
+}
+
 // GCConfig is JETSTREAM_GC_*.
 type GCConfig struct {
 	Interval  time.Duration
@@ -147,6 +157,7 @@ func DefaultStorageConfig() StorageConfig {
 			PendingBytes:      DefaultHotPendingBytes,
 			MaxUnfoldedEvents: DefaultHotMaxUnfoldedEvents,
 		},
+		Direct:                     DirectConfig{MaxPendingBlocks: ingest.DefaultMaxPendingBlocks},
 		BlockMaxAge:                DefaultBlockMaxAge,
 		CatalogPollInterval:        DefaultCatalogPollInterval,
 		MaxViewAge:                 DefaultMaxViewAge,
@@ -199,15 +210,16 @@ func (c StorageConfig) Validate(opts Options) error {
 		}
 	}
 	for name, v := range map[string]int64{
-		"JETSTREAM_PG_MAX_CONNS":             int64(c.PG.MaxConns),
-		"JETSTREAM_S3_UPLOAD_CONCURRENCY":    int64(c.S3.UploadConcurrency),
-		"JETSTREAM_S3_READ_CONCURRENCY":      int64(c.S3.ReadConcurrency),
-		"JETSTREAM_HOT_INLINE_BYTES_PER_SEC": c.Hot.InlineBytesPerSec,
-		"JETSTREAM_HOT_BULK_PENDING_BYTES":   c.Hot.BulkPendingBytes,
-		"JETSTREAM_HOT_PENDING_BYTES":        c.Hot.PendingBytes,
-		"JETSTREAM_HOT_MAX_UNFOLDED_EVENTS":  int64(c.Hot.MaxUnfoldedEvents),
-		"JETSTREAM_OBJECT_CACHE_BYTES":       c.ObjectCacheBytes,
-		"JETSTREAM_COMPACTION_MEMORY_BYTES":  c.CompactionMemoryBytes,
+		"JETSTREAM_PG_MAX_CONNS":              int64(c.PG.MaxConns),
+		"JETSTREAM_S3_UPLOAD_CONCURRENCY":     int64(c.S3.UploadConcurrency),
+		"JETSTREAM_S3_READ_CONCURRENCY":       int64(c.S3.ReadConcurrency),
+		"JETSTREAM_HOT_INLINE_BYTES_PER_SEC":  c.Hot.InlineBytesPerSec,
+		"JETSTREAM_HOT_BULK_PENDING_BYTES":    c.Hot.BulkPendingBytes,
+		"JETSTREAM_HOT_PENDING_BYTES":         c.Hot.PendingBytes,
+		"JETSTREAM_HOT_MAX_UNFOLDED_EVENTS":   int64(c.Hot.MaxUnfoldedEvents),
+		"JETSTREAM_DIRECT_MAX_PENDING_BLOCKS": int64(c.Direct.MaxPendingBlocks),
+		"JETSTREAM_OBJECT_CACHE_BYTES":        c.ObjectCacheBytes,
+		"JETSTREAM_COMPACTION_MEMORY_BYTES":   c.CompactionMemoryBytes,
 	} {
 		if v <= 0 {
 			return fmt.Errorf("serve: %s must be > 0, got %d", name, v)
@@ -279,6 +291,7 @@ func (c StorageConfig) LogValue() slog.Value {
 		slog.Int64("hot_bulk_pending_bytes", c.Hot.BulkPendingBytes),
 		slog.Int64("hot_pending_bytes", c.Hot.PendingBytes),
 		slog.Int("hot_max_unfolded_events", c.Hot.MaxUnfoldedEvents),
+		slog.Int("direct_max_pending_blocks", c.Direct.MaxPendingBlocks),
 		slog.Duration("block_max_age", c.BlockMaxAge),
 		slog.Duration("catalog_poll_interval", c.CatalogPollInterval),
 		slog.Duration("max_view_age", c.MaxViewAge),

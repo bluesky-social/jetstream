@@ -95,10 +95,12 @@ type Config struct {
 	// each afterDone. A hook must not assume that the next hook call means
 	// the previous batch failed; afterDone reports that.
 	//
-	// In direct mode the hook runs on its own goroutine, for each block and
-	// checkpoint in order, while the batch before it commits
-	// (Writer.PipelinesDurableBatches). Hook calls and callbacks never run
-	// under the writer mutex there.
+	// In direct mode the hook runs on its own goroutine, for each checkpoint
+	// and each group of blocks one transaction commits, in order, while the
+	// batch before it commits (Writer.PipelinesDurableBatches). nextSeq is
+	// past the group's last block. A writer with a DurableBatchPrepareValue
+	// commits one block per transaction, so the hook sees every sample. Hook
+	// calls and callbacks never run under the writer mutex there.
 	//
 	// force requests a checkpoint without a new block on DrainDurability,
 	// Close, or SealActiveAndClose. It does not make pending events

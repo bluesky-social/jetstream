@@ -186,6 +186,20 @@ func (s *Segment) Committed(c catalog.BlockCommit, ref catalog.ObjectRef, frame 
 	return nil
 }
 
+// BlocksBeforeRotation implements ingest.SegmentSealer: the blocks the
+// active segment takes, given their frame lengths, through the first that
+// takes its framed bytes to MaxSegmentBytes.
+func (s *Segment) BlocksBeforeRotation(frameLens []int) int {
+	framed := s.framed
+	for i, n := range frameLens {
+		framed += 8 + int64(n)
+		if framed >= s.cfg.MaxSegmentBytes {
+			return i + 1
+		}
+	}
+	return len(frameLens)
+}
+
 // RotateIfFull implements ingest.SegmentSealer: it seals once the framed
 // bytes reach MaxSegmentBytes, local mode's rotation rule.
 func (s *Segment) RotateIfFull(ctx context.Context) error {

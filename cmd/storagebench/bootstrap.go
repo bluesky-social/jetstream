@@ -37,7 +37,10 @@ session so they share the fence:
 
   - discovery: --hosts crawls, each calling the backfill store's Lookup and
     OnDiscover for every listed DID, as the atmos engine does. OnDiscover is
-    one metadata transaction per DID.
+    one metadata transaction per call, of --discover-batch DIDs (one by
+    default, to measure per-repo discovery latency). A large batch makes
+    discovery cheap, as it is once a real bootstrap has listed every host,
+    so the run measures the downloads.
   - downloads: --downloaders workers append each discovered repo to main in
     direct mode and complete it through the completion batcher, so
     completions ride in block commits.
@@ -50,6 +53,7 @@ deliver.`,
 		Flags: []cli.Flag{
 			&cli.DurationFlag{Name: "duration", Value: time.Minute},
 			&cli.IntFlag{Name: "hosts", Value: 8, Validator: atLeastOne[int], Usage: "Concurrent listRepos crawls"},
+			&cli.IntFlag{Name: "discover-batch", Value: 1, Validator: atLeastOne[int], Usage: "DIDs each crawl discovers per call"},
 			&cli.IntFlag{Name: "downloaders", Value: 16, Validator: atLeastOne[int]},
 			&cli.Float64Flag{Name: "bulk-rate", Usage: "Cap on repo events/s appended to main; zero is unpaced"},
 			&cli.Float64Flag{Name: "live-rate", Value: 330, Usage: "Live events/s into bootstrap_live"},
@@ -63,12 +67,12 @@ deliver.`,
 
 // bootstrapStats is what one bootstrap run measured.
 type bootstrapStats struct {
-	hosts, downloaders int
-	bulkRate, liveRate float64
-	pop1Repos          float64
+	hosts, downloaders, discoverBatch int
+	bulkRate, liveRate                float64
+	pop1Repos                         float64
 
 	txn                      *txnStats
-	discover                 samples // Lookup plus OnDiscover, per DID
+	discover                 samples // Lookup plus OnDiscover, per call
 	discovered, repos        atomic.Int64
 	bulk, live               atomic.Int64
 	mainBatches, liveBatches atomic.Int64
@@ -85,12 +89,13 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 
 	st := jetstreamd.DefaultStorageConfig()
 	stats := &bootstrapStats{
-		txn:         newTxnStats(),
-		pop1Repos:   float64(cmd.Uint64("pop1-repos")),
-		liveRate:    cmd.Float64("live-rate"),
-		bulkRate:    cmd.Float64("bulk-rate"),
-		hosts:       cmd.Int("hosts"),
-		downloaders: cmd.Int("downloaders"),
+		txn:           newTxnStats(),
+		pop1Repos:     float64(cmd.Uint64("pop1-repos")),
+		liveRate:      cmd.Float64("live-rate"),
+		bulkRate:      cmd.Float64("bulk-rate"),
+		hosts:         cmd.Int("hosts"),
+		downloaders:   cmd.Int("downloaders"),
+		discoverBatch: cmd.Int("discover-batch"),
 	}
 	var cur atomic.Pointer[txnStats]
 	cur.Store(newTxnStats()) // setup, not reported
@@ -186,11 +191,11 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 				return hook(ctx, mb, next, force, v)
 			},
 			Direct: &ingest.DirectConfig{
-				Session:           sess,
-				Uploader:          uploader,
-				Sealer:            sealer,
-				UploadConcurrency: st.S3.UploadConcurrency,
-				OnFailure:         onFailure,
+				Session:          sess,
+				Uploader:         uploader,
+				Sealer:           sealer,
+				MaxPendingBlocks: st.Direct.MaxPendingBlocks,
+				OnFailure:        onFailure,
 			},
 		})
 	}
@@ -198,6 +203,7 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	store.SetWriterPipelines(mainW.PipelinesDurableBatches())
 	closeMain := sync.OnceValue(mainW.Close)
 	defer func() { _ = closeMain() }()
 	// The cursor is sampled when the batch is cut, as the live consumer's is:
@@ -284,25 +290,35 @@ func driveBootstrap(ctx context.Context, cmd *cli.Command, stats *bootstrapStats
 	for _, host := range hosts {
 		g.Go(func() error {
 			for gctx.Err() == nil {
-				did := atmos.DID(didFor(next.Add(1)))
+				last := next.Add(uint64(stats.discoverBatch))
+				dids := make([]atmos.DID, stats.discoverBatch)
+				for i := range dids {
+					dids[i] = atmos.DID(didFor(last - uint64(len(dids)-1-i)))
+				}
 				start := time.Now()
-				// One DID per call: the bench measures per-repo discovery
-				// latency, not the engine's page batching.
-				recs, err := crawl.Lookup(gctx, []atmos.DID{did})
+				recs, err := crawl.Lookup(gctx, dids)
 				if err != nil {
 					return done(err)
 				}
-				if recs[0].State == atmosbackfill.StateUnknown {
-					if err := crawl.OnDiscover(gctx, host, []atmossync.ListReposEntry{{DID: did, Active: true}}); err != nil {
+				var fresh []atmossync.ListReposEntry
+				for i, rec := range recs {
+					if rec.State == atmosbackfill.StateUnknown {
+						fresh = append(fresh, atmossync.ListReposEntry{DID: dids[i], Active: true})
+					}
+				}
+				if len(fresh) > 0 {
+					if err := crawl.OnDiscover(gctx, host, fresh); err != nil {
 						return done(err)
 					}
 				}
 				stats.discover.add(time.Since(start))
-				stats.discovered.Add(1)
-				select {
-				case jobs <- job{did: did, host: host}:
-				case <-gctx.Done():
-					return nil
+				stats.discovered.Add(int64(len(dids)))
+				for _, did := range dids {
+					select {
+					case jobs <- job{did: did, host: host}:
+					case <-gctx.Done():
+						return nil
+					}
 				}
 			}
 			return nil
@@ -401,7 +417,7 @@ func reportBootstrap(out *os.File, s *bootstrapStats) {
 	rows := [][2]string{
 		{"duration", s.end.Sub(s.start).Round(time.Millisecond).String()},
 		{"discovered DIDs", rate(s.discovered.Load())},
-		{"discovery per DID", s.discover.summary().String()},
+		{fmt.Sprintf("discovery per %d DIDs", s.discoverBatch), s.discover.summary().String()},
 		{"repos appended", rate(s.repos.Load())},
 		{"bulk events", rate(s.bulk.Load())},
 		{"live events", rate(s.live.Load())},
