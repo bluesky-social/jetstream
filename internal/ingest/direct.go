@@ -52,15 +52,13 @@ type DirectConfig struct {
 	// Sealer owns the namespace's active segment. It must have been opened
 	// in the same session, for the writer's namespace.
 	Sealer SegmentSealer
-	// UploadConcurrency bounds the writer's block uploads in flight.
-	UploadConcurrency int
 	// MaxCommitBlocks bounds the blocks one transaction commits (group
 	// commit). Zero means DefaultMaxCommitBlocks.
 	MaxCommitBlocks int
-	// MaxPendingBlocks bounds the blocks frozen and not yet committed. An
-	// append waits for room before it appends anything; one AppendBatch
-	// may still freeze several blocks past it. Zero means twice
-	// UploadConcurrency.
+	// MaxPendingBlocks bounds the blocks frozen and not yet committed, and
+	// so the writer's uploads in flight. An append waits for room before it
+	// appends anything; one AppendBatch may still freeze several blocks
+	// past it. Zero means DefaultMaxPendingBlocks.
 	MaxPendingBlocks int
 	// Crash is the test-only crash seam injector. Nil in production.
 	Crash crashpoint.Injector
@@ -92,7 +90,7 @@ func (c *Config) validateDirect() error {
 		return fmt.Errorf("%w: direct mode takes neither AsyncFlushWorkers nor Catalog", ErrInvalidConfig)
 	case c.MaxEventsPerBlock < 0 || c.ReadLogRetentionBytes < 0:
 		return fmt.Errorf("%w: MaxEventsPerBlock and ReadLogRetentionBytes must be >= 0", ErrInvalidConfig)
-	case d.UploadConcurrency < 0 || d.MaxPendingBlocks < 0 || d.MaxCommitBlocks < 0:
+	case d.MaxPendingBlocks < 0 || d.MaxCommitBlocks < 0:
 		return fmt.Errorf("%w: Direct limits must be >= 0", ErrInvalidConfig)
 	}
 	if _, err := segment.NewBlockBuilder(c.MaxEventsPerBlock); err != nil {
@@ -107,19 +105,32 @@ func (c *Config) validateDirect() error {
 // behind an AppendBatch that froze many blocks at once.
 const DefaultMaxCommitBlocks = 64
 
+// DefaultMaxPendingBlocks is DirectConfig.MaxPendingBlocks' default. The
+// blocks in flight set the writer's throughput: each spends an upload, with
+// its objects transaction, and a group commit between freeze and commit, so
+// the writer commits about MaxPendingBlocks blocks per that latency. With
+// 16ms to PostgreSQL, storagebench bootstrap committed 630k events/s at 32,
+// 1.03M at 64, and 1.44M at 128. A pop2 backfill block uploads about
+// 320KB, so 64 in flight cost little beside the repos waiting to append.
+const DefaultMaxPendingBlocks = 64
+
 func (d *DirectConfig) applyDefaults() {
-	d.UploadConcurrency = cmp.Or(d.UploadConcurrency, DefaultUploadConcurrency)
-	d.MaxPendingBlocks = cmp.Or(d.MaxPendingBlocks, 2*d.UploadConcurrency)
+	d.MaxPendingBlocks = cmp.Or(d.MaxPendingBlocks, DefaultMaxPendingBlocks)
 	d.MaxCommitBlocks = cmp.Or(d.MaxCommitBlocks, DefaultMaxCommitBlocks)
 }
 
 // directWriter is the Writer in direct mode (design §10.6): local mode's
 // block flush pointed at the object store and the catalog. Appends assign
 // seqs and fill one open block. A full block, or one a Flush, DrainDurability,
-// ForceRotate, or Close cuts, is frozen: a goroutine encodes and uploads it,
-// several at a time. One committer goroutine commits frozen blocks strictly
-// in seq order, carrying the DurableBatchHook's output, then releases what
-// waits on the blocks and applies the rotation rule.
+// ForceRotate, or Close cuts, is frozen: a goroutine encodes and uploads it.
+// Every frozen block uploads at once: MaxPendingBlocks bounds them, the
+// object store bounds its PUTs process-wide, and concurrent uploads share
+// their objects transactions (catalog.Session.BeginUploads). A writer
+// bound of its own, held through the objects transaction an upload waits
+// for, would cap the blocks in flight below MaxPendingBlocks. One committer
+// goroutine commits frozen blocks strictly in seq order, carrying the
+// DurableBatchHook's output, then releases what waits on the blocks and
+// applies the rotation rule.
 //
 // A stager goroutine feeds the committer the queue in order, running the
 // hook for each item first. It runs one item ahead, so an item's hook
@@ -145,7 +156,6 @@ type directWriter struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	uploads  chan struct{} // upload concurrency semaphore
 	encoders sync.WaitGroup
 	wake     chan struct{} // stager: queue grew
 	// staged hands items from the stager to the committer. It is
@@ -251,7 +261,6 @@ func openDirect(cfg Config) (*Writer, error) {
 		logger:    w.cfg.Logger,
 		ctx:       ctx,
 		cancel:    cancel,
-		uploads:   make(chan struct{}, dc.UploadConcurrency),
 		wake:      make(chan struct{}, 1),
 		staged:    make(chan stagedItem),
 		nextSeq:   next,
@@ -472,14 +481,7 @@ func (d *directWriter) prepare(b *directBlock) {
 		b.err = err
 		return
 	}
-	select {
-	case d.uploads <- struct{}{}:
-	case <-d.ctx.Done():
-		b.err = d.ctx.Err()
-		return
-	}
 	refs, err := d.direct.Uploader.Upload(d.ctx, d.direct.Session, [][]byte{b.frame})
-	<-d.uploads
 	switch {
 	case err != nil:
 		b.err = fmt.Errorf("ingest: upload block [%d,%d]: %w", b.first, b.last(), err)

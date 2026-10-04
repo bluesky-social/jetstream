@@ -627,12 +627,12 @@ func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog
 			return nil, err
 		}
 		return &ingest.DirectConfig{
-			Session:           sess,
-			Uploader:          d.uploader,
-			Sealer:            sealer,
-			UploadConcurrency: st.S3.UploadConcurrency,
-			Crash:             r.opts.CrashInjector,
-			OnFailure:         onFailure,
+			Session:          sess,
+			Uploader:         d.uploader,
+			Sealer:           sealer,
+			MaxPendingBlocks: st.Direct.MaxPendingBlocks,
+			Crash:            r.opts.CrashInjector,
+			OnFailure:        onFailure,
 		}, nil
 	}
 

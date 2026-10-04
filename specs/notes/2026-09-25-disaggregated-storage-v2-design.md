@@ -876,8 +876,9 @@ Rules:
    before any of its events lands returns its permits at once.
 7. **Upload concurrency.** At most `JETSTREAM_S3_UPLOAD_CONCURRENCY` (default 8)
    uploads run at once, across all writer and maintainer work. The process-wide
-   bound is the blob store's PUT limit. The writer separately bounds its
-   in-flight uploads, at the same default. A bulk chunk also waits while as
+   bound is the blob store's PUT limit. The hot writer separately bounds its
+   in-flight uploads, at the same default. The direct writer does not: its
+   pending-block cap bounds them (§10.6). A bulk chunk also waits while as
    many bulk batches are frozen and uncommitted as the writer may upload at
    once. Uploads beyond that only queue, and every live batch frozen behind
    them waits for them to commit (§22.2).
@@ -954,8 +955,10 @@ As built (S3.1, `internal/ingest/direct.go`):
   is always the namespace's (`catalog.SeqKey`), and the local-only fields are
   refused.
 - The writer does its own encode and upload, as the hot writer does, instead of
-  reusing `AsyncFlushWorkers`. Frozen blocks encode and upload concurrently, up
-  to `UploadConcurrency`. One committer goroutine commits them in seq order.
+  reusing `AsyncFlushWorkers`. Frozen blocks encode and upload concurrently, all
+  of them at once: the blob store bounds PUTs process-wide (rule 7), and
+  concurrent uploads share their objects transactions (§7.3 step 3). One
+  committer goroutine commits them in seq order.
   A stager goroutine ahead of it runs the DurableBatchHook for each item in
   order, one item ahead, so an item's hook overlaps the previous item's
   commit (`Writer.PipelinesDurableBatches`). The backfill hook reads the
@@ -973,8 +976,9 @@ As built (S3.1, `internal/ingest/direct.go`):
   while the next is staged. Only the backfill writer, which has no sampler,
   needs the throughput. `jetstream_ingest_direct_commit_blocks` is the
   blocks per transaction.
-- Admission: an append waits while `MaxPendingBlocks` blocks (default twice the
-  upload concurrency) are frozen but not committed. It waits before it appends
+- Admission: an append waits while `MaxPendingBlocks` blocks
+  (`JETSTREAM_DIRECT_MAX_PENDING_BLOCKS`, default 64) are frozen but not
+  committed. It waits before it appends
   anything, so an `AppendBatch` still gets contiguous seqs. Waiting appends take
   turns in arrival order. Each commit wakes only the oldest, and each append
   wakes the next if it left room. A broadcast to about 500 waiting backfill
@@ -1973,6 +1977,7 @@ identity, instance role). There is no `JETSTREAM_S3_*` credential variable.
 | `JETSTREAM_HOT_BULK_PENDING_BYTES` | 64MiB | bulk permits |
 | `JETSTREAM_HOT_PENDING_BYTES` | 256MiB | total frozen-uncommitted cap |
 | `JETSTREAM_HOT_MAX_UNFOLDED_EVENTS` | 65536 | committed-but-unfolded cap |
+| `JETSTREAM_DIRECT_MAX_PENDING_BLOCKS` | 64 | direct-mode blocks frozen but not committed, per writer |
 | `JETSTREAM_CATALOG_POLL_INTERVAL` | 250ms | follower poll |
 | `JETSTREAM_MAX_VIEW_AGE` | 30s | not ready when the mirror is older |
 | `JETSTREAM_MAX_ARCHIVE_RESPONSE_DURATION` | 1h | archive response cutoff |

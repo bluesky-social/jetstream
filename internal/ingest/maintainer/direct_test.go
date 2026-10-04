@@ -266,7 +266,7 @@ func runDirectSwarm(t *testing.T, rng *rand.Rand) {
 	}
 	maxSegment := int64(1500 + rng.IntN(8000))
 	maxBlock := 1 + rng.IntN(16)
-	dc := ingest.DirectConfig{UploadConcurrency: 1 + rng.IntN(4), MaxPendingBlocks: rng.IntN(4), MaxCommitBlocks: rng.IntN(4)}
+	dc := ingest.DirectConfig{MaxPendingBlocks: rng.IntN(4), MaxCommitBlocks: rng.IntN(4)}
 	sampled := rng.IntN(2) == 0
 
 	var want []segment.Event
@@ -505,9 +505,8 @@ func TestDirect_CancelledWaitKeepsWriter(t *testing.T) {
 			return nil, nil, nil
 		},
 	}, ingest.DirectConfig{
-		UploadConcurrency: 1,
-		MaxPendingBlocks:  1,
-		OnFailure:         func(error) { failures.Add(1) },
+		MaxPendingBlocks: 1,
+		OnFailure:        func(error) { failures.Add(1) },
 	})
 
 	evs := testEvents(rng, 2*blockEvents)
@@ -558,7 +557,7 @@ func TestDirect_WaitingAppendsTakeTurns(t *testing.T) {
 			}
 			return nil, nil, nil
 		},
-	}, ingest.DirectConfig{UploadConcurrency: 1, MaxPendingBlocks: 1})
+	}, ingest.DirectConfig{MaxPendingBlocks: 1})
 
 	const waiters = 6
 	evs := testEvents(rng, (1+waiters)*blockEvents)
@@ -623,7 +622,7 @@ func TestDirect_WaitingAppendsReleasedOnCloseAndFailure(t *testing.T) {
 					}
 					return nil, nil, nil
 				},
-			}, ingest.DirectConfig{UploadConcurrency: 1, MaxPendingBlocks: 1, OnFailure: func(error) {}})
+			}, ingest.DirectConfig{MaxPendingBlocks: 1, OnFailure: func(error) {}})
 
 			const waiters = 4
 			evs := testEvents(rng, (1+waiters)*blockEvents)
@@ -696,7 +695,7 @@ func runWaitingAppendsSwarm(t *testing.T, rng *rand.Rand) {
 		cfg.DurableBatchPrepareValue = h.prepare
 	}
 	w := e.directWriter(catalog.Main, int64(2000+rng.IntN(8000)), cfg,
-		ingest.DirectConfig{UploadConcurrency: 1 + rng.IntN(2), MaxPendingBlocks: 1 + rng.IntN(2)})
+		ingest.DirectConfig{MaxPendingBlocks: 1 + rng.IntN(2)})
 
 	var mu sync.Mutex
 	var want []segment.Event
@@ -772,8 +771,7 @@ func TestDirect_CommitFailure(t *testing.T) {
 				OnAppend:                 h.onAppend,
 				DurableBatchPrepareValue: h.prepare,
 			}, ingest.DirectConfig{
-				UploadConcurrency: 1,
-				OnFailure:         func(error) { failures.Add(1) },
+				OnFailure: func(error) { failures.Add(1) },
 			})
 			rng := rand.New(rand.NewPCG(3, 3))
 			var appendErr error

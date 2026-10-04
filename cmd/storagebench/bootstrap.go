@@ -191,11 +191,11 @@ func runBootstrap(ctx context.Context, cmd *cli.Command) error {
 				return hook(ctx, mb, next, force, v)
 			},
 			Direct: &ingest.DirectConfig{
-				Session:           sess,
-				Uploader:          uploader,
-				Sealer:            sealer,
-				UploadConcurrency: st.S3.UploadConcurrency,
-				OnFailure:         onFailure,
+				Session:          sess,
+				Uploader:         uploader,
+				Sealer:           sealer,
+				MaxPendingBlocks: st.Direct.MaxPendingBlocks,
+				OnFailure:        onFailure,
 			},
 		})
 	}
