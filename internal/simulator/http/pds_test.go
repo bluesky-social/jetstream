@@ -201,7 +201,7 @@ func TestPDS_GetRepoResponseFaultServesXRPCBodyAndRateLimitHeaders(t *testing.T)
 	require.Equal(t, "RateLimitExceeded", xerr.Name)
 	require.Equal(t, "slow down", xerr.Message)
 	require.NotNil(t, xerr.RateLimit)
-	require.Equal(t, time.Unix(reset, 0), xerr.RateLimit.Reset)
+	require.Equal(t, time.Unix(reset+1, 0), xerr.RateLimit.Reset, "atmos rounds the floored second up")
 	require.Equal(t, 1, faults.GetRepoResponseFaultsFired(string(a.DID)))
 }
 

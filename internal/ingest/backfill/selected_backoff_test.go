@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	atmosbackfill "github.com/jcalabro/atmos/backfill"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -12,8 +13,8 @@ import (
 func TestSelectedRetryDefaultsAreBounded(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, 1, selectedDefaultMaxRetries)
-	assert.Equal(t, 1, selectedDefaultRetryRateLimitMax)
-	assert.Equal(t, 30*time.Second, selectedRetryRateLimitCeiling)
+	assert.Equal(t, atmosbackfill.DefaultRetryRateLimitMaxAttempts, selectedDefaultRetryRateLimitMax)
+	assert.Equal(t, atmosbackfill.DefaultRateLimitMaxWait, selectedRetryRateLimitCeiling)
 }
 
 // TestSelectedBackoffDelay_Deterministic shows an injected jitter makes the

@@ -320,6 +320,15 @@ func (r *retryRunner) processCandidate(ctx context.Context, cand retryCandidate)
 		r.cfg.Metrics.incRetrySkippedHostParked()
 		return r.store.DeferRetryAttempt(ctx, cand.DID, until)
 	}
+	if until := r.clientParkedUntil(cand.PDS); !until.IsZero() {
+		// The PDS client has getRepo parked on a quota a response reported
+		// spent. The download would wait that out holding this worker and
+		// the host slot for up to a rate-limit window; park the host and
+		// defer instead, as after a 429.
+		r.parkHost(cand.Host, until)
+		r.cfg.Metrics.incRetrySkippedHostParked()
+		return r.store.DeferRetryAttempt(ctx, cand.DID, until)
+	}
 
 	r.cfg.Metrics.incRetryAttempts()
 	host, viaFallback, err := r.tryRepo(ctx, cand)
@@ -480,6 +489,16 @@ func (r *retryRunner) clientForHost(host string) (*atmossync.Client, error) {
 	}
 	r.hostClients[host] = client
 	return client, nil
+}
+
+// clientParkedUntil reports when the client for pds next sends getRepo, or
+// the zero time if it is not parked or has no usable client.
+func (r *retryRunner) clientParkedUntil(pds string) time.Time {
+	client, err := r.clientForHost(pds)
+	if err != nil {
+		return time.Time{}
+	}
+	return client.GetRepoRateLimitedUntil()
 }
 
 // classifyDownloadErr annotates a download failure caused by OUR

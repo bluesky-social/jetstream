@@ -46,6 +46,7 @@ type Metrics struct {
 	HostnameRejected         prometheus.Counter
 	RosterCapHits            prometheus.Counter
 	DownloadSlotWait         prometheus.Histogram
+	RateLimitWait            *prometheus.HistogramVec
 	EngineActiveHosts        prometheus.Gauge
 	GroupCommitWrites        prometheus.Histogram
 	GroupCommitOps           prometheus.Histogram
@@ -189,6 +190,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "download_slot_wait_seconds", Help: "Time direct-PDS workers wait for a fleet-wide download slot.",
 			Buckets: obs.LatencyBucketsFast,
 		}),
+		// A PDS resets its getRepo quota every few minutes, so these waits
+		// run to the window's end rather than the latency scale.
+		RateLimitWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "rate_limit_wait_seconds",
+			Help:    "Time direct-PDS workers wait on a host's rate limit: for a spent getRepo quota to reset, or after a 429.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 14),
+		}, []string{"host_class"}),
 		EngineActiveHosts: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "engine_active_hosts", Help: "PDS host producer loops currently active.",
@@ -215,7 +224,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.RetryPasses, m.RetryCandidates, m.RetryAttempts,
 		m.RetrySucceeded, m.RetryFailed, m.RetrySkippedHostParked,
 		m.HostsTotal, m.HostEnumeratedRepos, m.HostAttempts,
-		m.HostnameRejected, m.RosterCapHits, m.DownloadSlotWait, m.EngineActiveHosts,
+		m.HostnameRejected, m.RosterCapHits, m.DownloadSlotWait, m.RateLimitWait, m.EngineActiveHosts,
 		m.GroupCommitWrites, m.GroupCommitOps,
 	)
 	return m
@@ -306,6 +315,12 @@ func (m *Metrics) incRosterCapHit() {
 func (m *Metrics) observeDownloadSlotWait(wait time.Duration) {
 	if m != nil && wait >= 0 {
 		m.DownloadSlotWait.Observe(wait.Seconds())
+	}
+}
+
+func (m *Metrics) observeRateLimitWait(host string, wait time.Duration) {
+	if m != nil && wait >= 0 {
+		m.RateLimitWait.WithLabelValues(hostClass(host)).Observe(wait.Seconds())
 	}
 }
 

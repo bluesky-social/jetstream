@@ -35,6 +35,7 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	m.incRetrySucceeded()
 	m.incRetryFailed()
 	m.incRetrySkippedHostParked()
+	m.observeRateLimitWait("jellybaby.us-east.host.bsky.network", 3*time.Minute)
 
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Discovered), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.Completed), 0)
@@ -56,6 +57,10 @@ func TestNewMetrics_RegistersStableMetrics(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetrySucceeded), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetryFailed), 0)
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.RetrySkippedHostParked), 0)
+	require.Equal(t, 1, testutil.CollectAndCount(m.RateLimitWait))
+	mushroom, ok := m.RateLimitWait.WithLabelValues("mushroom").(prometheus.Histogram)
+	require.True(t, ok)
+	require.Equal(t, 1, testutil.CollectAndCount(mushroom))
 	requireNoDebugMetricFields(t, m)
 	requireNoDebugMetrics(t, reg)
 }
@@ -84,6 +89,7 @@ func TestNewMetrics_NilSafe(t *testing.T) {
 		m.incRetrySucceeded()
 		m.incRetryFailed()
 		m.incRetrySkippedHostParked()
+		m.observeRateLimitWait("pds.example.com", time.Second)
 	})
 }
 
