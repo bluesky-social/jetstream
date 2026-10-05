@@ -8,13 +8,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 type mergeRunner struct {
@@ -26,7 +29,15 @@ type mergeRunner struct {
 	crashInjector crashpoint.Injector
 	now           func() time.Time // overridable for tests
 	cache         *repoStatusLookup
+	// readAhead is how many source blocks are fetched and decoded ahead
+	// of the one being drained. Zero reads one block at a time, which
+	// keeps local-mode fault and crash tests deterministic; disaggregated
+	// merge sets mergeReadAhead, since each read is an object GET.
+	readAhead int
 }
+
+// mergeReadAhead is the disaggregated drain's source read-ahead.
+const mergeReadAhead = 8
 
 // newMergeRunner builds a drain runner. injector is the test-only crash
 // simulator (crashpoint.Injector); production callers thread
@@ -121,24 +132,52 @@ func (r *mergeRunner) simulateCrash(ctx context.Context, point crashpoint.Point)
 // WitnessedAt, returns the per-DID last-seen rev map. dst.Flush is
 // called before returning so the cursor commit that follows is
 // ordered after a fsync (§5.2).
+//
+// Each block's repo rows are read in one batch before its events are
+// filtered, and only for the event kinds shouldKeep checks against the
+// row; a remote store would otherwise pay a round trip per DID.
 func (r *mergeRunner) processSourceSegment(ctx context.Context, sf sourceSegment) (map[string]string, error) {
 	return obs.Span2(ctx, func(ctx context.Context) (map[string]string, error) {
-		fetcher := r.src.fetcher()
 		perDID := make(map[string]string)
+		blocks, stop := r.readBlocks(ctx, sf)
+		defer stop()
 
-		for _, ref := range sf.refs {
-			if err := ctx.Err(); err != nil {
+		var dids []string
+		for i, ref := range sf.refs {
+			blk, ok := <-blocks
+			if !ok {
+				// readBlocks closes early only on cancellation.
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("orchestrator: merge: source segment %d ended after %d of %d blocks", sf.index, i, len(sf.refs))
+			}
+			if blk.err != nil {
+				return nil, fmt.Errorf("orchestrator: merge: decode source segment %d block %d: %w", sf.index, ref.Block, blk.err)
+			}
+			if blk.index != i {
+				return nil, fmt.Errorf("orchestrator: merge: source segment %d read block %d out of order (want %d)", sf.index, blk.index, i)
+			}
+			events := blk.events
+
+			dids = dids[:0]
+			for j := range events {
+				if isBackfillRevFilteredKind(events[j].Kind) {
+					dids = append(dids, events[j].DID)
+				}
+			}
+			if err := r.cache.prefill(ctx, dids); err != nil {
 				return nil, err
 			}
-			events, err := catalog.DecodeRef(ctx, fetcher, ref)
-			if err != nil {
-				return nil, fmt.Errorf("orchestrator: merge: decode source segment %d block %d: %w", sf.index, ref.Block, err)
-			}
+
 			for j := range events {
 				ev := &events[j]
-				rs, lerr := r.cache.get(ev.DID)
-				if lerr != nil {
-					return nil, lerr
+				var rs *backfill.RepoStatus
+				if isBackfillRevFilteredKind(ev.Kind) {
+					var lerr error
+					if rs, lerr = r.cache.get(ev.DID); lerr != nil {
+						return nil, lerr
+					}
 				}
 				if !shouldKeep(ev, rs) {
 					r.metrics.incMergeEventsDropped()
@@ -162,4 +201,79 @@ func (r *mergeRunner) processSourceSegment(ctx context.Context, sf sourceSegment
 		}
 		return perDID, nil
 	})
+}
+
+// sourceBlock is one decoded source block, or the error reading it.
+type sourceBlock struct {
+	index  int
+	events []segment.Event
+	err    error
+}
+
+// readBlocks streams sf's blocks, decoded, in order. With readAhead > 0 it
+// keeps up to readAhead blocks fetching concurrently ahead of the
+// consumer. The stream stops after the first error. stop cancels any
+// outstanding reads and waits for them, and must be called.
+func (r *mergeRunner) readBlocks(ctx context.Context, sf sourceSegment) (<-chan sourceBlock, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	fetcher := r.src.fetcher()
+	out := make(chan sourceBlock)
+	var wg sync.WaitGroup
+
+	if r.readAhead <= 0 {
+		wg.Go(func() {
+			defer close(out)
+			for i, ref := range sf.refs {
+				events, err := catalog.DecodeRef(ctx, fetcher, ref)
+				select {
+				case out <- sourceBlock{index: i, events: events, err: err}:
+				case <-ctx.Done():
+					return
+				}
+				if err != nil {
+					return
+				}
+			}
+		})
+		return out, func() { cancel(); wg.Wait() }
+	}
+
+	// Each block gets a one-slot result channel, queued in order; the
+	// queue's capacity bounds the reads in flight.
+	pending := make(chan chan sourceBlock, r.readAhead)
+	wg.Go(func() {
+		defer close(pending)
+		for i, ref := range sf.refs {
+			res := make(chan sourceBlock, 1)
+			select {
+			case pending <- res:
+			case <-ctx.Done():
+				return
+			}
+			wg.Go(func() {
+				events, err := catalog.DecodeRef(ctx, fetcher, ref)
+				res <- sourceBlock{index: i, events: events, err: err}
+			})
+		}
+	})
+	wg.Go(func() {
+		defer close(out)
+		for res := range pending {
+			var blk sourceBlock
+			select {
+			case blk = <-res:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case out <- blk:
+			case <-ctx.Done():
+				return
+			}
+			if blk.err != nil {
+				return
+			}
+		}
+	})
+	return out, func() { cancel(); wg.Wait() }
 }

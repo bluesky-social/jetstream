@@ -115,6 +115,68 @@ func (l *repoStatusLookup) get(did string) (*backfill.RepoStatus, error) {
 	return rs, nil
 }
 
+// mergeLookupBatchKeys caps the keys one prefill read asks for.
+const mergeLookupBatchKeys = 10_000
+
+// prefill reads every uncached DID in dids with batched reads and caches
+// the results, so the get calls that follow are cache hits. A remote
+// store answers each GetMany in one round trip, where get pays one per
+// DID. It only fills absent entries: a DID already cached keeps its
+// value, so a set from commitSourceComplete is never overwritten by an
+// older read. Errors latch the same sticky error get does.
+func (l *repoStatusLookup) prefill(ctx context.Context, dids []string) error {
+	if l.stickyErr != nil {
+		return l.stickyErr
+	}
+	var keys [][]byte
+	var missing []string
+	seen := make(map[string]struct{}, len(dids))
+	flush := func() error {
+		if len(keys) == 0 {
+			return nil
+		}
+		vals, err := l.store.GetMany(ctx, keys)
+		if err != nil {
+			l.stickyErr = fmt.Errorf("orchestrator: merge: lookup %d repo rows: %w", len(keys), err)
+			return l.stickyErr
+		}
+		for i, did := range missing {
+			if l.onLookup != nil {
+				l.onLookup()
+			}
+			if vals[i] == nil {
+				l.cache[did] = nil
+				continue
+			}
+			rs, err := backfill.DecodeRepoStatus(vals[i])
+			if err != nil {
+				l.stickyErr = fmt.Errorf("orchestrator: merge: decode repo/%s: %w", did, err)
+				return l.stickyErr
+			}
+			l.cache[did] = rs
+		}
+		keys, missing = keys[:0], missing[:0]
+		return nil
+	}
+	for _, did := range dids {
+		if _, ok := l.cache[did]; ok {
+			continue
+		}
+		if _, ok := seen[did]; ok {
+			continue
+		}
+		seen[did] = struct{}{}
+		keys = append(keys, backfill.RepoKey(did))
+		missing = append(missing, did)
+		if len(keys) == mergeLookupBatchKeys {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
 // set replaces the cached entry. Called by commitSourceComplete
 // (Task 8) after a successful pebble batch so subsequent sources
 // see the updated Rev without a fresh pebble read.

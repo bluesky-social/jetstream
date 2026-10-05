@@ -303,6 +303,7 @@ func (o *Orchestrator) runMergeDisaggregated(ctx context.Context) error {
 		return err
 	}
 	runner := newMergeRunner(dst, o.cfg.Store, src, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
+	runner.readAhead = mergeReadAhead
 	if err := runner.run(ctx); err != nil {
 		if cerr := dst.Close(); cerr != nil {
 			o.logger.WarnContext(ctx, "dst writer close after merge error", "err", cerr)
