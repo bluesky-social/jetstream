@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -22,6 +23,7 @@ const txKindRead = "read"
 type readTx struct {
 	tx      pgx.Tx
 	metrics *Metrics
+	limits  readLimits
 	span    trace.Span
 	start   time.Time
 	failed  bool
@@ -42,7 +44,7 @@ func (s *Store) BeginRead(ctx context.Context) (catalog.ReadTx, error) {
 		span.End()
 		return nil, fmt.Errorf("pgstore: begin read: %w", err)
 	}
-	return &readTx{tx: ptx, metrics: s.metrics, span: span, start: start}, nil
+	return &readTx{tx: ptx, metrics: s.metrics, limits: s.readLimits, span: span, start: start}, nil
 }
 
 func (r *readTx) fail(stmt string, err error) error {
@@ -118,16 +120,53 @@ func (r *readTx) Generations(ctx context.Context, ids []uint64) ([]catalog.Gener
 	return out, nil
 }
 
-func (r *readTx) GenerationBlocks(ctx context.Context, ids []uint64) ([]catalog.GenerationBlockRow, error) {
-	rows, err := r.tx.Query(ctx,
-		`SELECT generation_id, ordinal, object_id, compressed_length FROM generation_blocks
-		 WHERE generation_id = ANY($1::bigint[]) ORDER BY generation_id, ordinal`, int64s(ids))
-	if err != nil {
-		return nil, r.fail("generation_blocks", err)
+// readStatementObjects and readStatementGenerations cap the IDs one read
+// statement looks up. A follower's first load reads every object row the
+// catalog references, about 5.7M in pop2 at 1.6 TiB, and one statement that
+// size outlasts statement_timeout, so no pod could start. Split, the
+// statements still share the transaction's snapshot. A generation is about
+// a thousand blocks, so readStatementGenerations bounds the rows similarly.
+const (
+	readStatementObjects     = 100_000
+	readStatementGenerations = 256
+)
+
+// readLimits is the per-statement ID caps a read transaction uses; tests
+// shrink them to cover the split.
+type readLimits struct {
+	objects, generations int
+}
+
+var defaultReadLimits = readLimits{objects: readStatementObjects, generations: readStatementGenerations}
+
+// readChunks returns ids sorted and deduplicated, in runs of at most n, so
+// statements that each order their rows by ID return them in order overall.
+func readChunks(ids []uint64, n int) [][]int64 {
+	sorted := slices.Compact(slices.Sorted(slices.Values(ids)))
+	all := int64s(sorted)
+	var out [][]int64
+	for len(all) > 0 {
+		k := min(n, len(all))
+		out = append(out, all[:k])
+		all = all[k:]
 	}
-	out, err := pgx.CollectRows(rows, scanGenerationBlock)
-	if err != nil {
-		return nil, r.fail("generation_blocks", err)
+	return out
+}
+
+func (r *readTx) GenerationBlocks(ctx context.Context, ids []uint64) ([]catalog.GenerationBlockRow, error) {
+	var out []catalog.GenerationBlockRow
+	for _, chunk := range readChunks(ids, r.limits.generations) {
+		rows, err := r.tx.Query(ctx,
+			`SELECT generation_id, ordinal, object_id, compressed_length FROM generation_blocks
+			 WHERE generation_id = ANY($1::bigint[]) ORDER BY generation_id, ordinal`, chunk)
+		if err != nil {
+			return nil, r.fail("generation_blocks", err)
+		}
+		got, err := pgx.AppendRows(out, rows, scanGenerationBlock)
+		if err != nil {
+			return nil, r.fail("generation_blocks", err)
+		}
+		out = got
 	}
 	return out, nil
 }
@@ -196,16 +235,20 @@ func (r *readTx) HotBatches(ctx context.Context, framesFrom uint64) ([]catalog.H
 }
 
 func (r *readTx) Objects(ctx context.Context, ids []uint64) ([]catalog.ObjectRow, error) {
-	rows, err := r.tx.Query(ctx,
-		`SELECT `+objectCols+` FROM objects WHERE object_id = ANY($1::bigint[]) ORDER BY object_id`, int64s(ids))
-	if err != nil {
-		return nil, r.fail("objects", err)
-	}
-	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.ObjectRow, error) {
-		return scanObject(row)
-	})
-	if err != nil {
-		return nil, r.fail("objects", err)
+	var out []catalog.ObjectRow
+	for _, chunk := range readChunks(ids, r.limits.objects) {
+		rows, err := r.tx.Query(ctx,
+			`SELECT `+objectCols+` FROM objects WHERE object_id = ANY($1::bigint[]) ORDER BY object_id`, chunk)
+		if err != nil {
+			return nil, r.fail("objects", err)
+		}
+		got, err := pgx.AppendRows(out, rows, func(row pgx.CollectableRow) (catalog.ObjectRow, error) {
+			return scanObject(row)
+		})
+		if err != nil {
+			return nil, r.fail("objects", err)
+		}
+		out = got
 	}
 	return out, nil
 }

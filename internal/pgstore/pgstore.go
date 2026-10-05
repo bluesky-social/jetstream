@@ -86,6 +86,8 @@ type Store struct {
 	pool    *pgxpool.Pool
 	connCfg *pgx.ConnConfig // for the dedicated LISTEN connection
 	metrics *Metrics
+	// readLimits caps the IDs per statement in read transactions.
+	readLimits readLimits
 }
 
 var (
@@ -130,7 +132,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("pgstore: connect: %w", err)
 	}
 	cfg.Metrics.watchPool(pool)
-	return &Store{pool: pool, connCfg: pcfg.ConnConfig.Copy(), metrics: cfg.Metrics}, nil
+	return &Store{pool: pool, connCfg: pcfg.ConnConfig.Copy(), metrics: cfg.Metrics, readLimits: defaultReadLimits}, nil
 }
 
 // tunePool applies the pool tuning above. maxConns <= 0 means

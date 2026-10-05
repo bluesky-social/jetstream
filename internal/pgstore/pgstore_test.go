@@ -164,6 +164,28 @@ func TestContract(t *testing.T) {
 	})
 }
 
+// TestContractSplitReads runs the contract with every read split into
+// statements of one or two IDs: the rows must come back as one statement
+// returns them, in ID order with duplicates folded.
+func TestContractSplitReads(t *testing.T) {
+	t.Parallel()
+	pgtest.URL(t)
+	for _, n := range []int{1, 2} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			t.Parallel()
+			catalogtest.Run(t, func(t *testing.T) catalogtest.Backend {
+				s, _ := pgtest.Open(t, nil)
+				pgstore.SetReadLimits(s, n, n)
+				return catalogtest.Backend{
+					DB:        s,
+					NewLocker: func() leader.Locker { return s.NewLease() },
+					Listener:  s,
+				}
+			})
+		})
+	}
+}
+
 // The lease runs on PostgreSQL's clock, so the suite sleeps. The lease is
 // long enough that a slow statement cannot eat the margins (a fifth of it).
 func TestLockerContract(t *testing.T) {
