@@ -68,6 +68,14 @@ func requireSparseMatchesRewrite(t testing.TB, src sparseGeneration, dids map[st
 	require.NoError(t, err)
 	require.Equal(t, plan.rowsDropped > 0, res.Rewritten)
 	require.Equal(t, len(fetched), res.BlocksFetched)
+	if len(dids)+len(records) > 0 && len(src.frames) > 0 {
+		switch {
+		case opts.ProbeLimit < 0:
+			require.True(t, res.Dense, "a negative probe limit reads dense")
+		case opts.ProbeLimit == 0:
+			require.False(t, res.Dense, "the default probe limit narrows at this size")
+		}
+	}
 	if !res.Rewritten {
 		return src, src, false
 	}

@@ -176,6 +176,9 @@ type SparseResult struct {
 	// BlocksFetched counts every block fetched: candidates and the
 	// vanished-DID check's extra reads.
 	BlocksFetched int
+	// Dense reports that the probe limit stopped narrowing, so every block
+	// below the highest tombstone seq was a candidate.
+	Dense bool
 }
 
 // SparseRewrite is the §12.2 segment rewrite over one sealed generation:
@@ -220,6 +223,7 @@ type sparseRewrite struct {
 
 	fetched     int
 	rowsDropped uint64
+	dense       bool
 }
 
 type sparseBlock struct {
@@ -249,7 +253,7 @@ func (s *sparseRewrite) run(footer []byte) (SparseResult, error) {
 		}
 	}
 	if s.rowsDropped == 0 {
-		return SparseResult{BlocksFetched: s.fetched}, nil
+		return SparseResult{BlocksFetched: s.fetched, Dense: s.dense}, nil
 	}
 	vanished, err := s.vanished()
 	if err != nil {
@@ -316,6 +320,7 @@ func (s *sparseRewrite) run(footer []byte) (SparseResult, error) {
 		RowsDropped:   s.rowsDropped,
 		VanishedDIDs:  vanished,
 		BlocksFetched: s.fetched,
+		Dense:         s.dense,
 	}, nil
 }
 
@@ -348,6 +353,7 @@ func (s *sparseRewrite) candidates() ([]int, error) {
 		}
 	}
 
+	s.dense = dense
 	var out []int
 	for i, b := range s.blocks {
 		if b.EventCount == 0 || b.MinSeq > s.t.maxSeq {

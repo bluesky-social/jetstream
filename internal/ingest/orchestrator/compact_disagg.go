@@ -100,6 +100,13 @@ func maxTombstoneSeq(snap tombstone.Snapshot) uint64 {
 	return top
 }
 
+// disaggSparseProbeLimit replaces segment.DefaultSparseProbeLimit for
+// disaggregated rewrites. That default weighs bloom probes against block
+// decodes; here every block a probe rules out also saves an object GET,
+// and a merge-tail pass carries millions of tombstoned DIDs, which past
+// the default would read every block of the archive.
+const disaggSparseProbeLimit = 1 << 26
+
 // rewriteSegmentDisaggregated is the §12.2 segment rewrite on the shared
 // catalog: a sparse rewrite of the current generation, the upload of its new
 // blocks and footer, and the publish.
@@ -130,13 +137,15 @@ func (o *Orchestrator) rewriteSegmentDisaggregated(ctx, gctx context.Context, f 
 		return d.Objects.Get(gctx, parts.Blocks[i].ID)
 	}
 	res, err := segment.SparseRewrite(parts.Header, footer, fetch, rule, segment.SparseOptions{
-		Name:    f.Path,
-		Reserve: reserve,
+		Name:       f.Path,
+		Reserve:    reserve,
+		ProbeLimit: disaggSparseProbeLimit,
 		OnDrop: func(ev *segment.Event, didLevel bool) {
 			out.droppedByReason[snap.DropReason(ev, didLevel)]++
 		},
 	})
 	out.blocksFetched = res.BlocksFetched
+	out.dense = res.Dense
 	if err != nil {
 		return out, fmt.Errorf("orchestrator: compaction: rewrite %s: %w", f.Path, err)
 	}
