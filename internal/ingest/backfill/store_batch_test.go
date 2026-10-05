@@ -3,6 +3,7 @@ package backfill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -442,4 +443,47 @@ func TestStore_ConcurrentHostsGroupCommit(t *testing.T) {
 	require.Equal(t, normalizedKeyspace(t, refDB), normalizedKeyspace(t, db.Store))
 	writes := int64(hosts * (1 + pages))
 	require.Less(t, db.commits.Load(), writes, "concurrent page writes must share commits")
+}
+
+// TestStore_DirectHostStateGroupCommit covers merge discovery's path, a
+// Store with no completion batcher: concurrent hosts' cursor and drain
+// writes must share commits and leave the keyspace a sequential run does.
+func TestStore_DirectHostStateGroupCommit(t *testing.T) {
+	t.Parallel()
+	const hosts = 32
+	infos := make([]atmosbackfill.HostInfo, hosts)
+	for h := range hosts {
+		infos[h] = atmosbackfill.HostInfo{Hostname: fmt.Sprintf("host%02d.example.test", h), RelayStatus: "active"}
+	}
+	walk := func(st atmosbackfill.Store, h int) {
+		ctx := context.Background()
+		name := infos[h].Hostname
+		require.NoError(t, st.SaveHostCursor(ctx, name, "c1"))
+		require.NoError(t, st.SaveHostCursor(ctx, name, "c2"))
+		if h%4 == 0 {
+			require.NoError(t, st.OnHostExhausted(ctx, name, errors.New("boom"), 3))
+			return
+		}
+		require.NoError(t, st.OnHostDrained(ctx, name, "c2"))
+	}
+
+	refDB := memstore.New()
+	ref := newSeededStore(t, refDB, nil).AtmosStore()
+	recordHostsOne(t, ref, infos)
+	for h := range hosts {
+		walk(ref, h)
+	}
+
+	db := &countingStore{Store: memstore.New(), commitDelay: 500 * time.Microsecond}
+	st := newSeededStore(t, db, nil).AtmosStore()
+	recordHostsOne(t, st, infos)
+	db.reset()
+	var wg sync.WaitGroup
+	for h := range hosts {
+		wg.Go(func() { walk(st, h) })
+	}
+	wg.Wait()
+
+	require.Equal(t, normalizedKeyspace(t, refDB), normalizedKeyspace(t, db.Store))
+	require.Less(t, db.commits.Load(), int64(hosts*3), "concurrent host writes must share commits")
 }

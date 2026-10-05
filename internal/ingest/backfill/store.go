@@ -1528,13 +1528,17 @@ func (s *Store) OnHostExhausted(ctx context.Context, hostname string, cause erro
 	})
 }
 
+// updateHostStateDirect writes one host's state change without a
+// completion batcher, as merge discovery does for every host it walks. It
+// rides the group committer, so concurrent hosts share one transaction
+// instead of queuing one commit each behind the counts lock.
 func (s *Store) updateHostStateDirect(ctx context.Context, hostname string, mutate func(*PDSHost) atmosbackfill.HostState) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	keys := [][]byte{pdsHostKey(hostname), []byte(countsKey)}
-	return s.writeLocked(ctx, true, fmt.Sprintf("commit pdshost/%s state", hostname), keys,
-		func(view *metaView, batch metastore.Batch) error {
+	return s.commitGrouped(&groupWrite{
+		keys: [][]byte{pdsHostKey(hostname), []byte(countsKey)},
+		apply: func(_ context.Context, view *metaView, batch metastore.Batch) error {
 			host, _, err := loadPDSHostFrom(view, hostname)
 			if err != nil {
 				return err
@@ -1560,7 +1564,8 @@ func (s *Store) updateHostStateDirect(ctx context.Context, hostname string, muta
 			batch.Set(pdsHostKey(hostname), hostEnc)
 			batch.Set([]byte(countsKey), countsEnc)
 			return nil
-		})
+		},
+	})
 }
 
 // OnComplete records a successful repo download. The commit's rev is
