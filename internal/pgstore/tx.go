@@ -441,12 +441,24 @@ func (t *tx) ApplyMeta(_ context.Context, ops []metastore.Op) error {
 	return nil
 }
 
+// metaBatchStatementRows caps the rows one MetaBatch statement carries. A
+// merge segment commits hundreds of thousands of repo rows at once, and one
+// statement that size can outlast statement_timeout; split, the statements
+// still share the caller's transaction.
+const metaBatchStatementRows = 10_000
+
 // MetaBatch turns ordered metastore ops into the design §14.2 statements:
 // a run of Sets is one unnest upsert (last write per key wins, since one
 // INSERT ... ON CONFLICT cannot touch a row twice), a run of Deletes is one
 // `= ANY` delete, and a DeleteRange is its own statement that ends a run.
-// Order across runs is kept, which is Pebble's batch semantics.
+// A run longer than metaBatchStatementRows is split into several
+// statements, in order. Order across runs is kept, which is Pebble's batch
+// semantics.
 func MetaBatch(ops []metastore.Op) *pgx.Batch {
+	return metaBatch(ops, metaBatchStatementRows)
+}
+
+func metaBatch(ops []metastore.Op, maxRows int) *pgx.Batch {
 	b := &pgx.Batch{}
 	var keys, vals [][]byte
 	setAt := map[string]int{} // key -> index in the current Set run
@@ -475,10 +487,15 @@ func MetaBatch(ops []metastore.Op) *pgx.Batch {
 				vals[i] = v
 				continue
 			}
+			// A key repeated after a split lands in a later statement,
+			// which still applies last.
+			if len(keys) == maxRows {
+				flush()
+			}
 			setAt[string(k)] = len(keys)
 			keys, vals = append(keys, k), append(vals, v)
 		case metastore.OpDelete:
-			if vals != nil {
+			if vals != nil || len(keys) == maxRows {
 				flush()
 			}
 			keys = append(keys, nonNil(op.Key))

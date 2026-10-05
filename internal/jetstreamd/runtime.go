@@ -119,6 +119,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.FailedRepoRetryWorkers < 0 {
 		return nil, fmt.Errorf("serve: --failed-repo-retry-workers must be >= 0 (FailedRepoRetryWorkers must be >= 0), got %d", opts.FailedRepoRetryWorkers)
 	}
+	if opts.PendingRepoPassWorkers < 0 {
+		return nil, fmt.Errorf("serve: --pending-repo-pass-workers must be >= 0 (PendingRepoPassWorkers must be >= 0), got %d", opts.PendingRepoPassWorkers)
+	}
 	if opts.FailedRepoRetryHostWorkers < 0 {
 		return nil, fmt.Errorf("serve: --failed-repo-retry-host-workers must be >= 0 (FailedRepoRetryHostWorkers must be >= 0), got %d", opts.FailedRepoRetryHostWorkers)
 	}
@@ -414,6 +417,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
 			FailedRepoRetryInterval:        opts.FailedRepoRetryInterval,
 			FailedRepoRetryWorkers:         opts.FailedRepoRetryWorkers,
+			PendingRepoPassWorkers:         opts.PendingRepoPassWorkers,
 			FailedRepoRetryHostWorkers:     opts.FailedRepoRetryHostWorkers,
 			FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
 			LiveReconnectBackoff:           opts.LiveReconnectBackoff,

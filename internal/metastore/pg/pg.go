@@ -94,6 +94,12 @@ func (s *Store) Delete(ctx context.Context, key []byte) error {
 // transaction or cursor open between pages, and a page never sees a
 // half-applied commit. Rows committed between pages may or may not appear,
 // which is all the interface promises.
+//
+// After a full page it fetches the next one in the background while the
+// caller consumes the current one, so a long scan (45M repo rows is about
+// 4,500 pages) waits on one round trip per page at most. The read-ahead
+// is a single bounded query under the caller's context; an iterator
+// abandoned without Close lets it finish and be collected.
 func (s *Store) NewIter(ctx context.Context, lower, upper []byte) (metastore.Iterator, error) {
 	it := &iter{s: s, ctx: ctx, next: bytes.Clone(lower), upper: bytes.Clone(upper), pos: -1}
 	if upper != nil && bytes.Compare(it.next, upper) >= 0 {
@@ -115,10 +121,28 @@ type iter struct {
 	pos   int
 	done  bool // no page after the current one
 	err   error
+	ahead chan pageResult // the next page, when a read-ahead is running
+}
+
+type pageResult struct {
+	page []pgstore.MetaKV
+	err  error
+}
+
+func (it *iter) scan(lower []byte) ([]pgstore.MetaKV, error) {
+	return it.s.cfg.DB.MetaScan(it.ctx, lower, it.upper, it.s.cfg.PageSize)
 }
 
 func (it *iter) fetch() error {
-	page, err := it.s.cfg.DB.MetaScan(it.ctx, it.next, it.upper, it.s.cfg.PageSize)
+	var page []pgstore.MetaKV
+	var err error
+	if it.ahead != nil {
+		r := <-it.ahead
+		it.ahead = nil
+		page, err = r.page, r.err
+	} else {
+		page, err = it.scan(it.next)
+	}
 	if err != nil {
 		return err
 	}
@@ -130,6 +154,17 @@ func (it *iter) fetch() error {
 	// The smallest key after last is last followed by a zero byte.
 	last := page[len(page)-1].Key
 	it.next = append(bytes.Clone(last), 0)
+	if it.upper != nil && bytes.Compare(it.next, it.upper) >= 0 {
+		it.done = true
+		return nil
+	}
+	ahead := make(chan pageResult, 1)
+	lower := it.next
+	go func() {
+		page, err := it.scan(lower)
+		ahead <- pageResult{page: page, err: err}
+	}()
+	it.ahead = ahead
 	return nil
 }
 
@@ -155,4 +190,12 @@ func (it *iter) Next() bool {
 func (it *iter) Key() []byte   { return it.page[it.pos].Key }
 func (it *iter) Value() []byte { return it.page[it.pos].Value }
 func (it *iter) Err() error    { return it.err }
-func (it *iter) Close() error  { return nil }
+
+// Close waits for a running read-ahead, so no query outlives the iterator.
+func (it *iter) Close() error {
+	if it.ahead != nil {
+		<-it.ahead
+		it.ahead = nil
+	}
+	return nil
+}

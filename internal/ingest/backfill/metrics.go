@@ -40,6 +40,9 @@ type Metrics struct {
 	RetrySucceeded           prometheus.Counter
 	RetryFailed              prometheus.Counter
 	RetrySkippedHostParked   prometheus.Counter
+	RetryRequeued            prometheus.Counter
+	RetryHostsAbandoned      prometheus.Counter
+	RetryQueueRemaining      prometheus.Gauge
 	HostsTotal               *prometheus.GaugeVec
 	HostEnumeratedRepos      prometheus.Counter
 	HostAttempts             prometheus.Counter
@@ -165,6 +168,21 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "failed_repo_retry_skipped_host_parked_total",
 			Help: "Number of eligible failed repo retries skipped because their host was parked by a rate-limit response.",
 		}),
+		RetryRequeued: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_requeued_total",
+			Help: "Number of pending-pass retry candidates put back on their host's queue after a rate limit, to wait out the host's park.",
+		}),
+		RetryHostsAbandoned: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_hosts_abandoned_total",
+			Help: "Number of hosts a pending pass stopped asking after a long unbroken run of rate limits; their remaining repos are recorded failed for the steady-state retry.",
+		}),
+		RetryQueueRemaining: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "failed_repo_retry_queue_remaining",
+			Help: "Candidates the running retry pass has not finished.",
+		}),
 		HostsTotal: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "hosts_total", Help: "Current PDS roster hosts by engine lifecycle state and coarse host class.",
@@ -223,6 +241,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.CompletionQueueWait, m.ForcedCheckpointFlushes,
 		m.RetryPasses, m.RetryCandidates, m.RetryAttempts,
 		m.RetrySucceeded, m.RetryFailed, m.RetrySkippedHostParked,
+		m.RetryRequeued, m.RetryHostsAbandoned, m.RetryQueueRemaining,
 		m.HostsTotal, m.HostEnumeratedRepos, m.HostAttempts,
 		m.HostnameRejected, m.RosterCapHits, m.DownloadSlotWait, m.RateLimitWait, m.EngineActiveHosts,
 		m.GroupCommitWrites, m.GroupCommitOps,
@@ -454,5 +473,23 @@ func (m *Metrics) incRetryFailed() {
 func (m *Metrics) incRetrySkippedHostParked() {
 	if m != nil {
 		m.RetrySkippedHostParked.Inc()
+	}
+}
+
+func (m *Metrics) incRetryRequeued() {
+	if m != nil {
+		m.RetryRequeued.Inc()
+	}
+}
+
+func (m *Metrics) incRetryHostsAbandoned() {
+	if m != nil {
+		m.RetryHostsAbandoned.Inc()
+	}
+}
+
+func (m *Metrics) setRetryQueueRemaining(n int) {
+	if m != nil {
+		m.RetryQueueRemaining.Set(float64(n))
 	}
 }

@@ -63,6 +63,7 @@ type Metrics struct {
 	CompactionWatermarkLag      prometheus.Gauge
 	CompactionBlocksExamined    prometheus.Counter
 	CompactionBlocksFetched     prometheus.Counter
+	CompactionDenseRewrites     prometheus.Counter
 
 	// tombstones is the set the tombstone gauges read. Metrics live for the
 	// process but each writer session builds its own set.
@@ -218,6 +219,11 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Name: "blocks_fetched_total",
 		Help: "Blocks disaggregated compaction's sparse rewrites fetched: candidates plus the vanished-DID check's extra reads.",
 	})
+	m.CompactionDenseRewrites = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
+		Name: "dense_rewrites_total",
+		Help: "Disaggregated segment rewrites that hit the sparse probe limit and read every block below the highest tombstone seq.",
+	})
 	reg.MustRegister(
 		m.Phase,
 		m.PhaseTransitions,
@@ -245,6 +251,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		m.CompactionWatermarkLag,
 		m.CompactionBlocksExamined,
 		m.CompactionBlocksFetched,
+		m.CompactionDenseRewrites,
 	)
 	if len(tombstones) > 0 {
 		m.SetTombstones(tombstones[0])
@@ -399,4 +406,10 @@ func (m *Metrics) addCompactionBlocks(blocks, fetched int) {
 	}
 	m.CompactionBlocksExamined.Add(float64(blocks))
 	m.CompactionBlocksFetched.Add(float64(fetched))
+}
+
+func (m *Metrics) incCompactionDenseRewrites() {
+	if m != nil {
+		m.CompactionDenseRewrites.Inc()
+	}
 }

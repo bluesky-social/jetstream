@@ -57,8 +57,10 @@ type compactionRewriteResult struct {
 	size            int64 // rewritten file size, when result.Rewritten
 	droppedByReason map[string]uint64
 	// blocks and blocksFetched are the segment's block count and the blocks
-	// a sparse rewrite fetched (disaggregated mode only).
+	// a sparse rewrite fetched, and dense reports that the rewrite hit the
+	// probe limit (disaggregated mode only).
 	blocks, blocksFetched int
+	dense                 bool
 }
 
 // runDeleteCompaction executes one compaction pass. liveWriter is the
@@ -306,6 +308,12 @@ func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed [
 		if !ok || v.State != catalog.Sealed {
 			return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: sealed segment %s left the catalog mid-pass", f.Path)
 		}
+		// A segment's blocks fold concurrently, as in rebuildLiveTombstones:
+		// Merge keeps each key's highest seq, so order does not matter. The
+		// segment loop stays serial so the chunk cap cuts where it did.
+		var mu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(tombstoneRebuildConcurrency)
 		for ref := range segmentRefs(view, v) {
 			// Block-index bounds survive rewrites as historical
 			// supersets (spec §6), so skipping on them can only skip
@@ -313,15 +321,29 @@ func (o *Orchestrator) collectCompactionTombstones(ctx context.Context, sealed [
 			if ref.MaxSeq <= watermark || ref.MinSeq > targetWatermark {
 				continue
 			}
-			events, err := catalog.DecodeRef(ctx, fetcher, ref)
-			if err != nil {
-				return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, ref.Block, err)
+			if gctx.Err() != nil {
+				break
 			}
-			part, err := tombstone.FoldRange(events, watermark, targetWatermark)
-			if err != nil {
-				return tombstone.Snapshot{}, 0, fmt.Errorf("orchestrator: compaction: fold %s block %d: %w", f.Path, ref.Block, err)
-			}
-			snap.Merge(part)
+			g.Go(func() error {
+				events, err := catalog.DecodeRef(gctx, fetcher, ref)
+				if err != nil {
+					return fmt.Errorf("orchestrator: compaction: decode source %s block %d: %w", f.Path, ref.Block, err)
+				}
+				part, err := tombstone.FoldRange(events, watermark, targetWatermark)
+				if err != nil {
+					return fmt.Errorf("orchestrator: compaction: fold %s block %d: %w", f.Path, ref.Block, err)
+				}
+				mu.Lock()
+				snap.Merge(part)
+				mu.Unlock()
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return tombstone.Snapshot{}, 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			return tombstone.Snapshot{}, 0, err
 		}
 		if capEntries > 0 && len(snap.Records)+len(snap.DIDs) >= capEntries {
 			chunkEnd = min(f.header.MaxSeq, targetWatermark)
@@ -343,6 +365,9 @@ func (o *Orchestrator) applyCompactionChunk(ctx context.Context, sealed []sealed
 	workers := o.cfg.CompactionRewriteWorkers
 	if workers <= 0 {
 		workers = defaultCompactionRewriteWorkers()
+		if o.cfg.Disaggregated != nil {
+			workers = defaultDisaggCompactionRewriteWorkers
+		}
 	}
 	workers = min(workers, len(sealed))
 	if workers <= 0 {
@@ -406,6 +431,9 @@ sendLoop:
 	published := false
 	for _, r := range results {
 		o.cfg.Metrics.addCompactionBlocks(r.blocks, r.blocksFetched)
+		if r.dense {
+			o.cfg.Metrics.incCompactionDenseRewrites()
+		}
 		if r.result.Rewritten {
 			published = true
 			o.cfg.Metrics.incCompactionSegmentsRewritten()
@@ -519,6 +547,12 @@ func compactionCandidateDIDs(snap tombstone.Snapshot) []string {
 func defaultCompactionRewriteWorkers() int {
 	return min(runtime.NumCPU(), 8)
 }
+
+// defaultDisaggCompactionRewriteWorkers is the disaggregated default.
+// There a rewrite waits on object GETs and PUTs rather than CPU, and a
+// merge-tail pass can rewrite most of the archive's segments, so more run
+// at once. JETSTREAM_COMPACTION_MEMORY_BYTES still bounds their decodes.
+const defaultDisaggCompactionRewriteWorkers = 32
 
 func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *ingest.Writer) error {
 	if o.cfg.CompactionInterval == 0 {

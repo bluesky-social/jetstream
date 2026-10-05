@@ -5,6 +5,7 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"path/filepath"
@@ -231,7 +232,7 @@ func (o *Orchestrator) runPendingRepoRetryPass(ctx context.Context, dst *ingest.
 		DropMetrics:   o.cfg.DropMetrics,
 		NewHostClient: o.cfg.BackfillNewHostClient,
 		Interval:      o.cfg.FailedRepoRetryInterval,
-		Workers:       o.cfg.FailedRepoRetryWorkers,
+		Workers:       cmp.Or(o.cfg.PendingRepoPassWorkers, backfill.DefaultPendingRepoPassWorkers),
 		HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
 		MaxDelay:      o.cfg.FailedRepoRetryMaxDelay,
 	}); err != nil {
