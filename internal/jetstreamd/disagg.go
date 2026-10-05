@@ -299,19 +299,6 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		return fail(fmt.Errorf("serve: build gc: %w", err))
 	}
 	rt.disagg.gc = gc
-	objects, err := protocol.NewReader(protocol.ReaderConfig{
-		Rows:           protocol.DBRows{DB: backend.DB},
-		Blob:           backend.Blob,
-		ArchiveID:      archive.ArchiveID,
-		Cache:          cache,
-		Metrics:        protocolMetrics,
-		CatalogMetrics: catalogMetrics,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("serve: build object reader: %w", err))
-	}
-	rt.disagg.objects = objects
-
 	metaKV := backend.MetaStore(nil)
 	mft, err := manifest.NewRemote(manifest.Options{
 		BlockIndexCacheSize: opts.CursorBlockIndexCacheSize,
@@ -345,6 +332,22 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		return fail(fmt.Errorf("serve: build catalog follower: %w", err))
 	}
 	rt.disagg.follower = f
+	// The leader's reader looks rows up in the follower's mirror, which
+	// falls back to the catalog on a miss or a refresh. A DBRows lookup is
+	// three round trips (BEGIN, SELECT, ROLLBACK) on every read, cache hits
+	// included, and merge and compaction read millions of blocks.
+	objects, err := protocol.NewReader(protocol.ReaderConfig{
+		Rows:           f,
+		Blob:           backend.Blob,
+		ArchiveID:      archive.ArchiveID,
+		Cache:          cache,
+		Metrics:        protocolMetrics,
+		CatalogMetrics: catalogMetrics,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("serve: build object reader: %w", err))
+	}
+	rt.disagg.objects = objects
 
 	// First full load (design §15.2 step 3). In steady state it loads every
 	// footer into the manifest, so the budgets can be checked again with
