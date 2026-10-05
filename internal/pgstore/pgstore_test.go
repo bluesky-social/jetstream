@@ -19,6 +19,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/pgstore/pgtest"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -99,6 +100,53 @@ func TestMetaBatch(t *testing.T) {
 	require.Len(t, q[3].Arguments, 1, "an unbounded range has no end")
 	require.Equal(t, [][]byte{{}, {}}, q[4].Arguments[1], "values are never NULL")
 	require.Zero(t, pgstore.MetaBatch(nil).Len())
+}
+
+func TestMetaBatchSplitsLongRuns(t *testing.T) {
+	t.Parallel()
+	const per = 10_000 // metaBatchStatementRows
+	key := func(i int) []byte { return fmt.Appendf(nil, "k%06d", i) }
+	rowCounts := func(b *pgx.Batch) (kinds []string, rows []int) {
+		for _, q := range b.QueuedQueries {
+			kinds = append(kinds, strings.Fields(q.SQL)[0])
+			rows = append(rows, len(q.Arguments[0].([][]byte)))
+		}
+		return kinds, rows
+	}
+
+	for _, n := range []int{per - 1, per, per + 1, 2*per + 1} {
+		var sets, dels []metastore.Op
+		for i := range n {
+			sets = append(sets, metastore.Op{Kind: metastore.OpSet, Key: key(i), Value: []byte("v")})
+			dels = append(dels, metastore.Op{Kind: metastore.OpDelete, Key: key(i)})
+		}
+		want := []int{}
+		for left := n; left > 0; left -= per {
+			want = append(want, min(left, per))
+		}
+		_, rows := rowCounts(pgstore.MetaBatch(sets))
+		require.Equal(t, want, rows, "sets, n=%d", n)
+		_, rows = rowCounts(pgstore.MetaBatch(dels))
+		require.Equal(t, want, rows, "deletes, n=%d", n)
+	}
+
+	// A key rewritten after the split point lands in the later statement,
+	// so the last write still applies last.
+	var ops []metastore.Op
+	for i := range per {
+		ops = append(ops, metastore.Op{Kind: metastore.OpSet, Key: key(i), Value: []byte("old")})
+	}
+	ops = append(ops,
+		metastore.Op{Kind: metastore.OpSet, Key: key(per), Value: []byte("v")},
+		metastore.Op{Kind: metastore.OpSet, Key: key(0), Value: []byte("new")},
+		metastore.Op{Kind: metastore.OpDelete, Key: key(1)},
+	)
+	b := pgstore.MetaBatch(ops)
+	kinds, rows := rowCounts(b)
+	require.Equal(t, []string{"INSERT", "INSERT", "DELETE"}, kinds)
+	require.Equal(t, []int{per, 2, 1}, rows)
+	require.Equal(t, [][]byte{key(per), key(0)}, b.QueuedQueries[1].Arguments[0])
+	require.Equal(t, [][]byte{[]byte("v"), []byte("new")}, b.QueuedQueries[1].Arguments[1])
 }
 
 func TestContract(t *testing.T) {
