@@ -108,8 +108,10 @@ func TestMetaBatchSplitsLongRuns(t *testing.T) {
 	key := func(i int) []byte { return fmt.Appendf(nil, "k%06d", i) }
 	rowCounts := func(b *pgx.Batch) (kinds []string, rows []int) {
 		for _, q := range b.QueuedQueries {
+			keys, ok := q.Arguments[0].([][]byte)
+			require.True(t, ok, "keys are the first argument")
 			kinds = append(kinds, strings.Fields(q.SQL)[0])
-			rows = append(rows, len(q.Arguments[0].([][]byte)))
+			rows = append(rows, len(keys))
 		}
 		return kinds, rows
 	}
