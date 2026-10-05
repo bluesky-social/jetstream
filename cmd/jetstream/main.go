@@ -293,6 +293,12 @@ func serveCommand() *cli.Command {
 				Value:   jetstreamd.DefaultFailedRepoRetryWorkers,
 			},
 			&cli.IntFlag{
+				Name:    "pending-repo-pass-workers",
+				Usage:   "Global worker count for merge's one-shot pass over repos left pending by bootstrap restarts. Per-host concurrency is --failed-repo-retry-host-workers. 0 uses the production default.",
+				Sources: cli.EnvVars("JETSTREAM_PENDING_REPO_PASS_WORKERS"),
+				Value:   jetstreamd.DefaultPendingRepoPassWorkers,
+			},
+			&cli.IntFlag{
 				Name:    "failed-repo-retry-host-workers",
 				Usage:   "Maximum concurrent failed-repo retry requests per known PDS host. 0 uses the production default.",
 				Sources: cli.EnvVars("JETSTREAM_FAILED_REPO_RETRY_HOST_WORKERS"),
@@ -702,6 +708,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		SkipMergeDiscovery:             skipMergeDiscovery,
 		FailedRepoRetryInterval:        cmd.Duration("failed-repo-retry-interval"),
 		FailedRepoRetryWorkers:         cmd.Int("failed-repo-retry-workers"),
+		PendingRepoPassWorkers:         cmd.Int("pending-repo-pass-workers"),
 		FailedRepoRetryHostWorkers:     cmd.Int("failed-repo-retry-host-workers"),
 		FailedRepoRetryMaxDelay:        cmd.Duration("failed-repo-retry-max-delay"),
 		DisableRepoActionRateLimits:    cmd.Bool("disable-repo-action-rate-limits"),

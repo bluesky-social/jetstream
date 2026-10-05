@@ -754,6 +754,9 @@ func (s *Store) stageCompletionsLocked(ctx context.Context, completions []queued
 			}
 			rs.Host = bucket
 		}
+		if c.pds != "" {
+			rs.PDS = c.pds
+		}
 		applyCountTransition(&counts, hadRow, old, StatusComplete)
 
 		enc, err := encodeRepoStatus(rs)
@@ -1661,41 +1664,8 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, host string, failErr 
 			rs.Host = bucket
 		}
 	}
-	if isRepoNotFoundError(failErr) {
-		return s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
-			rs.Backfill.Status = StatusComplete
-			rs.Backfill.LastError = ""
-			rs.Backfill.Attempts = 0
-			rs.Backfill.RetryCount = 0
-			rs.Backfill.NextAttemptAt = time.Time{}
-			rs.Backfill.CompletedAt = now
-			rs.LastAttemptedAt = now
-			setHost(rs)
-			return func(hs *HostStatus) {
-				hs.LastAttemptedAt = now
-			}, nil
-		})
-	}
-	if isRepoUnavailableError(failErr) {
-		// The account exists but its repo is deactivated/suspended/
-		// taken down. This is a terminal upstream state, not a download
-		// failure: record it as unavailable so the engine stops
-		// retrying (Lookup -> StateComplete) and dashboards don't count
-		// it as a failed host. Clear LastError/Attempts so a row that
-		// previously failed for another reason doesn't carry a stale
-		// diagnostic into its terminal state.
-		return s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
-			rs.Backfill.Status = StatusUnavailable
-			rs.Backfill.LastError = ""
-			rs.Backfill.Attempts = 0
-			rs.Backfill.RetryCount = 0
-			rs.Backfill.NextAttemptAt = time.Time{}
-			rs.LastAttemptedAt = now
-			setHost(rs)
-			return func(hs *HostStatus) {
-				hs.LastAttemptedAt = now
-			}, nil
-		})
+	if mutate, ok := terminalFailMutation(failErr, now, setHost); ok {
+		return s.updateRepoStatusAndCounts(did, mutate)
 	}
 
 	errMsg := ""
@@ -1727,42 +1697,140 @@ func (s *Store) OnFail(ctx context.Context, did atmos.DID, host string, failErr 
 	return nil
 }
 
+// repoStatusMutation is the read-modify-write updateRepoStatusesAndCounts
+// applies to one row.
+type repoStatusMutation = func(*RepoStatus, bool, Status) (func(*HostStatus), error)
+
+// terminalFailMutation returns the mutation for a failure that ends a DID's
+// backfill rather than failing it, and whether failErr is one: RepoNotFound
+// completes the row (there is nothing to download), and an unavailable repo
+// (deactivated, suspended, or taken down) is StatusUnavailable, so neither
+// the engine nor a retry pass asks again and dashboards don't count it as a
+// failed host. Both clear LastError and the attempt counters so a row that
+// failed earlier for another reason doesn't carry a stale diagnostic into
+// its terminal state.
+func terminalFailMutation(failErr error, now time.Time, setHost func(*RepoStatus)) (repoStatusMutation, bool) {
+	var status Status
+	switch {
+	case isRepoNotFoundError(failErr):
+		status = StatusComplete
+	case isRepoUnavailableError(failErr):
+		status = StatusUnavailable
+	default:
+		return nil, false
+	}
+	return func(rs *RepoStatus, _ bool, _ Status) (func(*HostStatus), error) {
+		rs.Backfill.Status = status
+		rs.Backfill.LastError = ""
+		rs.Backfill.Attempts = 0
+		rs.Backfill.RetryCount = 0
+		rs.Backfill.NextAttemptAt = time.Time{}
+		if status == StatusComplete {
+			rs.Backfill.CompletedAt = now
+		}
+		rs.LastAttemptedAt = now
+		setHost(rs)
+		return func(hs *HostStatus) {
+			hs.LastAttemptedAt = now
+		}, nil
+	}, true
+}
+
+// retryFailure is one retry attempt's failure: the DID, the host the
+// request went to (post-redirect, or "" with no response), the error, and
+// when the DID is next eligible.
+type retryFailure struct {
+	did  atmos.DID
+	host string
+	err  error
+	next time.Time
+}
+
 // RecordRetryFailure records one steady-state failed-repo retry attempt and
 // persists when that DID is next eligible. Unlike OnFail, this is intentionally
 // not part of the atmos bootstrap Store contract: periodic steady-state retry
 // has its own long-lived backoff state that must survive process restarts.
 func (s *Store) RecordRetryFailure(ctx context.Context, did atmos.DID, host string, failErr error, nextAttemptAt time.Time) error {
+	return s.recordRetryFailures(ctx, []retryFailure{{did: did, host: host, err: failErr, next: nextAttemptAt}})
+}
+
+// recordRetryFailures is RecordRetryFailure for several DIDs in one commit:
+// one read for every row and the counts, one for the host aggregates, and
+// one transaction. Each failure's update sees the ones before it, so the
+// result equals one RecordRetryFailure per entry in order.
+func (s *Store) recordRetryFailures(ctx context.Context, fails []retryFailure) error {
 	if err := ctx.Err(); err != nil {
 		s.metrics.incOnFailErrors()
 		return err
 	}
-
+	if len(fails) == 0 {
+		return nil
+	}
 	now := timeNow()
-	bucket, hasBucket := hostBucketFromAuthority(host)
+	recorded := 0
+	keys := [][]byte{[]byte(countsKey)}
+	for _, f := range fails {
+		keys = append(keys, repoKey(f.did))
+	}
+	err := s.writeLocked(ctx, false, fmt.Sprintf("record %d retry failures", len(fails)), keys,
+		func(view *metaView, batch metastore.Batch) error {
+			hosts := make([]string, 0, 2*len(fails))
+			for _, f := range fails {
+				rs, err := readRepoStatusFrom(view, f.did)
+				if err != nil {
+					return err
+				}
+				if rs != nil {
+					hosts = append(hosts, rs.Host)
+				}
+				if bucket, ok := hostBucketFromAuthority(f.host); ok {
+					hosts = append(hosts, bucket)
+				}
+			}
+			if err := prefetchHostStatuses(ctx, view, hosts...); err != nil {
+				return err
+			}
+			for _, f := range fails {
+				if err := s.stageRepoStatusUpdate(ctx, view, batch, f.did, retryFailureMutation(f, now, &recorded)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		s.metrics.incOnFailErrors()
+		return err
+	}
+	for range recorded {
+		s.metrics.incRetryFailed()
+	}
+	return nil
+}
+
+// retryFailureMutation is the row update for one retry failure. Terminal
+// upstream answers take OnFail's terminal states. Any other failure marks
+// the row failed until f.next, but only while a retry pass may still record
+// one: a completion that raced the attempt wins.
+func retryFailureMutation(f retryFailure, now time.Time, recorded *int) repoStatusMutation {
+	bucket, hasBucket := hostBucketFromAuthority(f.host)
 	setHost := func(rs *RepoStatus) {
 		if hasBucket {
 			rs.Host = bucket
 		}
 	}
-
-	if isRepoNotFoundError(failErr) || isRepoUnavailableError(failErr) {
-		return s.OnFail(ctx, did, host, failErr, 1)
+	if mutate, ok := terminalFailMutation(f.err, now, setHost); ok {
+		return mutate
 	}
-
 	errMsg := ""
-	if failErr != nil {
-		errMsg = failErr.Error()
+	if f.err != nil {
+		errMsg = f.err.Error()
 	}
 	errMsg = truncateErrorString(errMsg)
-	errClass := classifyBackfillError(failErr)
-	recorded := false
-	if err := s.updateRepoStatusAndCounts(did, func(rs *RepoStatus, hadRow bool, old Status) (func(*HostStatus), error) {
+	errClass := classifyBackfillError(f.err)
+	return func(rs *RepoStatus, hadRow bool, old Status) (func(*HostStatus), error) {
 		if !hadRow {
-			return nil, fmt.Errorf("backfill: retry failure %s: missing row", did)
+			return nil, fmt.Errorf("backfill: retry failure %s: missing row", f.did)
 		}
-		// Guard against a concurrent terminal transition (e.g. a completion
-		// that raced this attempt): only record a failure for a row still
-		// selected by a retry pass.
 		if !isRetryFailureRecordableStatus(old) {
 			return nil, nil
 		}
@@ -1770,27 +1838,20 @@ func (s *Store) RecordRetryFailure(ctx context.Context, did atmos.DID, host stri
 		rs.Backfill.LastError = errMsg
 		rs.Backfill.Attempts++
 		rs.Backfill.RetryCount++
-		rs.Backfill.NextAttemptAt = nextAttemptAt.UTC()
+		rs.Backfill.NextAttemptAt = f.next.UTC()
 		rs.LastAttemptedAt = now
 		setHost(rs)
-		recorded = true
+		*recorded++
 		return func(hs *HostStatus) {
 			hs.LastAttemptedAt = now
 			hs.addErrorSample(HostErrorSample{
-				DID:         did,
+				DID:         f.did,
 				AttemptedAt: now,
 				Class:       errClass,
 				Error:       errMsg,
 			})
 		}, nil
-	}); err != nil {
-		s.metrics.incOnFailErrors()
-		return err
 	}
-	if recorded {
-		s.metrics.incRetryFailed()
-	}
-	return nil
 }
 
 // DeferRetryAttempt persists host-level backpressure for a due retry candidate
@@ -1799,33 +1860,51 @@ func (s *Store) RecordRetryFailure(ctx context.Context, did atmos.DID, host stri
 // RetryCount, LastAttemptedAt, or host error samples — the repo keeps its
 // current status and is simply rescheduled past the host's parked-until instant.
 func (s *Store) DeferRetryAttempt(ctx context.Context, did atmos.DID, nextAttemptAt time.Time) error {
+	return s.deferRetryAttempts(ctx, []retryDeferral{{did: did, next: nextAttemptAt}})
+}
+
+// retryDeferral reschedules one unattempted retry candidate.
+type retryDeferral struct {
+	did  atmos.DID
+	next time.Time
+}
+
+// deferRetryAttempts is DeferRetryAttempt for several DIDs in one commit.
+func (s *Store) deferRetryAttempts(ctx context.Context, defers []retryDeferral) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	return s.writeLocked(ctx, false, fmt.Sprintf("defer retry repo/%s", did), [][]byte{repoKey(did)},
+	if len(defers) == 0 {
+		return nil
+	}
+	keys := make([][]byte, len(defers))
+	for i, d := range defers {
+		keys[i] = repoKey(d.did)
+	}
+	return s.writeLocked(ctx, false, fmt.Sprintf("defer %d retry repos", len(defers)), keys,
 		func(view *metaView, batch metastore.Batch) error {
-			rs, err := readRepoStatusFrom(view, did)
-			if err != nil {
-				return err
+			for _, d := range defers {
+				rs, err := readRepoStatusFrom(view, d.did)
+				if err != nil {
+					return err
+				}
+				if rs == nil {
+					return fmt.Errorf("backfill: defer retry %s: missing row", d.did)
+				}
+				if !isRetryFailureRecordableStatus(rs.Backfill.Status) {
+					continue
+				}
+				next := d.next.UTC()
+				if !rs.Backfill.NextAttemptAt.IsZero() && rs.Backfill.NextAttemptAt.After(next) {
+					continue
+				}
+				rs.Backfill.NextAttemptAt = next
+				enc, err := encodeRepoStatus(rs)
+				if err != nil {
+					return err
+				}
+				batch.Set(repoKey(d.did), enc)
 			}
-			if rs == nil {
-				return fmt.Errorf("backfill: defer retry %s: missing row", did)
-			}
-			if !isRetryFailureRecordableStatus(rs.Backfill.Status) {
-				return nil
-			}
-			next := nextAttemptAt.UTC()
-			if !rs.Backfill.NextAttemptAt.IsZero() && rs.Backfill.NextAttemptAt.After(next) {
-				return nil
-			}
-			rs.Backfill.NextAttemptAt = next
-
-			enc, err := encodeRepoStatus(rs)
-			if err != nil {
-				return err
-			}
-			batch.Set(repoKey(did), enc)
 			return nil
 		})
 }

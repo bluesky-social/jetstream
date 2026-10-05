@@ -197,6 +197,10 @@ type Config struct {
 	FailedRepoRetryWorkers     int
 	FailedRepoRetryHostWorkers int
 	FailedRepoRetryMaxDelay    time.Duration
+	// PendingRepoPassWorkers is merge's pending pass's worker count; zero
+	// is backfill.DefaultPendingRepoPassWorkers. FailedRepoRetryHostWorkers
+	// bounds each host.
+	PendingRepoPassWorkers int
 
 	// LiveReconnectBackoff, when non-nil, overrides atmos's subscribeRepos
 	// reconnect backoff for both bootstrap-time and steady-state live
@@ -365,6 +369,9 @@ func (c *Config) validate() error {
 	}
 	if c.FailedRepoRetryWorkers < 0 {
 		return fmt.Errorf("%w: FailedRepoRetryWorkers must be >= 0", ErrInvalidConfig)
+	}
+	if c.PendingRepoPassWorkers < 0 {
+		return fmt.Errorf("%w: PendingRepoPassWorkers must be >= 0", ErrInvalidConfig)
 	}
 	if c.FailedRepoRetryHostWorkers < 0 {
 		return fmt.Errorf("%w: FailedRepoRetryHostWorkers must be >= 0", ErrInvalidConfig)

@@ -477,6 +477,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 			SteadyMaxEventsPerBlock:    opts.SteadyMaxEventsPerBlock,
 			FailedRepoRetryInterval:    opts.FailedRepoRetryInterval,
 			FailedRepoRetryWorkers:     opts.FailedRepoRetryWorkers,
+			PendingRepoPassWorkers:     opts.PendingRepoPassWorkers,
 			FailedRepoRetryHostWorkers: opts.FailedRepoRetryHostWorkers,
 			FailedRepoRetryMaxDelay:    opts.FailedRepoRetryMaxDelay,
 			LiveReconnectBackoff:       opts.LiveReconnectBackoff,

@@ -51,8 +51,11 @@ type completionWatermark struct {
 }
 
 type queuedCompletion struct {
-	did       atmos.DID
-	host      string
+	did  atmos.DID
+	host string
+	// pds, when set, re-stamps the row's routing PDS: a retry that reached
+	// the repo only through the relay fallback proved the old stamp stale.
+	pds       string
 	commit    *repo.Commit
 	completed time.Time
 	watermark completionWatermark
@@ -129,6 +132,16 @@ func (b *completionBatcher) RecordWatermark(did atmos.DID, lastSeq uint64, appen
 }
 
 func (b *completionBatcher) QueueComplete(ctx context.Context, did atmos.DID, host string, commit *repo.Commit) error {
+	return b.queueComplete(ctx, did, host, "", commit)
+}
+
+// queueCompleteRestamp is QueueComplete that also re-stamps the row's
+// routing PDS when the completion commits.
+func (b *completionBatcher) queueCompleteRestamp(ctx context.Context, did atmos.DID, host, pds string, commit *repo.Commit) error {
+	return b.queueComplete(ctx, did, host, pds, commit)
+}
+
+func (b *completionBatcher) queueComplete(ctx context.Context, did atmos.DID, host, pds string, commit *repo.Commit) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -149,6 +162,7 @@ func (b *completionBatcher) QueueComplete(ctx context.Context, did atmos.DID, ho
 	completion := queuedCompletion{
 		did:       did,
 		host:      host,
+		pds:       pds,
 		commit:    queuedCommit,
 		completed: timeNow(),
 		watermark: watermark,
@@ -351,6 +365,7 @@ func removeQueuedCompletions(queued, staged []queuedCompletion) []queuedCompleti
 func queuedCompletionEqual(a, b queuedCompletion) bool {
 	return a.did == b.did &&
 		a.host == b.host &&
+		a.pds == b.pds &&
 		a.commit == b.commit &&
 		a.completed.Equal(b.completed) &&
 		a.watermark == b.watermark

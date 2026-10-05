@@ -28,6 +28,7 @@ const (
 	DefaultBackfillAsyncFlushWorkers  = 4
 	DefaultFailedRepoRetryInterval    = backfill.DefaultFailedRepoRetryInterval
 	DefaultFailedRepoRetryWorkers     = backfill.DefaultFailedRepoRetryWorkers
+	DefaultPendingRepoPassWorkers     = backfill.DefaultPendingRepoPassWorkers
 	DefaultFailedRepoRetryHostWorkers = backfill.DefaultFailedRepoRetryHostWorkers
 	DefaultFailedRepoRetryMaxDelay    = backfill.DefaultFailedRepoRetryMaxDelay
 	// DefaultCompactionCacheGrace is a bounded freshness cushion for archive
@@ -81,6 +82,7 @@ type Options struct {
 	SkipMergeDiscovery             bool
 	FailedRepoRetryInterval        time.Duration
 	FailedRepoRetryWorkers         int
+	PendingRepoPassWorkers         int
 	FailedRepoRetryHostWorkers     int
 	FailedRepoRetryMaxDelay        time.Duration
 
