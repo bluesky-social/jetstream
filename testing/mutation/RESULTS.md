@@ -95,9 +95,8 @@ two-round-trip script with `checkSeq`. m067's patch no longer applied
 (`CommitHotBatches` was restructured) and was refreshed to remove the
 fallback's `checkSeq`; m078 removes the new in-database check. Both are
 unit-only by design, like m067 was: correct leaders never commit at a wrong
-seq. Each was verified by hand against `TestScripts_SeqMismatch` and
-`TestScripts_SeqKeyCorrupt` (both fail with the edit in place), not by a
-full campaign; run `just mutation-gate` on a clean tree to confirm.
+seq. `just mutation-gate` at `f903bf7`: **gate PASS — 69 mutants match
+baseline**, m067 and m078 both KILLED@disagg by the script tests.
 
 | mutant | result | what killed it |
 |---|---|---|
