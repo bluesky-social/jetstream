@@ -8,20 +8,22 @@ failure-mode: |
 expected-detection: |
   Correct leaders never diverge, so the layer 3 oracle has no path that
   reaches this check. TestScripts_SeqMismatch commits a batch at the wrong
-  first seq and requires SourceSeq corruption.
+  first seq and requires SourceSeq corruption. An inline batch tries the
+  one-round-trip commit first, whose in-database seq check fails it over
+  to this path, so the mutant still reaches the overwrite.
 expected-tier: disagg
 tiers: disagg
 
 diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
 --- a/internal/catalog/scripts.go
 +++ b/internal/catalog/scripts.go
-@@ -368,9 +368,6 @@
- 	seq, objs := seqRead(Main), newObjectReads(refs...)
- 	out := make([]HotBatchCommit, len(bs))
- 	rev, err := s.run(ctx, TxHotBatch, append([]Read{seq}, objs.reads()...), func(tx Tx, rev uint64) error {
--		if err := checkSeq(seq, bs[0].FirstSeq); err != nil {
--			return err
--		}
- 		ids, err := objs.resolve(ctx, tx)
- 		if err != nil {
- 			return err
+@@ -468,9 +468,6 @@ func (s *Session) CommitHotBatches(ctx context.Context, bs []HotBatch) ([]HotBat
+ 	if !ok {
+ 		seq, objs := seqRead(Main), newObjectReads(refs...)
+ 		rev, err = s.run(ctx, TxHotBatch, append([]Read{seq}, objs.reads()...), func(tx Tx, rev uint64) error {
+-			if err := checkSeq(seq, bs[0].FirstSeq); err != nil {
+-				return err
+-			}
+ 			ids, err := objs.resolve(ctx, tx)
+ 			if err != nil {
+ 				return err

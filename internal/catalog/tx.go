@@ -23,6 +23,12 @@ type DB interface {
 	// BeginRead opens a REPEATABLE READ READ ONLY transaction: every read
 	// through it sees one snapshot.
 	BeginRead(ctx context.Context) (ReadTx, error)
+	// ReadChanges runs one incremental follower read in a REPEATABLE READ
+	// READ ONLY transaction of its own. It must return what ReadChangesTx
+	// returns over a BeginRead. Each follower tick waits on it, and the
+	// visibility of every live event waits on a tick, so over a WAN link a
+	// backend sends it in one round trip rather than one per statement.
+	ReadChanges(ctx context.Context, q ChangesQuery) (Changes, error)
 }
 
 // Listener delivers the revisions leader transactions NOTIFY on commit
@@ -48,6 +54,12 @@ const (
 	TxCompaction TxKind = "compaction"
 	TxGC         TxKind = "gc"
 )
+
+// MetaCheck is a precondition of FenceBumpAt: metadata_kv holds Key with
+// exactly Value.
+type MetaCheck struct {
+	Key, Value []byte
+}
 
 // Tx is one leader write transaction. Each method, and each Read, is one
 // statement against the design §8 schema. The primitives do no checking of
@@ -78,6 +90,14 @@ type Tx interface {
 	// locked nothing, and the transaction is aborted, so Rollback is the
 	// only call left.
 	FenceBump(ctx context.Context, epoch uint64, reads ...Read) (revision uint64, ok bool, err error)
+	// FenceBumpAt is FenceBump for a script that knows the revision its
+	// fence takes and reads nothing: the fence must take revision rev, and
+	// each check must hold. It is queued like a write, so a script that
+	// writes only queued statements commits in one round trip. If the
+	// epoch is stale, the revision is not rev, or a check fails, the
+	// transaction aborts with nothing applied or locked, and the call that
+	// reports it, at the latest Commit, returns ErrPrecondition.
+	FenceBumpAt(ctx context.Context, epoch, rev uint64, checks ...MetaCheck) error
 	// Read runs reads in one round trip, after every queued statement. With
 	// no reads it does nothing.
 	Read(ctx context.Context, reads ...Read) error

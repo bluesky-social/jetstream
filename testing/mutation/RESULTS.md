@@ -5,14 +5,14 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 68 active mutants on disk
-(m001–m077; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
+**Current catalog (keep this line current): 69 active mutants on disk
+(m001–m078; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
 union baseline after disaggregated-storage compaction and GC coverage (Stage 4
 S4.5, m073–m077), disaggregated-storage lifecycle coverage (Stage 3 S3.5,
 m070–m072), disaggregated-storage coverage (Stage 2 S2.19, m062–m069),
 issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **68 killed, 0 survived,
+coverage: **69 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
@@ -33,6 +33,8 @@ merge's final transaction, and the per-DID pending sync-state queue.
 m073–m077 cover disaggregated compaction and GC: GC's claim re-check, the
 sparse rewrite's vanished-DID count and collection counts, the compaction
 refresh after a publish, and GC_DELAY.
+m078 covers the in-database seq check of the one-round-trip inline hot
+batch commit.
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -83,6 +85,24 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Update 2026-10-08 — one-round-trip hot batch commit; m078 added, m067 refreshed
+
+Inline hot batch commits now try `FenceBumpAt` first: the fence takes the
+revision after the session's last and the seq check runs in the database, so
+the commit is one round trip; any precondition failure falls back to the
+two-round-trip script with `checkSeq`. m067's patch no longer applied
+(`CommitHotBatches` was restructured) and was refreshed to remove the
+fallback's `checkSeq`; m078 removes the new in-database check. Both are
+unit-only by design, like m067 was: correct leaders never commit at a wrong
+seq. Each was verified by hand against `TestScripts_SeqMismatch` and
+`TestScripts_SeqKeyCorrupt` (both fail with the edit in place), not by a
+full campaign; run `just mutation-gate` on a clean tree to confirm.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m067_hot_batch_seq_check_skipped | KILLED@disagg | unit only: `TestScripts_SeqMismatch`, `TestScripts_SeqKeyCorrupt` (via the fallback) |
+| m078_hot_batch_db_seq_check_skipped | KILLED@disagg | unit only: `TestScripts_SeqMismatch`, `TestScripts_SeqKeyCorrupt` |
 
 ## Campaign 2026-09-26 — S4.5 compaction and GC; m073–m077, m024/m028/m045 refresh
 

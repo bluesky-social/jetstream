@@ -88,16 +88,21 @@ func (r *readTx) Archive(ctx context.Context) (catalog.ArchiveRow, error) {
 // Namespaces compare with COLLATE "C" so the order is bytewise, as
 // storagefake's, whatever the database's collation.
 
+const segmentsSinceSQL = `SELECT ` + segmentCols + ` FROM segments WHERE revision > $1
+	ORDER BY namespace COLLATE "C", segment_index`
+
+func collectSegments(rows pgx.Rows) ([]catalog.SegmentRow, error) {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.SegmentRow, error) {
+		return scanSegment(row)
+	})
+}
+
 func (r *readTx) SegmentsSince(ctx context.Context, rev uint64) ([]catalog.SegmentRow, error) {
-	rows, err := r.tx.Query(ctx,
-		`SELECT `+segmentCols+` FROM segments WHERE revision > $1
-		 ORDER BY namespace COLLATE "C", segment_index`, clampSeq(rev))
+	rows, err := r.tx.Query(ctx, segmentsSinceSQL, clampSeq(rev))
 	if err != nil {
 		return nil, r.fail("segments", err)
 	}
-	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.SegmentRow, error) {
-		return scanSegment(row)
-	})
+	out, err := collectSegments(rows)
 	if err != nil {
 		return nil, r.fail("segments", err)
 	}
@@ -111,13 +116,17 @@ func (r *readTx) Generations(ctx context.Context, ids []uint64) ([]catalog.Gener
 	if err != nil {
 		return nil, r.fail("generations", err)
 	}
-	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.GenerationRow, error) {
-		return scanGeneration(row)
-	})
+	out, err := collectGenerations(rows)
 	if err != nil {
 		return nil, r.fail("generations", err)
 	}
 	return out, nil
+}
+
+func collectGenerations(rows pgx.Rows) ([]catalog.GenerationRow, error) {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.GenerationRow, error) {
+		return scanGeneration(row)
+	})
 }
 
 // readStatementObjects and readStatementGenerations cap the IDs one read
@@ -171,10 +180,11 @@ func (r *readTx) GenerationBlocks(ctx context.Context, ids []uint64) ([]catalog.
 	return out, nil
 }
 
+const activeBlocksSinceSQL = `SELECT ` + activeBlockCols + ` FROM active_segment_blocks WHERE revision > $1
+	ORDER BY namespace COLLATE "C", segment_index, ordinal`
+
 func (r *readTx) ActiveBlocksSince(ctx context.Context, rev uint64) ([]catalog.ActiveBlockRow, error) {
-	rows, err := r.tx.Query(ctx,
-		`SELECT `+activeBlockCols+` FROM active_segment_blocks WHERE revision > $1
-		 ORDER BY namespace COLLATE "C", segment_index, ordinal`, clampSeq(rev))
+	rows, err := r.tx.Query(ctx, activeBlocksSinceSQL, clampSeq(rev))
 	if err != nil {
 		return nil, r.fail("active_blocks", err)
 	}
@@ -185,14 +195,11 @@ func (r *readTx) ActiveBlocksSince(ctx context.Context, rev uint64) ([]catalog.A
 	return out, nil
 }
 
-func (r *readTx) ActiveBlockKeys(ctx context.Context) ([]catalog.ActiveBlockKey, error) {
-	rows, err := r.tx.Query(ctx,
-		`SELECT namespace, segment_index, ordinal FROM active_segment_blocks
-		 ORDER BY namespace COLLATE "C", segment_index, ordinal`)
-	if err != nil {
-		return nil, r.fail("active_block_keys", err)
-	}
-	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.ActiveBlockKey, error) {
+const activeBlockKeysSQL = `SELECT namespace, segment_index, ordinal FROM active_segment_blocks
+	ORDER BY namespace COLLATE "C", segment_index, ordinal`
+
+func collectActiveBlockKeys(rows pgx.Rows) ([]catalog.ActiveBlockKey, error) {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.ActiveBlockKey, error) {
 		var (
 			k  catalog.ActiveBlockKey
 			ns string
@@ -201,21 +208,44 @@ func (r *readTx) ActiveBlockKeys(ctx context.Context) ([]catalog.ActiveBlockKey,
 		k.Namespace = catalog.Namespace(ns)
 		return k, err
 	})
+}
+
+func (r *readTx) ActiveBlockKeys(ctx context.Context) ([]catalog.ActiveBlockKey, error) {
+	rows, err := r.tx.Query(ctx, activeBlockKeysSQL)
+	if err != nil {
+		return nil, r.fail("active_block_keys", err)
+	}
+	out, err := collectActiveBlockKeys(rows)
 	if err != nil {
 		return nil, r.fail("active_block_keys", err)
 	}
 	return out, nil
 }
 
+// hotBatchCols are a hot_batches read's columns. $1 and $2 are framesFrom,
+// clamped, and whether it fits a bigint, as hotBatchArgs gives them: a frame
+// loads only at or above framesFrom.
+const hotBatchCols = `first_seq, last_seq, event_count, min_witnessed_us, max_witnessed_us, epoch, revision,
+	committed_at, CASE WHEN $2 AND first_seq >= $1 THEN frame END, object_id, frame IS NOT NULL`
+
+func hotBatchArgs(framesFrom uint64) []any {
+	return []any{clampSeq(framesFrom), framesFrom <= math.MaxInt64}
+}
+
 func (r *readTx) HotBatches(ctx context.Context, framesFrom uint64) ([]catalog.HotBatchRow, error) {
-	rows, err := r.tx.Query(ctx,
-		`SELECT first_seq, last_seq, event_count, min_witnessed_us, max_witnessed_us, epoch, revision,
-		        committed_at, CASE WHEN $2 AND first_seq >= $1 THEN frame END, object_id, frame IS NOT NULL
-		 FROM hot_batches ORDER BY first_seq`, clampSeq(framesFrom), framesFrom <= math.MaxInt64)
+	rows, err := r.tx.Query(ctx, `SELECT `+hotBatchCols+` FROM hot_batches ORDER BY first_seq`, hotBatchArgs(framesFrom)...)
 	if err != nil {
 		return nil, r.fail("hot_batches", err)
 	}
-	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.HotBatchRow, error) {
+	out, err := collectHotBatches(rows, framesFrom)
+	if err != nil {
+		return nil, r.fail("hot_batches", err)
+	}
+	return out, nil
+}
+
+func collectHotBatches(rows pgx.Rows, framesFrom uint64) ([]catalog.HotBatchRow, error) {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (catalog.HotBatchRow, error) {
 		var (
 			h   catalog.HotBatchRow
 			obj pgtype.Int8
@@ -228,10 +258,6 @@ func (r *readTx) HotBatches(ctx context.Context, framesFrom uint64) ([]catalog.H
 		}
 		return h, err
 	})
-	if err != nil {
-		return nil, r.fail("hot_batches", err)
-	}
-	return out, nil
 }
 
 func (r *readTx) Objects(ctx context.Context, ids []uint64) ([]catalog.ObjectRow, error) {
@@ -253,21 +279,33 @@ func (r *readTx) Objects(ctx context.Context, ids []uint64) ([]catalog.ObjectRow
 	return out, nil
 }
 
-func (r *readTx) MetaGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+const metaGetSQL = `SELECT key, value FROM metadata_kv WHERE key = ANY($1::bytea[])`
+
+func metaKeys(keys [][]byte) [][]byte {
 	ks := make([][]byte, len(keys))
 	for i, k := range keys {
 		ks[i] = nonNil(k)
 	}
-	rows, err := r.tx.Query(ctx, `SELECT key, value FROM metadata_kv WHERE key = ANY($1::bytea[])`, ks)
-	if err != nil {
-		return nil, r.fail("meta_get", err)
-	}
+	return ks
+}
+
+func collectMeta(rows pgx.Rows) (map[string][]byte, error) {
 	out := map[string][]byte{}
 	var k, v []byte
-	_, err = pgx.ForEachRow(rows, []any{&k, &v}, func() error {
+	_, err := pgx.ForEachRow(rows, []any{&k, &v}, func() error {
 		out[string(k)] = nonNil(v)
 		return nil
 	})
+	return out, err
+}
+
+func (r *readTx) MetaGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+	ks := metaKeys(keys)
+	rows, err := r.tx.Query(ctx, metaGetSQL, ks)
+	if err != nil {
+		return nil, r.fail("meta_get", err)
+	}
+	out, err := collectMeta(rows)
 	if err != nil {
 		return nil, r.fail("meta_get", err)
 	}

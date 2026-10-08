@@ -68,6 +68,7 @@
     {"id":"m074_sparse_vanished_did_miscount","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader, segment verify: header unique_did_count mismatch (seeds 1, 5); unit: TestSparseRewriteMatchesRewrite"},
     {"id":"m075_sparse_collection_count_stale","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader, segment verify: collection count mismatch (all 8 seeds); unit: TestSparseRewriteMatchesRewrite"},
     {"id":"m076_compaction_skips_refresh_after_publish","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: leader exits on corruption, main segment not sealed at the source generation (seeds 2, 7, 8)"},
-    {"id":"m077_gc_ignores_delay","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader read late, object no longer available (all 8 seeds); unit: TestGC"}
+    {"id":"m077_gc_ignores_delay","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader read late, object no longer available (all 8 seeds); unit: TestGC"},
+    {"id":"m078_hot_batch_db_seq_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"unit only: TestScripts_SeqMismatch/SeqKeyCorrupt (correct leaders never reach the in-database seq check)"}
   ]
 }
