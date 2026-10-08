@@ -2,10 +2,10 @@ package jetstream
 
 import "sync"
 
-// batcher groups events into batches by count, with a max-latency flush so a
-// low-volume live tail does not hold events indefinitely (the design's
-// tens-of-milliseconds delivery goal) and a final flush for the partial tail
-// when the stream ends.
+// batcher groups events into batches by count. Partial batches are flushed
+// when the live consumer drains a server burst, by a max-latency ticker as a
+// backstop, and once more for the partial tail when the stream ends, so a
+// low-volume live tail never holds events waiting for a full batch.
 //
 // It is safe for concurrent use: add is called from the backfill goroutine and
 // (after cutover) the live goroutine, while a periodic flusher may fire from a

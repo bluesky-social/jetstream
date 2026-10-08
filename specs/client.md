@@ -143,6 +143,21 @@ websocket once with `?cursor=max(S, lastProcessedSeq)`.
 → emit, reconnecting on error with exponential backoff (250ms → 30s,
 progress resets it).
 
+**Batch latency** (`startFrameReader`, `liveConfig.onDrain`): a per-session
+reader goroutine moves raw frames into a small queue (`liveFrameQueue`), and
+the decode loop drains it. When the queue is empty after an emitted event,
+the consumer has handled everything the server sent so far, and `onDrain`
+flushes the batcher's partial batch. The server sends live events in bursts
+smaller than the default batch size, so this delivers each burst at the end
+of its decode, not on the next tick. Under a backlog the queue stays
+non-empty and batches still fill to `BatchSize`. The `MaxBatchDelay` ticker
+(`startFlusher`, default 20ms, `WithMaxBatchDelay`) remains the upper bound
+for a stream that never drains. A frame still inside `conn.Read` can make the
+queue look empty for a moment; the only cost is an early, smaller flush. The
+reader stops with the session: `stopReader` closes the conn (normal close
+handshake), then cancels the read ctx, then waits for the goroutine to exit.
+A read error reaches the decode loop after every frame read before it.
+
 **Wire and framing** (`subscribeURL`, `dialWebsocket`, `livedecode.go`):
 the dial offers `xrpc.v1.json` via `Sec-WebSocket-Protocol` and verifies
 the echo (RFC 6455 §4.1: a non-offered selection fails the connection; an
@@ -284,8 +299,9 @@ is the legacy `/subscribe` endpoint, which uses a different dictionary.
   `ErrFatal` "already running" error.
 - `Batch.Events()` + `Batch.LastCursor()` — batches amortize cursor
   persistence: process the batch, persist `LastCursor` once (default batch
-  size 64, `WithBatchSize`; live partial batches flush on
-  `MaxBatchDelay`, default 20ms).
+  size 64, `WithBatchSize`; a live partial batch is delivered as soon as the
+  consumer has drained the server's current burst, with `WithMaxBatchDelay`,
+  default 20ms, as the upper bound).
 - Replay window: `WithAfterSeq` (exclusive; `WithAfterSeq(0)` = the
   whole archive) / `WithBeforeSeq` (inclusive; requires
   `WithSnapshotOnly` — a live tail with an upper bound would silently

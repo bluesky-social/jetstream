@@ -437,3 +437,217 @@ func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
 	require.NoError(t, <-errCh, "context cancel is a clean stop")
 	require.Equal(t, 1, got)
 }
+
+// feedConn is a wsConn whose frames the test pushes while the consumer runs.
+// Unlike scriptedConn, Read blocks until a frame is fed, the conn is closed,
+// or ctx ends, so a test can model a server that goes quiet between bursts.
+type feedConn struct {
+	feed      chan readStep
+	closed    chan struct{}
+	closeOnce sync.Once
+	reads     atomic.Int64 // Read calls entered
+	active    atomic.Int64 // Read calls not yet returned
+}
+
+func newFeedConn() *feedConn {
+	return &feedConn{feed: make(chan readStep, 1024), closed: make(chan struct{})}
+}
+
+func (c *feedConn) push(steps ...readStep) {
+	for _, s := range steps {
+		c.feed <- s
+	}
+}
+
+func (c *feedConn) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	c.reads.Add(1)
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	select {
+	case s := <-c.feed:
+		if s.err != nil {
+			return 0, nil, s.err
+		}
+		mt := s.msgType
+		if mt == 0 {
+			mt = websocket.MessageText
+		}
+		return mt, s.data, nil
+	case <-c.closed:
+		return 0, nil, errors.New("feed conn closed")
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+}
+
+func (c *feedConn) Close(websocket.StatusCode, string) error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *feedConn) SetReadLimit(int64) {}
+
+// feedDialer hands out conn on the first dial and a fresh, silent feedConn on
+// every reconnect, so a test's frames are only ever read by the first session.
+func feedDialer(conn *feedConn) dialFunc {
+	var dials atomic.Int64
+	return func(context.Context, string) (wsConn, error) {
+		if dials.Add(1) == 1 {
+			return conn, nil
+		}
+		return newFeedConn(), nil
+	}
+}
+
+func feedFrames(t *testing.T, from, to uint64) []readStep {
+	t.Helper()
+	var steps []readStep
+	for seq := from; seq <= to; seq++ {
+		steps = append(steps, readStep{data: liveCommitFrame(t, seq, "did:plc:a", "create", "app.bsky.feed.post", "r"+itoaU(seq), true)})
+	}
+	return steps
+}
+
+// TestLiveConsumerBacklogFillsBatches pins that the drain flush does not
+// shrink batches while frames are queued: only the frame that empties the
+// queue releases a partial batch. The emit gate holds decode on the first
+// event until the reader has queued the rest, which makes the queue depth
+// (and so the batch boundaries) deterministic.
+func TestLiveConsumerBacklogFillsBatches(t *testing.T) {
+	t.Parallel()
+	const total = liveFrameQueue + 1
+	conn := newFeedConn()
+	conn.push(feedFrames(t, 1, total)...)
+
+	var (
+		mu      sync.Mutex
+		batches [][]uint64
+		drains  int
+	)
+	b := newBatcher(4, func(batch []Event) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		batches = append(batches, seqs(batch))
+		return true
+	}, nil)
+	c := newLiveConsumer(liveConfig{
+		host: "https://h",
+		dial: feedDialer(conn),
+		onDrain: func() bool {
+			mu.Lock()
+			drains++
+			mu.Unlock()
+			return b.flush()
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gate := make(chan struct{})
+	first := true
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, func(ev *Event, err error) bool {
+			if err != nil {
+				return true
+			}
+			if first {
+				first = false
+				<-gate
+			}
+			return b.add(*ev)
+		})
+	}()
+
+	// Read number total+1 starts only after frame total was queued, and the
+	// queue can hold frames 2..total only once decode has taken frame 1.
+	require.Eventually(t, func() bool { return conn.reads.Load() > total }, 5*time.Second, time.Millisecond)
+	close(gate)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return drains > 0
+	}, 5*time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, [][]uint64{{1, 2, 3, 4}, {5, 6, 7, 8}, {9}}, batches)
+	require.Equal(t, 1, drains, "only the frame that empties the queue signals a drain")
+}
+
+// TestLiveConsumerReaderExitsWithSession guards the reader goroutine's
+// lifetime: every way a session ends must leave no Read in flight once Run
+// returns.
+func TestLiveConsumerReaderExitsWithSession(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		emit    func(cancel context.CancelFunc) func(*Event, error) bool
+		onDrain func() bool
+	}{
+		{
+			name: "ctx cancel",
+			emit: func(cancel context.CancelFunc) func(*Event, error) bool {
+				return func(*Event, error) bool { cancel(); return true }
+			},
+		},
+		{
+			name: "emit stop",
+			emit: func(context.CancelFunc) func(*Event, error) bool {
+				return func(*Event, error) bool { return false }
+			},
+		},
+		{
+			name: "drain stop",
+			emit: func(context.CancelFunc) func(*Event, error) bool {
+				return func(*Event, error) bool { return true }
+			},
+			onDrain: func() bool { return false },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			conn := newFeedConn()
+			conn.push(feedFrames(t, 1, 1)...)
+			c := newLiveConsumer(liveConfig{host: "https://h", dial: feedDialer(conn), onDrain: tc.onDrain})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- c.Run(ctx, tc.emit(cancel)) }()
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return")
+			}
+			require.Equal(t, uint64(1), c.LastSeq())
+			require.Zero(t, conn.active.Load(), "reader goroutine must have exited with the session")
+		})
+	}
+}
+
+// TestLiveConsumerReadErrorAfterFrames pins that the read-ahead goroutine keeps
+// order: frames read before a transport error are all handled before the
+// session returns that error, wrapped as before.
+func TestLiveConsumerReadErrorAfterFrames(t *testing.T) {
+	t.Parallel()
+	errBoom := errors.New("boom")
+	conn := newFeedConn()
+	conn.push(feedFrames(t, 1, 3)...)
+	conn.push(readStep{err: errBoom})
+	c := newLiveConsumer(liveConfig{host: "https://h", dial: feedDialer(conn)})
+
+	var got []uint64
+	err := c.session(context.Background(), func(ev *Event, err error) bool {
+		require.NoError(t, err)
+		got = append(got, ev.Seq)
+		return true
+	})
+	require.ErrorIs(t, err, errBoom)
+	require.True(t, strings.HasPrefix(err.Error(), "read: "), "got %q", err)
+	require.Equal(t, []uint64{1, 2, 3}, got)
+	require.Zero(t, conn.active.Load(), "reader goroutine must have exited with the session")
+}

@@ -81,8 +81,20 @@ func TestOptionsRejectNonPositive(t *testing.T) {
 	WithBatchSize(-5)(&cfg)
 	WithDownloadConcurrency(0)(&cfg)
 	WithDownloadConcurrency(-3)(&cfg)
+	WithMaxBatchDelay(0)(&cfg)
+	WithMaxBatchDelay(-time.Second)(&cfg)
 	require.Equal(t, defaultBatchSize, cfg.batchSize, "non-positive batch size must be ignored")
 	require.Equal(t, defaultDownloadConc(), cfg.downloadConc, "non-positive concurrency must be ignored (auto-sized default retained)")
+	require.Zero(t, cfg.maxBatchDelay, "non-positive batch delay must be ignored (engine default retained)")
+}
+
+func TestWithMaxBatchDelayReachesEngine(t *testing.T) {
+	t.Parallel()
+	c, err := Subscribe("host", WithMaxBatchDelay(time.Hour))
+	require.NoError(t, err)
+	eng, ok := c.engine.(*replayEngine)
+	require.True(t, ok)
+	require.Equal(t, time.Hour, eng.cfg.MaxBatchDelay)
 }
 
 // Not parallel: mutates the process-global GOMAXPROCS.

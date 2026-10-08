@@ -23,6 +23,7 @@ type config struct {
 	snapshotOnly   bool
 	liveCursor     uint64
 	batchSize      int
+	maxBatchDelay  time.Duration
 	downloadConc   int
 	segmentStripes int
 	// apiKey and hasAPIKey are constructor-only bearer-secret material. The
@@ -221,6 +222,21 @@ func WithBatchSize(n int) Option {
 	return func(c *config) {
 		if n > 0 {
 			c.batchSize = n
+		}
+	}
+}
+
+// WithMaxBatchDelay caps how long the live tail holds a partially-filled batch
+// before delivering it. The client already delivers a partial batch as soon as
+// it has handled every frame the server has sent so far, so at the tip each
+// burst arrives with no added wait and this delay only applies to a stream
+// that never pauses between frames. Under a sustained backlog batches still
+// fill to WithBatchSize. Archive replay fills batches by count and is
+// unaffected. Must be > 0; ignored otherwise. Default 20ms.
+func WithMaxBatchDelay(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.maxBatchDelay = d
 		}
 	}
 }

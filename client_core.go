@@ -25,9 +25,10 @@ import (
 const maxRebackfillStalls = 5
 
 // defaultMaxBatchDelay bounds how long a partially-filled batch waits before
-// being flushed, so a low-volume live tail still delivers promptly rather than
-// holding events until BatchSize accumulates. Backfill fills batches by count
-// almost immediately, so this only governs the steady-state tail.
+// being flushed. The live tail normally flushes sooner, as soon as it has
+// drained each server burst (liveConfig.onDrain); this ticker is the upper
+// bound for a stream that never goes quiet between frames. Backfill fills
+// batches by count almost immediately, so it only governs the live tail.
 const defaultMaxBatchDelay = 20 * time.Millisecond
 
 // liveCursorDedupFloor maps the overloaded initial wire cursor to the seq
@@ -52,7 +53,8 @@ type engineConfig struct {
 	LiveCursor   uint64 // pure-live resume cursor when !Backfill
 	BatchSize    int
 	// MaxBatchDelay bounds how long a partial batch waits before flushing in
-	// the steady-state live tail. Zero uses defaultMaxBatchDelay.
+	// the steady-state live tail, on top of the flush when a burst drains.
+	// Zero uses defaultMaxBatchDelay.
 	MaxBatchDelay time.Duration
 	Concurrency   int
 	// SegmentStripes sets the per-segment range-request fan-out; 0 uses the
@@ -346,6 +348,7 @@ func (e *replayEngine) runLiveOnly(ctx context.Context, emitBatch func([]Event) 
 		logger:      e.logger,
 		backoffMin:  e.cfg.LiveBackoffMin,
 		mode:        e.cfg.recordMode(),
+		onDrain:     b.flush,
 	})
 	// Route both events and errors through the batcher so the downstream yield
 	// is serialized against the flusher goroutine, and an error the consumer
@@ -390,7 +393,8 @@ func (e *replayEngine) wantsLive(ev *Event) bool {
 }
 
 // startFlusher runs a background ticker that flushes the batcher's partial tail
-// at most every MaxBatchDelay, so a low-volume live tail delivers promptly. It
+// every MaxBatchDelay. The live consumer already flushes when it drains a
+// burst, so this is the latency upper bound for a stream that never drains. It
 // returns a stop function (idempotent) that halts the ticker and waits for it
 // to exit.
 func (e *replayEngine) startFlusher(ctx context.Context, b *batcher) func() {
@@ -718,6 +722,7 @@ func (e *replayEngine) tailLiveFromCutover(ctx context.Context, b *batcher, cuto
 		logger:         e.logger,
 		backoffMin:     e.cfg.LiveBackoffMin,
 		mode:           e.cfg.recordMode(),
+		onDrain:        b.flush,
 	})
 	err = consumer.Run(ctx, func(ev *Event, cerr error) bool {
 		if cerr != nil {
