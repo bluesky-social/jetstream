@@ -65,6 +65,23 @@ Compaction selects blocks by DID (segment and per-block DID blooms). A backfill 
 
 ## Lessons
 
+### atmos ends `Events` on any HTTP response to a dial — the live consumer must resubscribe
+
+atmos wraps every dial that came back with an HTTP response (not just a
+wrong URL, but also a 502/503/429 from an overloaded relay or its load
+balancer) in a non-retryable `*streaming.DialError`, yields it once, and
+ends the iterator. On 2026-09-29 the pop3 relay did exactly that during a
+DDoS; `live.Consumer.Run` fell out of its range loop and returned nil, the
+steady-state errgroup kept the compactor and failed-repo retry alive, and
+the process sat in `steady_state` for ten days with no firehose and no
+socket. Two fixes: atmos now retries 408/425/429/5xx inside its own
+reconnect backoff, and `Run` re-enters `client.Events` with backoff
+(capped at 5m) until ctx is done for the rejections atmos still treats
+as terminal, counting them on
+`jetstream_livestream_dial_rejections_total`. Keep both: never let an
+upstream condition turn into a nil return from a long-lived ingest loop.
+Area: `internal/ingest/live/consumer.go`, atmos `streaming`.
+
 ### A restart-tier recovery child hangs if the relay is quiet — generate traffic between children
 
 The oracle restart child's cutover delivery gate (`cutoverDeliveryGate` in the restart harness) deliberately treats zero observations as "the bootstrap-live consumer hasn't delivered yet — keep waiting," because a fresh child always replays from seq 1. But a *recovery* child whose predecessor already archived every firehose frame and persisted cursor == relay tip resumes at the tip, observes nothing, and the gate waits forever — the test fails as an opaque 30s child timeout. The fix is not to weaken the gate (the zero-observations rule is what catches real delivery loss): generate a couple of fresh live events between the first child's exit and the recovery child's start (`liveEventsBetweenChildren` in the segment-fault scenarios), which mirrors reality — the relay doesn't stop when jetstream restarts. If you write a new fault/crash scenario whose first child runs long enough to fully drain the firehose, you need this too. Area: `internal/oracle/restart_harness_test.go` (gate), `restart_segmentfault_test.go` (the pattern).

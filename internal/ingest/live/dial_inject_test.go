@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/streaming"
+	"github.com/jcalabro/gt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -280,4 +282,111 @@ func TestConsumer_Run_UnknownAndErrorFramesClassified(t *testing.T) {
 
 	got := readAllSegmentEvents(t, dir)
 	require.Len(t, got, 3, "recognized events on all sides must archive")
+}
+
+// TestConsumer_Run_ResubscribesAfterRejectedDial pins the pop3 outage
+// (2026-09-29): during a relay DDoS the reconnect dial got an HTTP
+// error response instead of a websocket upgrade. atmos ends its Events
+// iterator on a *DialError, and Run used to return nil with its ctx
+// still live. The steady-state errgroup does not cancel on a nil
+// return, so the process stayed in steady_state for days with no
+// firehose. atmos now retries overload statuses itself; a 404 is still
+// terminal there (a relay mid-deploy can serve one), so it drives the
+// path here. Run must keep resubscribing, resume from the watermark
+// cursor, and count the rejections.
+func TestConsumer_Run_ResubscribesAfterRejectedDial(t *testing.T) {
+	t.Parallel()
+
+	first := newMemConn(encodeIdentityFrame(t, "did:plc:aaa", 1))
+	second := newMemConn(encodeIdentityFrame(t, "did:plc:bbb", 2))
+
+	const rejections = 3
+	var (
+		mu      sync.Mutex
+		dials   int
+		dialURL []string
+	)
+	dial := func(_ context.Context, url string, _ streaming.DialConfig) (streaming.Conn, *http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		dials++
+		dialURL = append(dialURL, url)
+		switch {
+		case dials == 1:
+			return first, nil, nil
+		case dials <= 1+rejections:
+			return nil, &http.Response{StatusCode: http.StatusNotFound}, errors.New("expected handshake response status code 101 but got 404")
+		default:
+			return second, nil, nil
+		}
+	}
+
+	st := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "live_segments")
+	metrics := NewMetrics(prometheus.NewRegistry())
+
+	var delivered atomic.Int64
+	c, err := Open(Config{
+		SegmentsDir:       dir,
+		Store:             st,
+		SeqKey:            "live_segments/seq/next",
+		CursorKey:         "relay/cursor",
+		RelayURL:          "https://relay.invalid",
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:          newTestVerifier(t),
+		Metrics:           metrics,
+		MaxEventsPerBlock: 1,
+		OnEvent:           func(*segment.Event) { delivered.Add(1) },
+		ReconnectBackoff: &streaming.BackoffPolicy{
+			InitialDelay: gt.Some(time.Millisecond),
+			MaxDelay:     gt.Some(5 * time.Millisecond),
+		},
+		Dial: dial,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- c.Run(ctx) }()
+
+	require.Eventually(t, func() bool { return delivered.Load() >= 1 },
+		3*time.Second, time.Millisecond, "first connection never delivered")
+
+	// Drop the first connection; atmos redials and the relay rejects.
+	first.closeOnce()
+
+	require.Eventually(t, func() bool { return delivered.Load() >= 2 },
+		3*time.Second, time.Millisecond,
+		"consumer never resubscribed after the relay rejected the reconnect dial")
+
+	select {
+	case err := <-runErr:
+		t.Fatalf("Run returned with a live ctx: %v", err)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	require.NoError(t, c.Close())
+
+	require.InDelta(t, float64(rejections), testutil.ToFloat64(metrics.DialRejections), 0,
+		"every rejected dial must land on dial_rejections_total")
+	require.Zero(t, testutil.ToFloat64(metrics.DecodeErrors),
+		"a rejected dial is not a decode error")
+
+	mu.Lock()
+	last := dialURL[len(dialURL)-1]
+	mu.Unlock()
+	require.Contains(t, last, "cursor=1", "the resubscribe must resume from the watermark, not replay from scratch")
+
+	got := readAllSegmentEvents(t, dir)
+	require.Len(t, got, 2)
 }

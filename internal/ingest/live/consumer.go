@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -480,7 +482,9 @@ func (c *Consumer) saveCursorAndSyncState(cur int64) error {
 //
 // Reconnects with exponential backoff are handled internally by
 // atmos's streaming.Client; Run does not see transient network
-// errors as terminal.
+// errors as terminal. Run only returns once ctx is done or on a
+// fatal local error: a relay that rejects the dial is retried
+// forever, never surfaced as a return.
 func (c *Consumer) Run(ctx context.Context) error {
 	ctx = ingest.WithClass(ctx, ingest.ClassLive)
 	c.closeMu.Lock()
@@ -551,27 +555,82 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 	}()
 
-	for batch, err := range client.Events(ctx) {
-		if err != nil {
-			// Stream-level errors flow through here; atmos has
-			// already flushed the partial batch as nil + err.
-			// Classify, log, and continue — the next iteration
-			// will either reconnect or yield the next batch.
-			c.noteStreamError(ctx, err)
-			continue
+	// atmos ends its iterator on a *DialError: a dial the relay answered
+	// with an HTTP rejection instead of an upgrade (atmos <= v0.7.2 also
+	// did this for 502/503/429 from a relay under load). For a long-lived
+	// ingester that is never terminal: returning would leave the caller's
+	// errgroup running everything except the firehose (pop3, 2026-09-29),
+	// so resubscribe with backoff until ctx is cancelled. The client keeps
+	// its watermark cursor across Events calls.
+	for attempt := 0; ; attempt++ {
+		for batch, err := range client.Events(ctx) {
+			if err != nil {
+				// Stream-level errors flow through here; atmos has
+				// already flushed the partial batch as nil + err.
+				// Classify, log, and continue — the next iteration
+				// will either reconnect or yield the next batch.
+				c.noteStreamError(ctx, err)
+				continue
+			}
+			attempt = 0
+
+			if perr := c.processBatch(ctx, batch); perr != nil {
+				return perr
+			}
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 
-		if perr := c.processBatch(ctx, batch); perr != nil {
-			return perr
+		d := resubscribeDelay(c.cfg.ReconnectBackoff, attempt)
+		c.cfg.Metrics.incReconnects()
+		c.logger.ErrorContext(ctx, "upstream stream ended; resubscribing",
+			"attempt", attempt,
+			"delay", d,
+			"cursor", client.Cursor(),
+		)
+		t := time.NewTimer(d)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
 		}
 	}
+}
 
-	return ctx.Err()
+// resubscribeMaxDelay caps the default resubscribe backoff. atmos
+// already retries overload statuses (5xx/429) itself, so an ended
+// iterator means a rejection that looks deterministic (404, 403, a bad
+// handshake) — usually a relay misconfiguration or deploy that an
+// operator has to fix. Keep probing, but slowly enough not to hammer it.
+const resubscribeMaxDelay = 5 * time.Minute
+
+// resubscribeDelay is the wait before re-entering client.Events after
+// atmos ended it: exponential with full jitter, like atmos's reconnect
+// backoff (whose delay computation is unexported), but with a longer
+// default cap. p overrides the policy for test harnesses.
+func resubscribeDelay(p *streaming.BackoffPolicy, attempt int) time.Duration {
+	var b streaming.BackoffPolicy
+	if p != nil {
+		b = *p
+	}
+	initial := b.InitialDelay.ValOr(time.Second)
+	maxDelay := b.MaxDelay.ValOr(resubscribeMaxDelay)
+	d := float64(initial) * math.Pow(b.Multiplier.ValOr(2), float64(attempt))
+	if d > float64(maxDelay) {
+		d = float64(maxDelay)
+	}
+	if b.Jitter.ValOr(true) {
+		d *= rand.Float64()
+	}
+	return time.Duration(d)
 }
 
 // noteStreamError counts stream errors by operator response: GapError reports
 // upstream loss; UnknownFrameError may require an upgrade; StreamError
 // records the relay's code (persistent FutureCursor requires intervention);
+// DialError counts relay dial rejections (Run resubscribes after them);
 // DropError counts verifier queue losses, including coalesced drops. Other
 // errors count as decode failures. Queue drops are permanent local archive
 // loss because the cursor advances past the unarchived event.
@@ -599,6 +658,14 @@ func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 		c.logger.WarnContext(ctx, "error frame from relay",
 			"code", se.Code,
 			"message", se.Message,
+		)
+		return
+	}
+	if de, ok := errors.AsType[*streaming.DialError](err); ok {
+		c.cfg.Metrics.incDialRejections()
+		c.logger.ErrorContext(ctx, "relay rejected subscribe dial",
+			"status", de.StatusCode,
+			"err", de.Err,
 		)
 		return
 	}
