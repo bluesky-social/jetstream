@@ -25,17 +25,45 @@ var adversarialOpCases = []struct {
 	badKey string
 	reason string
 }{
-	{"null_byte_rkey", "app.bsky.feed.post/bad\x00key", "invalid_rkey"},
-	{"emoji_rkey", "app.bsky.feed.post/bad\U0001F600key", "invalid_rkey"},
 	{"dot_rkey", "app.bsky.feed.post/.", "invalid_rkey"},
 	{"dotdot_rkey", "app.bsky.feed.post/..", "invalid_rkey"},
 	{"rkey_over_512", "app.bsky.feed.post/" + strings.Repeat("x", 600), "invalid_rkey"},
 	{"rkey_unrepresentable_300", "app.bsky.feed.post/" + strings.Repeat("x", 300), "field_too_long"},
-	{"dollar_collection", "$account/3lzzzzzzzzz2a", "invalid_collection"},
-	{"empty_collection", "/3lzzzzzzzzz2a", "invalid_collection"},
-	{"no_slash", "nosslashatall", "invalid_collection"},
-	{"unicode_collection", "app.bskÿ.feed.post/3lzzzzzzzzz2a", "invalid_collection"},
+	{"no_dot_collection", "nodots/3lzzzzzzzzz2a", "invalid_collection"},
 	{"two_segment_nsid", "bsky.post/3lzzzzzzzzz2a", "invalid_collection"},
+	{"trailing_dot_collection", "app.bsky.feed./3lzzzzzzzzz2a", "invalid_collection"},
+}
+
+// mstInvalidKeys are path lies atmos (>= v0.7.2) refuses as an invalid
+// tree, so they can never reach jetstream's ingest gate. The generators
+// must refuse them up front rather than half-apply a commit. If atmos
+// ever loosens this, these become gate cases again and belong above.
+var mstInvalidKeys = []string{
+	"app.bsky.feed.post/bad\x00key",
+	"app.bsky.feed.post/bad\U0001F600key",
+	"app.bsky.feed.post/bad\xff\xfekey",
+	"app.bsky.feed.post/bad/extra",
+	"$account/3lzzzzzzzzz2a",
+	"/3lzzzzzzzzz2a",
+	"nosslashatall",
+	"app.bskÿ.feed.post/3lzzzzzzzzz2a",
+}
+
+func TestAdversarialGenerators_RefuseMSTInvalidKeys(t *testing.T) {
+	t.Parallel()
+	w := newTestWorld(t)
+
+	for _, key := range mstInvalidKeys {
+		require.False(t, mst.IsValidMstKey(key), "%q", key)
+		_, err := w.GenerateAdversarialOpForTest(context.Background(), 0, key, "invalid_rkey")
+		require.ErrorIs(t, err, mst.ErrInvalidKey, "live %q", key)
+		require.ErrorIs(t, w.InjectAdversarialRecordForBackfill(context.Background(), 0, key, "invalid_rkey"), mst.ErrInvalidKey, "backfill %q", key)
+	}
+
+	frames, err := w.FirehoseRange(0, 10)
+	require.NoError(t, err)
+	require.Empty(t, frames, "a refused lie must not emit a frame")
+	require.Empty(t, w.AdversarialLedger().Entries(), "a refused lie must not reach the ledger")
 }
 
 func TestGenerateAdversarialOpForTest_VerifierConsistentLies(t *testing.T) {
@@ -125,8 +153,7 @@ func TestInjectAdversarialRecordForBackfill_SilentAndPersisted(t *testing.T) {
 	t.Parallel()
 	w := newTestWorld(t)
 
-	// Invalid UTF-8 is the class that can ONLY go this route.
-	badKey := "app.bsky.feed.post/bad\xff\xfekey"
+	badKey := "app.bsky.feed.post/.."
 	require.NoError(t, w.InjectAdversarialRecordForBackfill(context.Background(), 0, badKey, "invalid_rkey"))
 
 	// Silent: no firehose frame.
