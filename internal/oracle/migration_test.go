@@ -435,8 +435,6 @@ func (r *migrationRig) waitSplitClient(c *splitClient, last uint64) []ObservedEv
 		got := slices.Clone(c.events)
 		c.mu.Unlock()
 		if len(got) > 0 && got[len(got)-1].Seq >= last {
-			require.NotZero(r.t, c.plans.Load(), "the split client planned on the archive side")
-			require.NotZero(r.t, c.lives.Load(), "the split client went live on the live side")
 			return got
 		}
 		select {
@@ -573,6 +571,8 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	// A client plans on the source and goes live on the pod, and keeps its
 	// live tail across the handoff.
 	split := r.startSplitClient(r.url(r.local), r.url(pod))
+	require.Eventually(t, func() bool { return split.plans.Load() > 0 && split.lives.Load() > 0 },
+		10*time.Second, 5*time.Millisecond, "the split client planned on the source and went live on the pod before the handoff")
 
 	// Handoff.
 	result, err := r.fake.Backend.RequestMigration(ctx, migrate.ActionHandoff, time.Minute)
