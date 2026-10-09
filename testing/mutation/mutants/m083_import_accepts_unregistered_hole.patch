@@ -1,0 +1,27 @@
+mutant: m083_import_accepts_unregistered_hole
+target: internal/catalog/migration_scripts.go
+failure-mode: |
+  An import accepts a block that starts past the catalog's frontier with no
+  registered vacancy bridging the hole. A source that lost a block, or a
+  migrator that skipped one, imports a seq range nobody can read, and the
+  pods' readers fail or skip events instead of the import failing loudly.
+expected-detection: |
+  TestMigration_ImportRefusesHoles imports blocks across unregistered holes
+  between and inside segments and before active blocks, and requires
+  migration corruption with nothing committed.
+expected-tier: migration
+tiers: migration
+
+diff --git a/internal/catalog/migration_scripts.go b/internal/catalog/migration_scripts.go
+index 229af4a..fb07938 100644
+--- a/internal/catalog/migration_scripts.go
++++ b/internal/catalog/migration_scripts.go
+@@ -134,7 +134,7 @@ func mergeVacancies(stored, incoming *seqspace.Gaps, next uint64) (*seqspace.Gap
+ func walkEnvelopes(blocks []segment.BlockInfo, next uint64, gaps *seqspace.Gaps) (uint64, error) {
+ 	ranges := make([]seqspace.BlockRange, len(blocks))
+ 	for i, b := range blocks {
+-		if b.MinSeq != next && !Bridges(gaps, next, b.MinSeq) {
++		if b.MinSeq < next && !Bridges(gaps, next, b.MinSeq) {
+ 			return 0, Corruptf(SourceMigration, "block [%d,%d] does not continue the archive at seq %d, and no vacancy is exactly [%d,%d)",
+ 				b.MinSeq, b.MaxSeq, next, next, b.MinSeq)
+ 		}
