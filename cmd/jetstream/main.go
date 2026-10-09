@@ -141,6 +141,7 @@ func newAppWithEnviron(environ func() []string) *cli.Command {
 			inspectSegmentCommand(),
 			inspectAllCommand(),
 			storageCommand(),
+			migrateCommand(),
 		},
 	}
 }
@@ -416,6 +417,7 @@ func serveCommand() *cli.Command {
 		Action: runServe,
 	}
 	cmd.Flags = append(cmd.Flags, storageFlags()...)
+	cmd.Flags = append(cmd.Flags, migrationFlags()...)
 	return cmd
 }
 
@@ -695,6 +697,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		DebugAddr:                      cmd.String("debug-addr"),
 		DataDir:                        dataDir,
 		Storage:                        storage,
+		Migration:                      migrationConfigFromCommand(cmd),
 		RelayURL:                       cmd.String("relay-url"),
 		PLCURL:                         cmd.String("plc-url"),
 		OTelServiceName:                cmd.String("otel-service-name"),

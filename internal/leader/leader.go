@@ -62,8 +62,13 @@ var ErrRestartSession = errors.New("leader: restart session")
 // gets it back.
 var ErrStandby = errors.New("leader: standing by")
 
+// ErrDone is what a session returns when its work is over for good, such
+// as a migration that has handed off. Run releases the lease and returns
+// nil instead of electing again.
+var ErrDone = errors.New("leader: done")
+
 // DefaultFatal is the default Config.Fatal. An error is fatal unless it
-// wraps ErrRestartSession or ErrStandby, and always fatal when it wraps an error whose
+// wraps ErrRestartSession, ErrStandby, or ErrDone, and always fatal when it wraps an error whose
 // SessionFatal method reports true. The second rule keeps storage
 // corruption fatal even if some layer also wrapped it with a restart
 // marker.
@@ -72,7 +77,7 @@ func DefaultFatal(err error) bool {
 	if errors.As(err, &f) && f.SessionFatal() {
 		return true
 	}
-	return !errors.Is(err, ErrRestartSession) && !errors.Is(err, ErrStandby)
+	return !errors.Is(err, ErrRestartSession) && !errors.Is(err, ErrStandby) && !errors.Is(err, ErrDone)
 }
 
 // SessionFunc runs one writer session. It blocks until the session ends and
@@ -147,12 +152,15 @@ func Run(ctx context.Context, cfg Config, session SessionFunc) error {
 		if !ok {
 			return nil
 		}
-		standby, err := runOnce(ctx, cfg, session, acquiredAt)
+		next, err := runOnce(ctx, cfg, session, acquiredAt)
 		if err != nil {
 			return err
 		}
 		wait := cfg.AcquireInterval
-		if standby {
+		switch next {
+		case nextDone:
+			return nil
+		case nextStandby:
 			wait = cfg.StandbyBackoff
 		}
 		if !sleep(ctx, wait) {
@@ -239,10 +247,18 @@ func confirm(ctx context.Context, cfg Config) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// nextStep is what Run does after a session that did not end fatally.
+type nextStep int
+
+const (
+	nextElect nextStep = iota
+	nextStandby
+	nextDone
+)
+
 // runOnce runs one session under a held lock and releases the lock
-// afterwards. It returns the session error only when it is fatal, and
-// standby when the session ended with ErrStandby.
-func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt time.Time) (standby bool, _ error) {
+// afterwards. It returns the session error only when it is fatal.
+func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt time.Time) (nextStep, error) {
 	epoch := cfg.Locker.Epoch()
 	cfg.Metrics.sessionStarted(epoch)
 	cfg.Logger.Info("leader: session starting", "epoch", epoch)
@@ -292,11 +308,15 @@ func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt ti
 		// lease was going away is still corruption.
 		cfg.Metrics.sessionEnded(reasonFatal)
 		cfg.Logger.Error("leader: session ended with a fatal error", "epoch", epoch, "err", err)
-		return false, fmt.Errorf("leader: session epoch %d: %w", epoch, err)
+		return nextElect, fmt.Errorf("leader: session epoch %d: %w", epoch, err)
+	case errors.Is(err, ErrDone):
+		cfg.Metrics.sessionEnded(reasonDone)
+		cfg.Logger.Info("leader: session done; lease released", "epoch", epoch, "err", err)
+		return nextDone, nil
 	case errors.Is(err, ErrStandby):
 		cfg.Metrics.sessionEnded(reasonStandby)
 		cfg.Logger.Info("leader: standing by; lease released", "epoch", epoch, "err", err, "retry_in", cfg.StandbyBackoff)
-		return true, nil
+		return nextStandby, nil
 	case leaseLost:
 		cfg.Metrics.sessionEnded(reasonLeaseLost)
 		cfg.Logger.Warn("leader: lease lost; session ended", "epoch", epoch, "err", err)
@@ -307,7 +327,7 @@ func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt ti
 		cfg.Metrics.sessionEnded(reasonRestart)
 		cfg.Logger.Warn("leader: session ended; starting a new one", "epoch", epoch, "err", err)
 	}
-	return false, nil
+	return nextElect, nil
 }
 
 // renew extends the lease every RenewInterval. It closes lost and cancels

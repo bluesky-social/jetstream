@@ -13,6 +13,7 @@ const (
 	reasonShutdown  = "shutdown"
 	reasonRestart   = "restart"
 	reasonStandby   = "standby"
+	reasonDone      = "done"
 )
 
 // Metrics owns the prometheus series for the election loop. A nil *Metrics
@@ -65,7 +66,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		FenceFailures:  counter("fence_failures_total", "Leader write transactions rejected by the epoch fence."),
 		AcquireSkips:   counter("acquire_skips_total", "Acquire attempts skipped because the process may not lead yet (a migration in progress)."),
 	}
-	for _, r := range []string{reasonFatal, reasonLeaseLost, reasonShutdown, reasonRestart, reasonStandby} {
+	for _, r := range []string{reasonFatal, reasonLeaseLost, reasonShutdown, reasonRestart, reasonStandby, reasonDone} {
 		m.SessionsTotal.WithLabelValues(r)
 	}
 	reg.MustRegister(m.IsLeader, m.Epoch, m.SessionStarts, m.SessionsTotal,

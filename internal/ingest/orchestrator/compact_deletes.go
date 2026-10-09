@@ -579,7 +579,14 @@ func (o *Orchestrator) runSteadyCompactor(ctx context.Context, liveWriter *inges
 	// loop restarts the session or exits.
 	var lastPass time.Time
 	runPass := func() error {
+		if !o.cfg.CompactionGate.enter() {
+			// A paused gate means no pass is scheduled, so no deadline
+			// can be promised.
+			o.cfg.Metrics.incCompactionPausedPass()
+			return o.setCompactionSchedule(ctx, time.Time{})
+		}
 		err := o.runDeleteCompaction(ctx, compactionSteady, liveWriter)
+		o.cfg.CompactionGate.exit()
 		completed := time.Now()
 		if o.cfg.Disaggregated != nil && compactionPassFatal(err) {
 			return err

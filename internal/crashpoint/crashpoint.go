@@ -151,6 +151,41 @@ const (
 	// but before the forget transaction. The next run deletes the missing
 	// keys again, which succeeds, and forgets the rows.
 	AfterGCDeleteBeforeForget Point = "after-gc-delete-before-forget"
+
+	// The migration's seams (specs/notes/2026-10-09-local-to-disagg-
+	// migration.md). Before the handoff commits, a crash at any of them
+	// leaves local ingest the writer; after, the catalog's.
+
+	// AfterMigrationSegmentUpload fires after a sealed segment's blocks and
+	// footer are uploaded but before its import. The uploads stay orphans.
+	AfterMigrationSegmentUpload Point = "after-migration-segment-upload"
+
+	// AfterMigrationSegmentImport fires after a sealed segment's import
+	// commits. The next session resumes at the segment after it.
+	AfterMigrationSegmentImport Point = "after-migration-segment-import"
+
+	// AfterMigrationActiveUpload fires after active blocks are uploaded but
+	// before the transaction that ships them.
+	AfterMigrationActiveUpload Point = "after-migration-active-upload"
+
+	// AfterMigrationHandingOff fires once migration/state is handing_off
+	// (H1), before local ingest stops.
+	AfterMigrationHandingOff Point = "after-migration-handing-off"
+
+	// AfterMigrationIngestStopped fires once local ingest has stopped (H2).
+	AfterMigrationIngestStopped Point = "after-migration-ingest-stopped"
+
+	// AfterMigrationFinalShip fires once the last blocks and metadata are
+	// shipped (H3), before the handoff checks them.
+	AfterMigrationFinalShip Point = "after-migration-final-ship"
+
+	// AfterMigrationGuardPending fires once the local guard says pending
+	// (H5), before the decision commits.
+	AfterMigrationGuardPending Point = "after-migration-guard-pending"
+
+	// AfterMigrationDone fires once migration/state done commits (H6),
+	// before the local guard says done.
+	AfterMigrationDone Point = "after-migration-done"
 )
 
 // AllPoints is the single source of truth for the set of declared
@@ -183,6 +218,14 @@ var AllPoints = []Point{
 	AfterGCMarkBeforeClaim,
 	AfterGCClaimBeforeDelete,
 	AfterGCDeleteBeforeForget,
+	AfterMigrationSegmentUpload,
+	AfterMigrationSegmentImport,
+	AfterMigrationActiveUpload,
+	AfterMigrationHandingOff,
+	AfterMigrationIngestStopped,
+	AfterMigrationFinalShip,
+	AfterMigrationGuardPending,
+	AfterMigrationDone,
 }
 
 var knownPoints = func() map[Point]struct{} {

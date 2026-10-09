@@ -3,6 +3,8 @@ package pebblestore_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -94,3 +96,116 @@ func FuzzBatchSemanticsAgree(f *testing.F) {
 var fuzzKeys = []string{"", "\x00", "a", "a\x00", "a\xff", "ab", "b", "b\x00b", "\xff", "\xff\x00", "\xff\xff"}
 
 func fuzzKey(b byte) []byte { return []byte(fuzzKeys[int(b)%len(fuzzKeys)]) }
+
+// FuzzCommitObserverMirrors keeps a replica up to date only from what the
+// commit observer reports, as the migration's metadata tail does: after each
+// commit it copies each observed key's current value, and re-copies each
+// observed range. Any write the observer misses leaves the replica behind.
+// The replica also starts from a snapshot taken mid-stream, so the observer
+// must cover every write after the snapshot.
+func FuzzCommitObserverMirrors(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 3, 0, 0, 7, 0, 0, 2, 1, 6, 3, 0, 0})
+	f.Add([]byte{4, 3, 1, 7, 0, 0, 5, 3, 0, 2, 0, 10, 3, 0, 0})
+	f.Fuzz(func(t *testing.T, ops []byte) {
+		ctx := context.Background()
+		p := openMem(t)
+		replica := memstore.New()
+		var mu sync.Mutex
+		var dirty [][]byte
+		var dirtyRanges [][2][]byte
+		p.SetCommitObserver(func(keys [][]byte, ranges [][2][]byte) {
+			mu.Lock()
+			dirty = append(dirty, keys...)
+			dirtyRanges = append(dirtyRanges, ranges...)
+			mu.Unlock()
+		})
+		started := false
+		flush := func() {
+			mu.Lock()
+			keys, ranges := dirty, dirtyRanges
+			dirty, dirtyRanges = nil, nil
+			mu.Unlock()
+			if !started {
+				return
+			}
+			for _, r := range ranges {
+				it, err := replica.NewIter(ctx, r[0], r[1])
+				require.NoError(t, err)
+				var drop [][]byte
+				for it.Next() {
+					drop = append(drop, bytes.Clone(it.Key()))
+				}
+				require.NoError(t, it.Close())
+				for _, k := range drop {
+					require.NoError(t, replica.Delete(ctx, k))
+				}
+				for _, kv := range storetest.Scan(t, p, r[0], r[1]) {
+					require.NoError(t, replica.Set(ctx, kv.Key, kv.Value))
+				}
+			}
+			for _, k := range keys {
+				v, err := p.Get(ctx, k)
+				if errors.Is(err, metastore.ErrNotFound) {
+					require.NoError(t, replica.Delete(ctx, k))
+					continue
+				}
+				require.NoError(t, err)
+				require.NoError(t, replica.Set(ctx, k, v))
+			}
+		}
+
+		b := p.NewBatch()
+		for len(ops) >= 3 {
+			kind, a, c := ops[0]%8, fuzzKey(ops[1]), ops[2]
+			ops = ops[3:]
+			switch kind {
+			case 0:
+				b.Set(a, []byte{c})
+			case 1:
+				b.Delete(a)
+			case 2:
+				start, end := a, fuzzKey(c)
+				if bytes.Compare(start, end) >= 0 {
+					start, end = end, start
+				}
+				if !bytes.Equal(start, end) {
+					b.DeleteRange(start, end)
+				}
+			case 3:
+				require.NoError(t, b.Commit(ctx))
+				b = p.NewBatch()
+			case 4:
+				require.NoError(t, p.Set(ctx, a, []byte{c}))
+			case 5:
+				require.NoError(t, p.Delete(ctx, a))
+			case 6:
+				flush()
+			case 7:
+				if started {
+					continue
+				}
+				// The bulk copy: a snapshot, with the observer already
+				// installed, so writes after it are all dirty.
+				sn := p.NewSnapshot()
+				it, err := sn.NewIter(ctx, nil, nil)
+				require.NoError(t, err)
+				for it.Next() {
+					require.NoError(t, replica.Set(ctx, bytes.Clone(it.Key()), bytes.Clone(it.Value())))
+				}
+				require.NoError(t, it.Err())
+				require.NoError(t, it.Close())
+				require.NoError(t, sn.Close())
+				started = true
+				mu.Lock()
+				dirty, dirtyRanges = nil, nil
+				mu.Unlock()
+			}
+		}
+		require.NoError(t, b.Commit(ctx))
+		if !started {
+			return
+		}
+		flush()
+		require.Equal(t, storetest.Scan(t, p, nil, nil), storetest.Scan(t, replica, nil, nil))
+	})
+}

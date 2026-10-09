@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/gttp"
@@ -24,6 +25,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
+	"github.com/bluesky-social/jetstream/internal/migrate"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/repoexport"
 	"github.com/bluesky-social/jetstream/internal/server"
@@ -67,6 +69,17 @@ type Runtime struct {
 	// disagg is set in disaggregated mode, where it replaces metaStore,
 	// catalogLoad, and the local writer lock.
 	disagg *disaggregated
+
+	// ingest gates local writer sessions, and compactionGate local
+	// compaction passes, for a migration to disaggregated storage.
+	ingest         *ingestGate
+	compactionGate *orchestrator.CompactionGate
+	// migrator and migrationBackend are set when a migration runs.
+	migrator         *migrate.Migrator
+	migrationBackend *StorageBackend
+	// drained is set once this process handed its archive off: it serves
+	// archive reads and refuses subscribers.
+	drained atomic.Bool
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -153,6 +166,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if err := opts.Storage.Validate(opts); err != nil {
 		return nil, err
 	}
+	if err := opts.Migration.validate(opts); err != nil {
+		return nil, err
+	}
 
 	processLogger, err := obs.BuildLoggerFromStrings(opts.LogOutput, opts.LogLevel, opts.LogFormat)
 	if err != nil {
@@ -177,7 +193,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.Storage.Disaggregated() {
 		return buildDisaggregated(ctx, opts, processLogger, logger)
 	}
-	if opts.Storage.storageSettingsSet() {
+	if opts.Storage.storageSettingsSet() && !opts.Migration.Enabled {
 		logger.Warn("disaggregated storage settings are ignored because JETSTREAM_STORAGE is local", "storage", opts.Storage)
 	}
 
@@ -231,6 +247,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	var metaKV metastore.Store = metaStore
 	if opts.StoreFaultInjector != nil {
 		metaKV = metastore.WithFaults(metaStore, opts.StoreFaultInjector)
+	}
+	if err := rt.openMigrationGates(ctx); err != nil {
+		return fail(err)
 	}
 
 	manifestCtx, cancelManifest := context.WithCancel(ctx)
@@ -306,7 +325,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// xrpcapi sees only this read-only deadline surface. It starts unknown,
 	// so archive responses remain no-cache until steady-state scheduling is
 	// live.
-	deadline := &compactionDeadline{}
+	deadline := &compactionDeadline{gate: rt.compactionGate}
 	rt.deadline = deadline
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
@@ -412,6 +431,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			BootstrapLiveMaxSegmentBytes:   opts.BootstrapLiveMaxSegmentBytes,
 			BootstrapLiveMaxEventsPerBlock: opts.BootstrapLiveMaxEventsPerBlock,
 			SteadyMaxEventsPerBlock:        opts.SteadyMaxEventsPerBlock,
+			SteadyMaxSegmentBytes:          opts.SteadyMaxSegmentBytes,
 			BackfillRepos:                  opts.BackfillRepos,
 			SkipMergeDiscovery:             opts.SkipMergeDiscovery,
 			BackfillRetryBaseDelay:         opts.BackfillRetryBaseDelay,
@@ -428,6 +448,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			CompactionInterval:             opts.CompactionInterval,
 			CompactionTombstoneCap:         opts.CompactionTombstoneCap,
 			CompactionRewriteWorkers:       opts.CompactionRewriteWorkers,
+			CompactionGate:                 rt.compactionGate,
 			OnCompactionPass:               onCompactionPass,
 			OnBeforeCompactionPass:         opts.OnBeforeCompactionPass,
 			BarrierBeforeCutover:           phaseBarrier(opts.BarrierBeforeCutover),
@@ -490,9 +511,17 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// before steady-state, the phase readiness gate answers 503 so
 	// nil-pointer reads are harmless.
 	phaseReady := lifecycle.SteadyState(metaKV)
+	// A process that handed its archive off sends new subscribers to the
+	// disaggregated pods.
+	subscribeReady := lifecycle.AllReady(phaseReady, lifecycle.ReadinessFunc(func(context.Context) error {
+		if rt.drained.Load() {
+			return errHandedOff
+		}
+		return nil
+	}))
 	srv.RegisterPublicRoute("GET /subscribe", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Ready:     phaseReady,
+		Ready:     subscribeReady,
 		Manifest:  mft,
 		Catalog:   segCatalog,
 		Fetcher:   segCatalog.Fetcher(),
@@ -507,7 +536,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// handler owns this one NSID while atmos xrpcserver keeps the rest.
 	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
 		Tail:      tail,
-		Ready:     phaseReady,
+		Ready:     subscribeReady,
 		Manifest:  mft,
 		Catalog:   segCatalog,
 		Fetcher:   segCatalog.Fetcher(),
@@ -555,6 +584,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	srv.RegisterPublicRoute("/xrpc/", xrpcSrv.Handler())
 	rt.server = srv
 
+	if err := rt.buildMigrator(ctx, metrics.Registry, segCatalog, catalogLoad.Wait); err != nil {
+		return fail(err)
+	}
 	return rt, nil
 }
 
@@ -685,6 +717,10 @@ func (r *Runtime) runLocal(gctx context.Context, g *errgroup.Group) {
 		return nil
 	}))
 
+	if r.migrator != nil {
+		g.Go(r.goroutineRoot("migrator", func() error { return r.migrator.Run(gctx) }))
+	}
+
 	// Local mode always holds the lock, so the loop runs one session at a
 	// time until shutdown or a fatal error. A session error wrapping
 	// leader.ErrRestartSession starts a fresh session in-process instead.
@@ -765,6 +801,10 @@ func (r *Runtime) Close(ctx context.Context) error {
 	}
 	if runDrained {
 		r.closeDisaggregated()
+		if r.migrationBackend != nil && r.migrationBackend.Close != nil {
+			r.migrationBackend.Close()
+			r.migrationBackend = nil
+		}
 	}
 	if r.tracerShutdown != nil && runDrained {
 		if err := r.tracerShutdown(ctx); err != nil {

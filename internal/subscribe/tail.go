@@ -326,3 +326,43 @@ func (t *Tail) Shutdown(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+// DrainOver closes every registered connection like Shutdown, but spaces
+// the closes evenly over spread so the clients' reconnects do not all land
+// on their next server at once. Like Shutdown, it admits no new connection
+// from the moment it starts, and a later Shutdown has nothing left to close.
+// If ctx ends first, the remaining connections close at once.
+func (t *Tail) DrainOver(ctx context.Context, spread time.Duration) error {
+	t.connMu.Lock()
+	if t.draining {
+		t.connMu.Unlock()
+		return nil
+	}
+	t.draining = true
+	closers := make([]func(), 0, len(t.conns))
+	for id, fn := range t.conns {
+		closers = append(closers, fn)
+		delete(t.conns, id)
+	}
+	t.connMu.Unlock()
+	if len(closers) == 0 {
+		return nil
+	}
+	t.logger.Info("draining subscribers", "count", len(closers), "spread", spread)
+	interval := spread / time.Duration(len(closers))
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for i, fn := range closers {
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			for _, fn := range closers[i:] {
+				go fn()
+			}
+			return ctx.Err()
+		}
+		go fn()
+		timer.Reset(interval)
+	}
+	return nil
+}

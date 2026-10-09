@@ -80,7 +80,7 @@ type Options struct {
 	BootstrapLiveMaxSegmentBytes   int64
 	BootstrapLiveMaxEventsPerBlock int
 	SteadyMaxEventsPerBlock        int   // test-only; zero is the ingest default
-	SteadyMaxSegmentBytes          int64 // test-only, disaggregated mode; zero is the maintainer default
+	SteadyMaxSegmentBytes          int64 // test-only; zero is the writer's or maintainer's default
 	BackfillRepos                  []atmos.DID
 	SkipMergeDiscovery             bool
 	FailedRepoRetryInterval        time.Duration
