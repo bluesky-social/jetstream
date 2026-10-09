@@ -80,40 +80,39 @@ func (r *importReads) reads() []Read {
 }
 
 // frontier checks the migration state and returns Main's seq key, the
-// vacancy set after adding incoming, and whether that set changed.
-func (r *importReads) frontier(incoming *seqspace.Gaps) (next uint64, gaps *seqspace.Gaps, changed bool, err error) {
+// stored vacancy set, and that set with incoming merged in.
+func (r *importReads) frontier(incoming *seqspace.Gaps) (next uint64, stored, gaps *seqspace.Gaps, err error) {
 	if err := checkImporting(r.state); err != nil {
-		return 0, nil, false, err
+		return 0, nil, nil, err
 	}
 	if next, err = DecodeSeq(MainSeqKey, r.seq.Value, r.seq.Found); err != nil {
-		return 0, nil, false, err
+		return 0, nil, nil, err
 	}
-	stored, err := DecodeVacancies(r.vac.Value, r.vac.Found)
-	if err != nil {
-		return 0, nil, false, err
+	if stored, err = DecodeVacancies(r.vac.Value, r.vac.Found); err != nil {
+		return 0, nil, nil, err
 	}
 	if !r.seg.Found {
-		return 0, nil, false, Corruptf(SourceInvariant, "main has no active segment")
+		return 0, nil, nil, Corruptf(SourceInvariant, "main has no active segment")
 	}
 	if r.last.Found && (r.last.Row.Segment != r.seg.Row.Index || r.last.Row.MaxSeq+1 != next) {
-		return 0, nil, false, Corruptf(SourceInvariant, "main's last active block %d/%d ends at %d; %s is %d (active segment %d)",
+		return 0, nil, nil, Corruptf(SourceInvariant, "main's last active block %d/%d ends at %d; %s is %d (active segment %d)",
 			r.last.Row.Segment, r.last.Row.Ordinal, r.last.Row.MaxSeq, MainSeqKey, next, r.seg.Row.Index)
 	}
-	gaps, changed, err = mergeVacancies(stored, incoming, next)
-	return next, gaps, changed, err
+	gaps, err = mergeVacancies(stored, incoming, next)
+	return next, stored, gaps, err
 }
 
 // mergeVacancies returns the vacancy set after an import that brings the
 // source's whole registry, incoming (nil brings nothing). The registry only
 // grows, and only above what the catalog holds: every stored vacancy must
 // still be in it, and anything new must lie at or above next.
-func mergeVacancies(stored, incoming *seqspace.Gaps, next uint64) (*seqspace.Gaps, bool, error) {
+func mergeVacancies(stored, incoming *seqspace.Gaps, next uint64) (*seqspace.Gaps, error) {
 	if incoming == nil {
-		return stored, false, nil
+		return stored, nil
 	}
 	for _, g := range stored.Ranges() {
 		if end, ok := incoming.EndContaining(g.Start); !ok || end < g.End {
-			return nil, false, Corruptf(SourceMigration, "the source no longer registers vacancy [%d,%d)", g.Start, g.End)
+			return nil, Corruptf(SourceMigration, "the source no longer registers vacancy [%d,%d)", g.Start, g.End)
 		}
 	}
 	for _, g := range incoming.Ranges() {
@@ -121,10 +120,10 @@ func mergeVacancies(stored, incoming *seqspace.Gaps, next uint64) (*seqspace.Gap
 			continue
 		}
 		if end, ok := stored.EndContaining(g.Start); !ok || end < min(g.End, next) {
-			return nil, false, Corruptf(SourceMigration, "the source registers vacancy [%d,%d) below the imported frontier %d", g.Start, g.End, next)
+			return nil, Corruptf(SourceMigration, "the source registers vacancy [%d,%d) below the imported frontier %d", g.Start, g.End, next)
 		}
 	}
-	return incoming, !slices.Equal(stored.Ranges(), incoming.Ranges()), nil
+	return incoming, nil
 }
 
 // walkEnvelopes checks that blocks continue the seq space from next, each
@@ -148,13 +147,27 @@ func walkEnvelopes(blocks []segment.BlockInfo, next uint64, gaps *seqspace.Gaps)
 	return next, nil
 }
 
-// vacancyOps are the metadata writes an import ends with.
-func vacancyOps(next uint64, gaps *seqspace.Gaps, changed bool) []metastore.Op {
+// vacancyOps are the metadata writes an import ends with: the new seq key,
+// and the vacancies below it if they changed. A vacancy at or past the new
+// frontier waits for the import that ships the block after it, so the
+// catalog never registers one that no block bounds. walkEnvelopes already
+// refused any vacancy that overlaps a block, so none straddles next.
+func vacancyOps(next uint64, stored, gaps *seqspace.Gaps) ([]metastore.Op, error) {
 	ops := []metastore.Op{{Kind: metastore.OpSet, Key: []byte(MainSeqKey), Value: EncodeSeq(next)}}
-	if changed {
-		ops = append(ops, metastore.Op{Kind: metastore.OpSet, Key: []byte(VacanciesKey), Value: EncodeVacancies(gaps)})
+	var below []seqspace.Gap
+	for _, g := range gaps.Ranges() {
+		if g.Start < next {
+			below = append(below, g)
+		}
 	}
-	return ops
+	if slices.Equal(stored.Ranges(), below) {
+		return ops, nil
+	}
+	kept, err := seqspace.NewGaps(below)
+	if err != nil {
+		return nil, Corruptf(SourceMigration, "vacancies below %d: %v", next, err)
+	}
+	return append(ops, metastore.Op{Kind: metastore.OpSet, Key: []byte(VacanciesKey), Value: EncodeVacancies(kept)}), nil
 }
 
 // ImportSegment is one sealed local segment to import as a generation.
@@ -240,7 +253,7 @@ func (s *Session) ImportSealedSegment(ctx context.Context, is ImportSegment) (Se
 	ir, objs := newImportReads(), newObjectReads(append(refs, is.Footer)...)
 	var out SealCommit
 	rev, err := s.run(ctx, TxSeal, append(ir.reads(), objs.reads()...), func(tx Tx, rev uint64) error {
-		next, gaps, changed, err := ir.frontier(is.Vacancies)
+		next, stored, gaps, err := ir.frontier(is.Vacancies)
 		if err != nil {
 			return err
 		}
@@ -288,7 +301,11 @@ func (s *Session) ImportSealedSegment(ctx context.Context, is ImportSegment) (Se
 			return err
 		}
 		out = SealCommit{GenerationID: gen, FooterObjectID: footerID}
-		return tx.ApplyMeta(ctx, vacancyOps(next, gaps, changed))
+		ops, err := vacancyOps(next, stored, gaps)
+		if err != nil {
+			return err
+		}
+		return tx.ApplyMeta(ctx, ops)
 	})
 	out.Revision = rev
 	return out, err
@@ -327,7 +344,7 @@ func (s *Session) ImportActiveBlocks(ctx context.Context, ib ImportBlocks) ([]Bl
 	ir, objs := newImportReads(), newObjectReads(refs...)
 	out := make([]BlockCommit, len(ib.Blocks))
 	rev, err := s.run(ctx, TxBlock, append(ir.reads(), objs.reads()...), func(tx Tx, rev uint64) error {
-		next, gaps, changed, err := ir.frontier(ib.Vacancies)
+		next, stored, gaps, err := ir.frontier(ib.Vacancies)
 		if err != nil {
 			return err
 		}
@@ -363,7 +380,11 @@ func (s *Session) ImportActiveBlocks(ctx context.Context, ib ImportBlocks) ([]Bl
 			}
 			out[i] = BlockCommit{Segment: seg, Ordinal: row.Ordinal, ObjectID: row.ObjectID}
 		}
-		return tx.ApplyMeta(ctx, vacancyOps(next, gaps, changed))
+		ops, err := vacancyOps(next, stored, gaps)
+		if err != nil {
+			return err
+		}
+		return tx.ApplyMeta(ctx, ops)
 	})
 	if err != nil {
 		return nil, err
@@ -436,7 +457,8 @@ var ErrMigrationState = errors.New("catalog: migration state is not the expected
 
 // SetMigrationState moves migration/state from from to to, and applies
 // meta, in one transaction. The empty from is an absent key. The move must
-// be a ValidMigrationTransition, and meta may not write migration/state.
+// be a ValidMigrationTransition, and meta may not write a catalog-owned key,
+// except migration/handoff_seq on the move to done.
 // A stored state other than from fails with ErrMigrationState, which ends
 // the session like any failed script: the caller re-reads the state in a
 // new one.
@@ -445,8 +467,16 @@ func (s *Session) SetMigrationState(ctx context.Context, from, to MigrationState
 		return 0, s.fail(fmt.Errorf("catalog: migration state cannot move from %q to %q", from, to))
 	}
 	for _, op := range meta {
-		if bytes.Equal(op.Key, []byte(MigrationStateKey)) || op.Kind == metastore.OpDeleteRange {
-			return 0, s.fail(errors.New("catalog: a migration state change carries only point writes of other keys"))
+		// The handoff seq is the done transaction's own record; every other
+		// catalog-owned key belongs to the import scripts.
+		if op.Kind == metastore.OpSet && to == MigrationDone && bytes.Equal(op.Key, []byte(MigrationHandoffSeqKey)) {
+			continue
+		}
+		if op.Kind == metastore.OpDeleteRange {
+			return 0, s.fail(errors.New("catalog: a migration state change carries only point writes"))
+		}
+		if err := checkUnprotected([]metastore.Op{op}); err != nil {
+			return 0, s.fail(err)
 		}
 	}
 	state := migrationRead()

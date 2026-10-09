@@ -258,9 +258,10 @@ func TestMigration_ImportVacancies(t *testing.T) {
 			seqspace.Gap{Start: 25, End: 30},
 			seqspace.Gap{Start: 33, End: 40})
 
-		// Only the first two are known when segment 0 imports.
+		// The source registers all four, but segment 0 bounds only the
+		// first two; the rest wait for the blocks after them.
 		seg0 := writeLocalSegment(t, [][2]uint64{{4, 7}, {20, 22}}, nil)
-		_, err := h.s.ImportSealedSegment(ctx, h.importOf(0, seg0, gapsOf(t, all.Ranges()[:2]...)))
+		_, err := h.s.ImportSealedSegment(ctx, h.importOf(0, seg0, all))
 		require.NoError(t, err)
 		require.Equal(t, uint64(23), h.seqNext())
 		require.Equal(t, all.Ranges()[:2], h.vacancies())
@@ -279,6 +280,17 @@ func TestMigration_ImportVacancies(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, catalog.CheckInvariants(snap, catalog.InvariantOptions{}))
 		require.NoError(t, catalog.CheckInvariants(snap, catalog.InvariantOptions{Cheap: true}))
+
+		// A registry that also claims seqs a block holds, or seqs past the
+		// frontier, is corrupt: replay would skip real events through it.
+		for _, extra := range []seqspace.Gap{{Start: 31, End: 32}, {Start: 22, End: 23}, {Start: 4, End: 5}, {Start: 42, End: 50}} {
+			bad, err := all.Add(extra)
+			require.NoError(t, err)
+			snap.Meta[catalog.VacanciesKey] = catalog.EncodeVacancies(bad)
+			err = catalog.CheckInvariants(snap, catalog.InvariantOptions{})
+			_, corrupt := catalog.IsCorruption(err)
+			require.True(t, corrupt, "vacancy %v: %v", extra, err)
+		}
 
 		// Without the registry the same catalog is corrupt.
 		delete(snap.Meta, catalog.VacanciesKey)
@@ -395,6 +407,19 @@ func TestMigration_StateGuards(t *testing.T) {
 		} {
 			h.newSession()
 			_, err = h.s.ImportMeta(ctx, []metastore.Op{op})
+			require.ErrorIs(t, err, catalog.ErrProtectedKey, "%v", op)
+		}
+
+		// A state change cannot carry a write the import scripts own, and
+		// only done may record the handoff seq.
+		for _, op := range []metastore.Op{
+			{Kind: metastore.OpSet, Key: []byte(catalog.MainSeqKey), Value: catalog.EncodeSeq(1)},
+			{Kind: metastore.OpSet, Key: []byte(catalog.BootstrapLiveSeqKey), Value: catalog.EncodeSeq(1)},
+			{Kind: metastore.OpDelete, Key: []byte(catalog.VacanciesKey)},
+			{Kind: metastore.OpSet, Key: []byte(catalog.MigrationHandoffSeqKey), Value: catalog.EncodeSeq(1)},
+		} {
+			h.newSession()
+			_, err = h.s.SetMigrationState(ctx, catalog.MigrationTailing, catalog.MigrationHandingOff, []metastore.Op{op})
 			require.ErrorIs(t, err, catalog.ErrProtectedKey, "%v", op)
 		}
 

@@ -223,6 +223,11 @@ func checkNamespace(s *Snapshot, ns Namespace, opts InvariantOptions) error {
 		return nil
 	}
 
+	// Seqs a vacancy must not cover. A sealed segment's own blocks are not
+	// in the snapshot, so only its header's endpoints are checked here; the
+	// import checked the rest against the footer.
+	var held []seqspace.BlockRange
+
 	// Invariant 1, sealed part: generations tile [1, ...) in index order.
 	expect := uint64(1)
 	for _, seg := range segs {
@@ -258,6 +263,7 @@ func checkNamespace(s *Snapshot, ns Namespace, opts InvariantOptions) error {
 		if hdr.MinSeq != expect && !Bridges(gaps, expect, hdr.MinSeq) {
 			return Corruptf(SourceInvariant, "invariant 1: %s segment %d starts at seq %d, want %d", ns, seg.Index, hdr.MinSeq, expect)
 		}
+		held = append(held, seqspace.BlockRange{Min: hdr.MinSeq, Max: hdr.MinSeq}, seqspace.BlockRange{Min: hdr.MaxSeq, Max: hdr.MaxSeq})
 		expect = hdr.MaxSeq + 1
 	}
 	if opts.Cheap && len(segs) > 1 {
@@ -281,7 +287,18 @@ func checkNamespace(s *Snapshot, ns Namespace, opts InvariantOptions) error {
 			return Corruptf(SourceInvariant, "invariant 1: %s segment %d block %d covers [%d,%d] with %d events, want start %d",
 				ns, b.Segment, b.Ordinal, b.MinSeq, b.MaxSeq, b.EventCount, expect)
 		}
+		held = append(held, seqspace.BlockRange{Min: b.MinSeq, Max: b.MaxSeq})
 		expect = b.MaxSeq + 1
+	}
+	// A vacancy holds no event and is registered only with the first block
+	// past it, so it never covers a block's seqs or reaches the seq key.
+	if gs := gaps.Ranges(); len(gs) > 0 {
+		if err := gaps.ValidateVacant(held); err != nil {
+			return Corruptf(SourceInvariant, "invariant 1: %v", err)
+		}
+		if last := gs[len(gs)-1]; last.End > next {
+			return Corruptf(SourceInvariant, "invariant 1: vacancy [%d,%d) reaches past %s=%d", last.Start, last.End, key, next)
+		}
 	}
 	return checkHot(s, ns, expect, next, opts)
 }
