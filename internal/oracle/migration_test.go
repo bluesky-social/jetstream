@@ -574,7 +574,7 @@ func (i *killInjector) SimulateCrash(_ context.Context, p crashpoint.Point) erro
 		return nil
 	}
 	(*i.kill.Load())()
-	return fmt.Errorf("oracle: killed at %s", p)
+	return fmt.Errorf("migration test: killed at %s", p)
 }
 
 // waitSteady waits until p serves its archive, which it does from
