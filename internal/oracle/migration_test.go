@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -356,6 +359,99 @@ func (r *migrationRig) download(host string, last uint64) []ObservedEvent {
 	return nil
 }
 
+// splitClient is a client whose archive requests reach one server and
+// whose live tail reaches another: what a client sees when the routes flip
+// to the pods between its plan and its cutover to live.
+type splitClient struct {
+	cancel context.CancelFunc
+	done   chan error
+	// plans and lives count the requests each side served.
+	plans, lives atomic.Int64
+	mu           sync.Mutex
+	events       []ObservedEvent
+}
+
+// startSplitClient subscribes from seq 0, with archive requests sent to
+// archive and everything else to live.
+func (r *migrationRig) startSplitClient(archive, live string) *splitClient {
+	r.t.Helper()
+	proxyTo := func(host string) *httputil.ReverseProxy {
+		u, err := url.Parse(host)
+		require.NoError(r.t, err)
+		return httputil.NewSingleHostReverseProxy(u)
+	}
+	toArchive, toLive := proxyTo(archive), proxyTo(live)
+	c := &splitClient{done: make(chan error, 1)}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, ".planSnapshot"):
+			c.plans.Add(1)
+			toArchive.ServeHTTP(w, req)
+		case strings.HasSuffix(req.URL.Path, ".getSegment"), strings.HasSuffix(req.URL.Path, ".getBlock"):
+			toArchive.ServeHTTP(w, req)
+		default:
+			if strings.HasSuffix(req.URL.Path, ".subscribeEvents") {
+				c.lives.Add(1)
+			}
+			toLive.ServeHTTP(w, req)
+		}
+	}))
+	r.t.Cleanup(srv.Close)
+	client, err := jetstream.Subscribe(srv.URL, jetstream.WithAfterSeq(0), jetstream.WithBatchSize(64))
+	require.NoError(r.t, err)
+	ctx, cancel := context.WithCancel(r.ctx)
+	c.cancel = cancel
+	go func() {
+		defer func() { _ = client.Close() }()
+		for batch, err := range client.Events(ctx) {
+			if err != nil {
+				c.done <- err
+				return
+			}
+			for _, ev := range batch.Events() {
+				oe, err := observedEventFromClientErr(ev)
+				if err != nil {
+					c.done <- err
+					return
+				}
+				c.mu.Lock()
+				c.events = append(c.events, oe)
+				c.mu.Unlock()
+			}
+		}
+		c.done <- ctx.Err()
+	}()
+	r.t.Cleanup(func() { cancel(); <-c.done })
+	return c
+}
+
+// waitSplitClient returns everything c received once it has received seq
+// last.
+func (r *migrationRig) waitSplitClient(c *splitClient, last uint64) []ObservedEvent {
+	r.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		c.mu.Lock()
+		got := slices.Clone(c.events)
+		c.mu.Unlock()
+		if len(got) > 0 && got[len(got)-1].Seq >= last {
+			require.NotZero(r.t, c.plans.Load(), "the split client planned on the archive side")
+			require.NotZero(r.t, c.lives.Load(), "the split client went live on the live side")
+			return got
+		}
+		select {
+		case err := <-c.done:
+			c.done <- err
+			r.t.Fatalf("the split client ended at %d events, before seq %d: %v", len(got), last, err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			r.t.Fatalf("the split client reached %d events, not seq %d", len(got), last)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // getSegment downloads one sealed segment's bytes.
 func getSegment(t *testing.T, host string, idx uint64) []byte {
 	t.Helper()
@@ -474,6 +570,10 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 		require.Truef(t, bytes.Equal(want, getSegment(t, r.url(pod), idx)), "replica segment %d", idx)
 	}
 
+	// A client plans on the source and goes live on the pod, and keeps its
+	// live tail across the handoff.
+	split := r.startSplitClient(r.url(r.local), r.url(pod))
+
 	// Handoff.
 	result, err := r.fake.Backend.RequestMigration(ctx, migrate.ActionHandoff, time.Minute)
 	require.NoError(t, err)
@@ -496,6 +596,7 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	require.Equal(t, before+1, r.catalogSnapshot().Archive.WriterEpoch, "the pod acquired once, after done")
 	all := r.download(r.url(pod), tip)
 	r.requireModel(all, r.handoffSeq(), "the migrated archive and the pod's ingest after it")
+	r.requireModel(r.waitSplitClient(split, tip), r.handoffSeq(), "a client that planned on the source and went live on the pod")
 	require.NoError(t, catalog.CheckInvariants(r.catalogSnapshot(), catalog.InvariantOptions{MaxEventsPerBlock: 1 << 16}))
 
 	// A restart of the source stays drained and never ingests.

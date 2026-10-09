@@ -32,16 +32,25 @@ type shippedBlock struct {
 	obj  uint64
 }
 
-// loadTracker reads the catalog in one snapshot.
-func loadTracker(ctx context.Context, db catalog.DB) (*tracker, *catalog.Snapshot, error) {
+// loadSnapshot reads the whole catalog in one snapshot.
+func loadSnapshot(ctx context.Context, db catalog.DB) (*catalog.Snapshot, error) {
 	rtx, err := db.BeginRead(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("migrate: read catalog: %w", err)
+		return nil, fmt.Errorf("migrate: read catalog: %w", err)
 	}
 	snap, err := catalog.LoadSnapshot(ctx, rtx)
 	_ = rtx.Close(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("migrate: read catalog: %w", err)
+		return nil, fmt.Errorf("migrate: read catalog: %w", err)
+	}
+	return snap, nil
+}
+
+// loadTracker reads the catalog in one snapshot.
+func loadTracker(ctx context.Context, db catalog.DB) (*tracker, *catalog.Snapshot, error) {
+	snap, err := loadSnapshot(ctx, db)
+	if err != nil {
+		return nil, nil, err
 	}
 	tr := &tracker{}
 	found := false
@@ -91,29 +100,14 @@ func fatalf(format string, args ...any) error {
 }
 
 // reconcile checks that what the catalog holds is still what the source
-// holds (migration plan §6.3): each imported generation's header checksum,
-// which covers the header and footer, against the local file's, and each
-// shipped active block's bytes against the local file's. Compaction is
-// paused, so a mismatch means something rewrote the source behind the
-// migration's back.
+// holds (migration plan §6.3): each imported generation against the local
+// file's (reconcileSealed), and each shipped active block's bytes against
+// the local file's. Compaction is paused, so a mismatch means something
+// rewrote the source behind the migration's back.
 func (m *Migrator) reconcile(ctx context.Context, tr *tracker, snap *catalog.Snapshot, local uint64) error {
-	view := m.cfg.Catalog.Snapshot()
-	segs := view.Segments(catalog.Main)
-	for _, s := range snap.Segments {
-		if s.Namespace != catalog.Main || s.State != catalog.Sealed {
-			continue
-		}
-		g, ok := snap.Generations[s.GenerationID]
-		if !ok {
-			return catalog.Corruptf(catalog.SourceMigration, "main segment %d has no generation %d", s.Index, s.GenerationID)
-		}
-		hdr, err := segment.ReadSealedHeader(byteReaderAt(g.Header))
-		if err != nil {
-			return catalog.Corruptf(catalog.SourceMigration, "main segment %d header: %v", s.Index, err)
-		}
-		if s.Index >= uint64(len(segs)) || segs[s.Index].State != catalog.Sealed || segs[s.Index].Generation != hdr.Checksum {
-			return fatalf("reconcile: the catalog's segment %d (checksum %x) is not the source's; was the source compacted during the migration?", s.Index, hdr.Checksum)
-		}
+	segs, err := m.reconcileSealed(snap)
+	if err != nil {
+		return err
 	}
 	if len(tr.active) > 0 {
 		if tr.seg >= uint64(len(segs)) {
@@ -143,6 +137,31 @@ func (m *Migrator) reconcile(ctx context.Context, tr *tracker, snap *catalog.Sna
 		return fatalf("reconcile: the catalog's seq/next %d is past the source's %d", tr.next, local)
 	}
 	return nil
+}
+
+// reconcileSealed checks each imported generation's header checksum, which
+// covers the header and footer, against the one the source's catalog holds
+// for that segment. It reads no files. It returns the source's main
+// segments.
+func (m *Migrator) reconcileSealed(snap *catalog.Snapshot) ([]catalog.SegmentView, error) {
+	segs := m.cfg.Catalog.Snapshot().Segments(catalog.Main)
+	for _, s := range snap.Segments {
+		if s.Namespace != catalog.Main || s.State != catalog.Sealed {
+			continue
+		}
+		g, ok := snap.Generations[s.GenerationID]
+		if !ok {
+			return nil, catalog.Corruptf(catalog.SourceMigration, "main segment %d has no generation %d", s.Index, s.GenerationID)
+		}
+		hdr, err := segment.ReadSealedHeader(byteReaderAt(g.Header))
+		if err != nil {
+			return nil, catalog.Corruptf(catalog.SourceMigration, "main segment %d header: %v", s.Index, err)
+		}
+		if s.Index >= uint64(len(segs)) || segs[s.Index].State != catalog.Sealed || segs[s.Index].Generation != hdr.Checksum {
+			return nil, fatalf("reconcile: the catalog's segment %d (checksum %x) is not the source's; was the source compacted during the migration?", s.Index, hdr.Checksum)
+		}
+	}
+	return segs, nil
 }
 
 // checkPrefix checks that the source's segment still begins with the

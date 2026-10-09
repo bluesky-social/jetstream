@@ -401,7 +401,7 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                     # unit tests, and the catalog import contract tests.
                     cmd=(go test "${RACE_FLAG[@]}"
                          ./internal/oracle ./internal/migrate ./internal/catalog
-                         -run '^TestMigration_|^TestMetaSync_|^TestDirtySet$|^TestClassify$|^TestGuardAndPause$'
+                         -run '^TestMigration_|^TestMetaSync_|^TestDirtySet$|^TestClassify$|^TestGuardAndPause$|^TestReconcileSealed$'
                          -count=1 -timeout "$default_timeout") ;;
                 disagg)
                     # Disaggregated-storage tier (Stage 2 S2.19, extended in

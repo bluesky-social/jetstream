@@ -47,6 +47,16 @@ func (m *Migrator) handoff(ctx context.Context, sess *catalog.Session, tr *track
 	if last, _ := m.meta.lastResyncAt(); last.IsZero() || time.Since(last) > m.cfg.HandoffMaxDiffAge {
 		return m.refuse("no full metadata resync finished in the last %s", m.cfg.HandoffMaxDiffAge)
 	}
+	// The session start reconciled every generation; check again that none
+	// changed since, before anything stops. A mismatch is fatal.
+	m.setStep("handoff: reconciling sealed segments")
+	snap, err := loadSnapshot(ctx, m.cfg.DB)
+	if err != nil {
+		return "failed: " + err.Error(), err
+	}
+	if _, err := m.reconcileSealed(snap); err != nil {
+		return "failed: " + err.Error(), err
+	}
 
 	// H1.
 	m.setStep("handoff: handing_off")
