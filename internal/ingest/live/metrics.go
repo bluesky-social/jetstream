@@ -18,6 +18,7 @@ const (
 type Metrics struct {
 	EventsReceived                 prometheus.Counter
 	Reconnects                     prometheus.Counter
+	DialRejections                 prometheus.Counter
 	DecodeErrors                   prometheus.Counter
 	SequenceGaps                   prometheus.Counter
 	SequenceGapMissedSeqs          prometheus.Counter
@@ -47,6 +48,16 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "reconnects_total",
 			Help: "Number of websocket reconnect attempts the atmos client has made.",
+		}),
+		DialRejections: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "dial_rejections_total",
+			Help: "Number of subscribeRepos dials the relay rejected with an HTTP " +
+				"response atmos treats as non-retryable (e.g. 404/403, or a bad " +
+				"handshake) instead of a websocket upgrade. atmos ends its stream on " +
+				"these; the consumer resubscribes with backoff (capped at 5m). Any " +
+				"non-zero rate means live ingest is not connected and the relay URL " +
+				"or relay deployment likely needs an operator.",
 		}),
 		DecodeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -140,7 +151,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 	}
 	reg.MustRegister(
-		m.EventsReceived, m.Reconnects,
+		m.EventsReceived, m.Reconnects, m.DialRejections,
 		m.DecodeErrors, m.SequenceGaps, m.SequenceGapMissedSeqs,
 		m.UnknownEvents, m.VerifyQueueDrops, m.StreamErrorFrames, m.StaleResyncsDropped,
 		m.ReplayedAccountsDrop, m.ReplayedIdentityDrop, m.UpstreamCursor, m.LastSeenUpstreamEventTimestamp,
@@ -157,6 +168,12 @@ func (m *Metrics) incEventsReceived() {
 func (m *Metrics) incReconnects() {
 	if m != nil {
 		m.Reconnects.Inc()
+	}
+}
+
+func (m *Metrics) incDialRejections() {
+	if m != nil {
+		m.DialRejections.Inc()
 	}
 }
 
