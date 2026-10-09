@@ -62,6 +62,8 @@ type Tail struct {
 	conns    map[uint64]func()
 	nextConn uint64
 	draining bool
+	// closeReason is the close frames' reason once DrainOver set it.
+	closeReason string
 }
 
 // New validates cfg, builds the cold-backed Tail, and returns it ready for
@@ -327,18 +329,33 @@ func (t *Tail) Shutdown(ctx context.Context) error {
 	}
 }
 
+// DefaultCloseReason is the close frame's reason when the server shuts down.
+const DefaultCloseReason = "server shutting down"
+
+// CloseReason is the reason the close frames sent to subscribers carry.
+func (t *Tail) CloseReason() string {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.closeReason == "" {
+		return DefaultCloseReason
+	}
+	return t.closeReason
+}
+
 // DrainOver closes every registered connection like Shutdown, but spaces
 // the closes evenly over spread so the clients' reconnects do not all land
-// on their next server at once. Like Shutdown, it admits no new connection
-// from the moment it starts, and a later Shutdown has nothing left to close.
-// If ctx ends first, the remaining connections close at once.
-func (t *Tail) DrainOver(ctx context.Context, spread time.Duration) error {
+// on their next server at once, and tells them why in reason. Like
+// Shutdown, it admits no new connection from the moment it starts, and a
+// later Shutdown has nothing left to close. If ctx ends first, the
+// remaining connections close at once.
+func (t *Tail) DrainOver(ctx context.Context, spread time.Duration, reason string) error {
 	t.connMu.Lock()
 	if t.draining {
 		t.connMu.Unlock()
 		return nil
 	}
 	t.draining = true
+	t.closeReason = reason
 	closers := make([]func(), 0, len(t.conns))
 	for id, fn := range t.conns {
 		closers = append(closers, fn)

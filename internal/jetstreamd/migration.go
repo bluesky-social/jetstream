@@ -254,7 +254,8 @@ func (r *Runtime) openMigrationGates(ctx context.Context) error {
 			return err
 		}
 		r.logger.Info("local compaction stays paused for the migration", "paused_at", pausedAt)
-	case paused:
+	case paused && guard == migrate.GuardNone:
+		// With a guard set no writer session, and so no compaction, runs.
 		r.logger.Warn("a migration paused local compaction, but JETSTREAM_MIGRATE_TO_DISAGGREGATED is unset; compaction runs", "paused_at", pausedAt)
 	}
 	return nil
@@ -340,7 +341,7 @@ func (r *Runtime) buildMigrator(ctx context.Context, reg prometheus.Registerer, 
 // archive reads, and its subscribers move to the disaggregated pods.
 func (r *Runtime) drain(ctx context.Context) {
 	r.drained.Store(true)
-	if err := r.tail.DrainOver(ctx, r.opts.Migration.DrainSpread); err != nil && ctx.Err() == nil {
+	if err := r.tail.DrainOver(ctx, r.opts.Migration.DrainSpread, errHandedOff.Error()); err != nil && ctx.Err() == nil {
 		r.logger.Warn("draining subscribers", "err", err)
 	}
 }

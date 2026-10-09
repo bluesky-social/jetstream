@@ -13,6 +13,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/migrate"
 	"github.com/bluesky-social/jetstream/internal/pgstore"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -252,6 +253,9 @@ func (b *StorageBackend) ReclaimLocal(ctx context.Context, lease time.Duration, 
 	if margin == 0 {
 		margin = DefaultReclaimMargin
 	}
+	if margin >= seqspace.CursorSeqMaxThreshold {
+		return ReclaimResult{}, fmt.Errorf("migrate reclaim: margin %d reaches the seq ceiling %d", margin, seqspace.CursorSeqMaxThreshold)
+	}
 	// Open the local store first: its lock proves no local process runs.
 	st, err := pebblestore.Open(dataDir, nil, pebblestore.WithFS(fsys))
 	if err != nil {
@@ -296,7 +300,13 @@ func (b *StorageBackend) ReclaimLocal(ctx context.Context, lease time.Duration, 
 	if res.LocalNext, err = catalog.DecodeSeq(catalog.MainSeqKey, lv, err == nil); err != nil {
 		return ReclaimResult{}, err
 	}
-	res.ResumeSeq = max(res.CatalogNext, res.LocalNext) + margin
+	// The writer refuses a reservation past the cursor ceiling, so a resume
+	// seq beyond it would leave the reclaimed archive unable to start.
+	base := max(res.CatalogNext, res.LocalNext)
+	if base >= seqspace.CursorSeqMaxThreshold-margin {
+		return ReclaimResult{}, fmt.Errorf("migrate reclaim: seq %d plus margin %d reaches the seq ceiling %d; use a smaller --margin", base, margin, seqspace.CursorSeqMaxThreshold)
+	}
+	res.ResumeSeq = base + margin
 	// The seq lease registers [seq/next, seq/max_reserved) as a vacancy
 	// when the next session starts, exactly as after an unclean stop.
 	b2 := st.NewBatch()

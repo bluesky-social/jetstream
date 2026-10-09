@@ -22,6 +22,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/jetstreamd/jetstreamdtest"
 	"github.com/bluesky-social/jetstream/internal/metastore/pebblestore"
 	"github.com/bluesky-social/jetstream/internal/migrate"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
@@ -641,6 +642,11 @@ func TestMigration_Reclaim(t *testing.T) {
 	require.ErrorContains(t, err, "take the writer lease")
 	r.stop(pod)
 	r.pods = nil
+	_, err = r.fake.Backend.ReclaimLocal(ctx, time.Minute, r.dir, r.fs, seqspace.CursorSeqMaxThreshold)
+	require.ErrorContains(t, err, "seq ceiling")
+	require.Equal(t, catalog.MigrationDone, r.migrationState(), "a bad margin changes nothing")
+	_, err = r.fake.Backend.ReclaimLocal(ctx, time.Minute, r.dir, r.fs, seqspace.CursorSeqMaxThreshold-10)
+	require.ErrorContains(t, err, "seq ceiling")
 	res, err := r.fake.Backend.ReclaimLocal(ctx, time.Minute, r.dir, r.fs, 1000)
 	require.NoError(t, err)
 	require.Equal(t, catalog.MigrationReverted, r.migrationState())

@@ -25,7 +25,7 @@ func migrationFlags() []cli.Flag {
 	cat := migrationFlagCategory
 	return []cli.Flag{
 		&cli.BoolFlag{
-			Name: "migrate-to-disaggregated", Category: cat, Usage: "Run the migrator in this local-mode process: copy the archive to the PostgreSQL and S3 that the storage flags name, keep it in step, and hand off on `jetstream migrate handoff`",
+			Name: "migrate-to-disaggregated", Category: cat, Usage: "Run the migrator in this local-mode process: copy the archive to the PostgreSQL and S3 that the storage flags name, keep it in step, and hand off on a jetstream migrate handoff request",
 			Sources: cli.EnvVars("JETSTREAM_MIGRATE_TO_DISAGGREGATED"),
 		},
 		&cli.DurationFlag{

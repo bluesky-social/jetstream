@@ -450,13 +450,13 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		// timeout for a silent peer). Only then do we cancel, to
 		// guarantee the serve loops exit even if they were mid-select.
 		// The whole call is bounded by the caller's Shutdown deadline.
-		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		_ = conn.Close(websocket.StatusGoingAway, deps.Tail.CloseReason())
 		cancel()
 	}
 
 	connID, ok := deps.Tail.RegisterConn(closeConn)
 	if !ok {
-		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		_ = conn.Close(websocket.StatusGoingAway, deps.Tail.CloseReason())
 		return
 	}
 	defer deps.Tail.DeregisterConn(connID)
