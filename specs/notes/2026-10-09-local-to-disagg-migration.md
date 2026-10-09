@@ -1,6 +1,8 @@
 # Live migration from local to disaggregated storage
 
-2026-10-09. Branch `jc/local-to-disagg-migration`. Status: proposed.
+2026-10-09. Branch `jc/local-to-disagg-migration`. Status: implemented
+(S1–S7). §15 records where the code departs from this plan; where they
+disagree, §15 and the code win.
 
 This plan moves a running local-mode archive (segment files and Pebble on one
 volume) to disaggregated storage (S3-compatible object storage and
@@ -1109,3 +1111,122 @@ Checks: `just mutation-campaign`, and record the scorecard.
     preferred.
   - The restart path is the fallback if quiescing every metadata writer
     proves hard to make airtight.
+
+## 15. Implementation notes
+
+What landed, and where it departs from the plan above.
+
+**Where the code is.**
+
+- `internal/catalog`: `migration/state` and its transitions, the import
+  scripts (`ImportSealedSegment`, `ImportActiveBlocks`, `ImportSeal`,
+  `ImportMeta`), `SetMigrationState`, `InitMigration`, and the vacancy
+  registry. `CheckInvariants` accepts registered vacancies only.
+- `internal/leader`: `MayAcquire`, `ErrStandby`, and `ErrDone`.
+- `internal/migrate`: the migrator (seed, tail, metadata copy, reconcile,
+  handoff) and the local guard.
+- `internal/jetstreamd`: the wiring in the local process (the ingest gate,
+  the compaction gate, drained mode, `/debug/migration`), and the operator
+  operations behind the CLI.
+- `internal/pgstore`: the operator control tables.
+- `cmd/jetstream`: `storage init --migrate-from-local`, `serve
+  --migrate-to-disaggregated` (`JETSTREAM_MIGRATE_TO_DISAGGREGATED`) with
+  the `JETSTREAM_MIGRATION_*` knobs, and `jetstream migrate
+  status|handoff|abort|reclaim`.
+
+**Departures from the plan.**
+
+- **Vacancies are one key.** `seq/vacancies` holds main's whole registry
+  (`seqspace.Gaps`), not one key per gap. Only the import scripts write it,
+  and only above the imported frontier.
+- **No seal at handoff.** H2 stops the local writer session instead of
+  sealing: the active segment's durable blocks are shipped as active
+  blocks, and the new leader continues that segment. H3 has no
+  `ImportSeal`. A seal at handoff would add a seal and an upload to the
+  ingest pause, and the catalog already handles an active segment.
+- **No `bootstrap_live` segment.** `InitMigration` creates only main's
+  segment 0 and `migration/state = seeding`, in one transaction. A migrated
+  archive is past merge, so there is nothing for the phase transaction to
+  delete.
+- **H1 is not mirrored in Pebble.** The local process learns
+  `handing_off` from the catalog. The guard (H5, H7) is the only local
+  record of a handoff.
+- **H6 does not clear the lease holder in the transaction.** The session
+  ends with `leader.ErrDone`, so `leader.Run` returns nil and releases the
+  lease. A pod's `MayAcquire` passes once the state reads `done`.
+- **The session check is `ReadMigrationState`**, a fenced read at the
+  start of every disaggregated session, ahead of the orchestrator. The
+  follower also mirrors `migration/state` for `MayAcquire`.
+- **Operator control is two tables outside the versioned schema**
+  (`migration_requests`, `migration_status`), created with `CREATE TABLE IF
+  NOT EXISTS`, so `pgstore.SchemaVersion` is unchanged. A request is
+  claimed by the migrator before it acts; until then the operator can
+  withdraw it (a CLI timeout does). A new migrator session answers every
+  unanswered request as abandoned: a handoff is never replayed after a
+  restart.
+- **Metadata resync is a merge join**, not a cursor walk. A full resync
+  iterates the source's snapshot and the catalog together in key order and
+  writes only the differences, deletes included. It runs at the start of
+  every migrator session (the seed's bulk copy is this first resync), then
+  every `VERIFY_INTERVAL`, and whenever the dirty set overflows. Seeding
+  becomes tailing only after both the segments and that resync are done.
+- **`relay/cursor` is copied only at handoff.** Copied while tailing, it
+  could run ahead of the shipped events. H3 copies it after
+  ingest stops, and H4 checks it byte for byte with the other critical
+  keys.
+- **Handoff preconditions.** The migrator checks:
+  - the state is `tailing`;
+  - the replica trails local ingest by at most `HANDOFF_MAX_LAG_SEQS` seqs
+    (default 8,192), not a block count;
+  - a full resync finished within `HANDOFF_MAX_RESYNC_AGE` (default 24h);
+  - the compaction pause is within `MAX_COMPACTION_PAUSE`;
+  - every imported generation still matches the source's
+    (`reconcileSealed`, from memory, before H1).
+
+  The rest are the operator's: that a pod has caught up and serves, and
+  object-store headroom. `jetstream migrate status` shows what they need.
+- **H4 compares seq/next, vacancies, and the critical keys.** An optional
+  full metadata comparison (`HANDOFF_FULL_VERIFY`) runs inside the pause and
+  refuses on any difference.
+- **A vacancy at the source's tip refuses the handoff.** If the source
+  registered a vacancy and wrote no event after it, no block carries it to
+  the catalog yet. The handoff reverts and asks for a retry once local
+  ingest has written an event.
+- **Reclaim takes a margin, not a vacancy end.** `jetstream migrate reclaim
+  --data-dir ... --margin N` takes the writer lease (so it refuses while a
+  pod holds it), sets the catalog to `reverted`, and sets the local
+  `seq/max_reserved` to max(catalog next, local next) + N. The local seq
+  lease then registers the vacancy at the next start, as after an unclean
+  stop. It refuses a resume seq past the cursor ceiling. Segment indexes
+  are not skipped, so names from the handoff's active segment on repeat
+  with different content (§8).
+
+**Not built.**
+
+- **S0's dry-run inventory.** The migrator itself refuses a metadata key
+  with no rule (`errUnclassified`), which stops the migrator and not the
+  process, and `/debug/migration` and the status table report seed
+  progress. The inventory remains useful for sizing before a migration.
+- **S8 and S9** are operational: the rehearsals and the runbook.
+
+**Tests.**
+
+- The oracle's migration tests (`internal/oracle/migration_test.go`) run
+  the whole migration against storagefake and the simulator:
+  - seed, a mid-migration unclean restart, and tailing;
+  - a shadow pod with byte-equal sealed segments;
+  - handoff, a drained source, and a pod carrying on;
+  - a client that plans on the source and goes live on the pod across the
+    handoff;
+  - a kill at each of the eight migration crash points;
+  - reclaim.
+
+  Every client view is compared with the model, and no commit at or past
+  the handoff repeats one archived before it.
+- Per-DID rev order is not asserted. A plain local archive under stress can
+  archive a commit older than a preceding backfill or resync, without any
+  migration code, so the check would test that and not the migration.
+- `cmd/jetstream/migrate_test.go` runs the CLI against PostgreSQL and S3
+  (`just test-storage`).
+- Mutants m079–m084 cover the migration (the `migration` tier); see
+  `testing/mutation/RESULTS.md`.

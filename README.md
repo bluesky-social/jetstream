@@ -88,6 +88,8 @@ JETSTREAM_ADDR=:8081 JETSTREAM_DEBUG_ADDR=:6061 just run-prod serve
 
 `jetstream serve --help` lists every storage setting under "Disaggregated storage".
 
+A running local-mode archive can move to disaggregated storage without downtime; see [docs/migrating-to-disaggregated.md](docs/migrating-to-disaggregated.md).
+
 To fully reset your local environment (warning: destructive action!):
 
 ```sh
