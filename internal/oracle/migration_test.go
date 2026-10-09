@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,6 +41,7 @@ type migrationRig struct {
 	t     *testing.T
 	ctx   context.Context
 	cfg   Config
+	scale int
 	w     *world.World
 	relay string
 	fs    vfs.FS
@@ -51,6 +55,9 @@ type migrationRig struct {
 	// maxSeq is the highest seq any runtime archived. A pod reports an
 	// event once appended, before its catalog commit lands.
 	maxSeq atomic.Uint64
+	// archivedBy names the runtime that archived each seq, for failures.
+	archivedMu sync.Mutex
+	archivedBy map[uint64]string
 
 	local *rigRuntime
 	pods  []*rigRuntime
@@ -74,11 +81,15 @@ func newMigrationRig(t *testing.T, seedIdx int) *migrationRig {
 		LiveEventsBootstrap: 4,
 		LiveEventsSteady:    4,
 	}
+	scale := 1
+	if os.Getenv(envOracleMode) == "stress" {
+		cfg.Accounts, cfg.MaxInitialRecords, scale = 24, 8, 5
+	}
 	w := newRestartWorld(t, cfg)
 	t.Cleanup(func() { require.NoError(t, w.Close()) })
 	srv := newRestartServer(t, w, nil)
 	t.Cleanup(srv.Close)
-	r := &migrationRig{t: t, ctx: t.Context(), cfg: cfg, w: w, relay: srv.URL, fs: vfs.Default, dir: t.TempDir(), fake: jetstreamdtest.New(storagefake.Config{})}
+	r := &migrationRig{t: t, ctx: t.Context(), cfg: cfg, scale: scale, w: w, relay: srv.URL, fs: vfs.Default, dir: t.TempDir(), archivedBy: map[uint64]string{}, fake: jetstreamdtest.New(storagefake.Config{})}
 	r.gate.Store(newCutoverDeliveryGate(srv.URL, 30*time.Second))
 	t.Cleanup(func() {
 		for _, p := range r.pods {
@@ -91,6 +102,18 @@ func newMigrationRig(t *testing.T, seedIdx int) *migrationRig {
 	return r
 }
 
+// generate emits n relay events, times the stress scale.
+func (r *migrationRig) generate(n int) { generateN(r.t, r.w, n*r.scale) }
+
+func (r *migrationRig) observer(name string) func(*segment.Event) {
+	return func(ev *segment.Event) {
+		r.archivedMu.Lock()
+		r.archivedBy[ev.Seq] = name
+		r.archivedMu.Unlock()
+		r.observe(ev)
+	}
+}
+
 func (r *migrationRig) observe(ev *segment.Event) {
 	for {
 		cur := r.maxSeq.Load()
@@ -101,11 +124,29 @@ func (r *migrationRig) observe(ev *segment.Event) {
 	r.gate.Load().observe(ev)
 }
 
+// archivedTip returns the last seq archived once waitArchived has
+// returned. The gate counts a frame delivered at its first row, so a
+// multi-op commit's later rows can still be landing: the tip is read once
+// it holds still.
+func (r *migrationRig) archivedTip() uint64 {
+	r.t.Helper()
+	tip, stillFor := r.maxSeq.Load(), 0
+	require.Eventually(r.t, func() bool {
+		if cur := r.maxSeq.Load(); cur != tip {
+			tip, stillFor = cur, 0
+			return false
+		}
+		stillFor++
+		return stillFor >= 5
+	}, 10*time.Second, 10*time.Millisecond)
+	return tip
+}
+
 // committedTip waits until the catalog holds every seq any runtime
 // archived, and returns the last.
 func (r *migrationRig) committedTip() uint64 {
 	r.t.Helper()
-	tip := r.maxSeq.Load()
+	tip := r.archivedTip()
 	require.Eventually(r.t, func() bool {
 		next, err := catalog.DecodeSeq(catalog.MainSeqKey, r.catalogSnapshot().Meta[catalog.MainSeqKey], true)
 		require.NoError(r.t, err)
@@ -147,7 +188,7 @@ func (r *migrationRig) baseOptions(name string) jetstreamd.Options {
 		SteadyMaxEventsPerBlock: 3,
 		SteadyMaxSegmentBytes:   2048,
 		SessionRestartDelay:     10 * time.Millisecond,
-		OnSteadyStateEvent:      r.observe,
+		OnSteadyStateEvent:      r.observer(name),
 	}
 }
 
@@ -158,7 +199,7 @@ func (r *migrationRig) startLocal(migrateOn bool, crash crashpoint.Injector) {
 	opts := r.baseOptions("local")
 	opts.DataDir = r.dir
 	opts.StorageFS = r.fs
-	opts.OnBootstrapLiveEvent = r.observe
+	opts.OnBootstrapLiveEvent = r.observer("local")
 	opts.BarrierBeforeCutover = func(ctx context.Context) error { return r.gate.Load().waitDelivered(ctx) }
 	opts.CrashInjector = crash
 	if migrateOn {
@@ -327,14 +368,54 @@ func getSegment(t *testing.T, host string, idx uint64) []byte {
 	return body
 }
 
-func (r *migrationRig) requireModel(events []ObservedEvent, what string) {
+// requireModel checks a client's download of the archive against the
+// model, and that no commit archived at or past seam repeats one archived
+// before it: the handoff and a reclaim each resume ingest from a copied
+// relay cursor, and a stale cursor or replay guard shows up as exactly that.
+//
+// It does not assert per-DID rev order (CheckInvariants): a plain local
+// archive under stress can archive a commit older than the backfill or
+// resync before it, on the commit before this migration existed too, so
+// the order check would test that and not the migration.
+func (r *migrationRig) requireModel(events []ObservedEvent, seam uint64, what string) {
 	r.t.Helper()
-	require.NoErrorf(r.t, CheckInvariants(events), "%s", what)
+	require.NoErrorf(r.t, CheckStructuralInvariants(events), "%s", what)
 	want, err := GroundTruthFromWorld(r.w)
 	require.NoError(r.t, err)
 	got, err := Reconstruct(EventsSortedBySeq(events))
 	require.NoError(r.t, err)
-	require.NoErrorf(r.t, Compare(want, got), "%s", what)
+	if err := Compare(want, got); err != nil {
+		r.logHistory(events, err)
+		require.NoErrorf(r.t, err, "%s", what)
+	}
+	type commitKey struct {
+		did, collection, rkey, rev string
+		kind                       segment.Kind
+	}
+	before := map[commitKey]uint64{}
+	for _, ev := range events {
+		if ev.Rev == "" {
+			continue
+		}
+		k := commitKey{ev.DID, ev.Collection, ev.Rkey, ev.Rev, ev.Kind}
+		if ev.Seq < seam {
+			before[k] = ev.Seq
+		} else if prev, ok := before[k]; ok {
+			err := fmt.Errorf("oracle: %s %s/%s rev %s archived at seq %d before the seam %d and again at %d", ev.DID, ev.Collection, ev.Rkey, ev.Rev, prev, seam, ev.Seq)
+			r.logHistory(events, err)
+			require.NoErrorf(r.t, err, "%s", what)
+		}
+	}
+}
+
+// handoffSeq is the catalog's migration/handoff_seq.
+func (r *migrationRig) handoffSeq() uint64 {
+	r.t.Helper()
+	v, err := r.fake.DB.MetaStore(nil).Get(r.ctx, []byte(catalog.MigrationHandoffSeqKey))
+	require.NoError(r.t, err, "the handoff committed")
+	seq, err := catalog.DecodeSeq(catalog.MigrationHandoffSeqKey, v, true)
+	require.NoError(r.t, err)
+	return seq
 }
 
 // TestMigration_LocalToDisaggregated migrates a live local archive with
@@ -349,7 +430,8 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 
 	// A local archive in steady state, stopped uncleanly once: a vacancy.
 	r.startLocal(false, nil)
-	generateN(t, r.w, 30)
+	r.waitSteady(r.local)
+	r.generate(30)
 	r.waitArchived()
 	r.stop(r.local)
 	r.abandonLease(50)
@@ -357,7 +439,7 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	// The migration seeds, then tails.
 	require.NoError(t, r.fake.InitMigration(ctx))
 	r.startLocal(true, nil)
-	generateN(t, r.w, 30)
+	r.generate(30)
 	r.waitArchived()
 	first := r.waitTailing(1)
 	require.NotZero(t, first.RemoteActiveSegment, "the seed imported sealed segments")
@@ -367,7 +449,7 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	r.stop(r.local)
 	r.abandonLease(20)
 	r.startLocal(true, nil)
-	generateN(t, r.w, 30)
+	r.generate(30)
 	r.waitArchived()
 	st := r.waitTailing(first.RemoteNextSeq + 1)
 	snap := r.catalogSnapshot()
@@ -405,7 +487,7 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	require.NotEmpty(t, getSegment(t, r.url(r.local), sealed[0]))
 
 	// A pod takes the lease and carries on from the copied relay cursor.
-	generateN(t, r.w, 30)
+	r.generate(30)
 	r.waitArchived()
 	tip := r.committedTip()
 	// The done transition is fenced, so the migrator held the lease to the
@@ -413,7 +495,7 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	// one acquisition here.
 	require.Equal(t, before+1, r.catalogSnapshot().Archive.WriterEpoch, "the pod acquired once, after done")
 	all := r.download(r.url(pod), tip)
-	r.requireModel(all, "the migrated archive and the pod's ingest after it")
+	r.requireModel(all, r.handoffSeq(), "the migrated archive and the pod's ingest after it")
 	require.NoError(t, catalog.CheckInvariants(r.catalogSnapshot(), catalog.InvariantOptions{MaxEventsPerBlock: 1 << 16}))
 
 	// A restart of the source stays drained and never ingests.
@@ -421,12 +503,24 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	require.Equal(t, migrate.GuardDone, r.localGuard())
 	localNext := r.localNext()
 	r.startLocal(true, nil)
-	generateN(t, r.w, 5)
+	r.generate(5)
 	r.waitArchived()
 	r.waitSubscribeRefused(r.url(r.local))
 	r.stop(r.local)
 	require.Equal(t, migrate.GuardDone, r.localGuard())
 	require.Equal(t, localNext, r.localNext(), "the drained source ingested nothing")
+}
+
+// logHistory logs, for each DID err names, its events and who archived
+// them.
+func (r *migrationRig) logHistory(events []ObservedEvent, err error) {
+	r.archivedMu.Lock()
+	defer r.archivedMu.Unlock()
+	for _, ev := range events {
+		if strings.Contains(err.Error(), ev.DID) {
+			r.t.Logf("history: seq=%d by=%q kind=%d %s/%s rev=%s", ev.Seq, r.archivedBy[ev.Seq], ev.Kind, ev.Collection, ev.Rkey, ev.Rev)
+		}
+	}
 }
 
 func httpGet(ctx context.Context, url string) (*http.Response, error) {
@@ -483,6 +577,24 @@ func (i *killInjector) SimulateCrash(_ context.Context, p crashpoint.Point) erro
 	return fmt.Errorf("oracle: killed at %s", p)
 }
 
+// waitSteady waits until p serves its archive, which it does from
+// steady_state on: a migration only starts from there. Traffic generated
+// after it reaches the steady consumer, so the migration tests do not
+// depend on the bootstrap cutover.
+func (r *migrationRig) waitSteady(p *rigRuntime) {
+	r.t.Helper()
+	require.Eventually(r.t, func() bool {
+		// Until then /subscribe answers 503; after, a plain GET is refused
+		// for not being a websocket upgrade.
+		resp, err := httpGet(r.ctx, r.url(p)+"/subscribe")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode != http.StatusServiceUnavailable
+	}, 60*time.Second, 10*time.Millisecond, "%s reaches steady_state", p.name)
+}
+
 // waitSubscribeRefused waits until host's /subscribe answers 503.
 func (r *migrationRig) waitSubscribeRefused(host string) {
 	r.t.Helper()
@@ -501,9 +613,9 @@ func (r *migrationRig) waitSubscribeRefused(host string) {
 func (r *migrationRig) podCarriesOn(what string) {
 	r.t.Helper()
 	pod := r.startPod("pod-a")
-	generateN(r.t, r.w, 20)
+	r.generate(20)
 	r.waitArchived()
-	r.requireModel(r.download(r.url(pod), r.committedTip()), what)
+	r.requireModel(r.download(r.url(pod), r.committedTip()), r.handoffSeq(), what)
 	require.NoError(r.t, catalog.CheckInvariants(r.catalogSnapshot(), catalog.InvariantOptions{MaxEventsPerBlock: 1 << 16}))
 }
 
@@ -544,7 +656,8 @@ func TestMigration_CrashSeams(t *testing.T) {
 			r := newMigrationRig(t, 600+i)
 			ctx := r.ctx
 			r.startLocal(false, nil)
-			generateN(t, r.w, 30)
+			r.waitSteady(r.local)
+			r.generate(30)
 			r.waitArchived()
 			r.stop(r.local)
 			r.abandonLease(10)
@@ -552,7 +665,7 @@ func TestMigration_CrashSeams(t *testing.T) {
 
 			inj := &killInjector{target: point}
 			r.startLocal(true, inj)
-			generateN(t, r.w, 20)
+			r.generate(20)
 			var req int64
 			if handoff[point] {
 				r.waitArchived()
@@ -593,7 +706,7 @@ func TestMigration_CrashSeams(t *testing.T) {
 
 			// The restart reverts or resumes, and the migration completes.
 			r.startLocal(true, nil)
-			generateN(t, r.w, 20)
+			r.generate(20)
 			r.waitArchived()
 			r.waitTailing(1)
 			result, err := r.fake.Backend.RequestMigration(ctx, migrate.ActionHandoff, time.Minute)
@@ -618,12 +731,13 @@ func TestMigration_Reclaim(t *testing.T) {
 	r := newMigrationRig(t, 700)
 	ctx := r.ctx
 	r.startLocal(false, nil)
-	generateN(t, r.w, 30)
+	r.waitSteady(r.local)
+	r.generate(30)
 	r.waitArchived()
 	r.stop(r.local)
 	require.NoError(t, r.fake.InitMigration(ctx))
 	r.startLocal(true, nil)
-	generateN(t, r.w, 20)
+	r.generate(20)
 	r.waitArchived()
 	r.waitTailing(1)
 	result, err := r.fake.Backend.RequestMigration(ctx, migrate.ActionHandoff, time.Minute)
@@ -633,7 +747,7 @@ func TestMigration_Reclaim(t *testing.T) {
 	r.local = nil
 
 	pod := r.startPod("pod-a")
-	generateN(t, r.w, 20)
+	r.generate(20)
 	r.waitArchived()
 	r.committedTip()
 
@@ -660,12 +774,12 @@ func TestMigration_Reclaim(t *testing.T) {
 	epoch := r.fake.DB.Archive().WriterEpoch
 	r.startLocal(false, nil)
 	pod = r.startPod("pod-b")
-	generateN(t, r.w, 20)
+	r.generate(20)
 	r.waitArchived()
 	// Every seq the source assigns now is past the pods', so the highest
 	// archived seq is the source's.
-	local := r.download(r.url(r.local), r.maxSeq.Load())
-	r.requireModel(local, "the reclaimed local archive")
+	local := r.download(r.url(r.local), r.archivedTip())
+	r.requireModel(local, res.ResumeSeq, "the reclaimed local archive")
 	for _, ev := range local {
 		require.Falsef(t, ev.Seq >= res.LocalNext && ev.Seq < res.ResumeSeq, "seq %d is in the reclaim vacancy", ev.Seq)
 	}
