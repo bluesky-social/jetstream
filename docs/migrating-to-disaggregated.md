@@ -61,8 +61,9 @@ reports at `/debug/migration` on the debug listener (and as
   contiguous, and every metadata key has a migration rule. A key without a
   rule (listed under `unclassified`) would stop the migrator; it means this
   build does not know how to carry that key over.
-- `seed_bytes` and `seed_objects`: what the seed uploads. Divide by the read
-  throttle to estimate the seed's duration.
+- `seed_bytes` and `seed_objects`: at most what the seed uploads.
+  `segments.sealed_bytes` divided by the read throttle estimates the seed's
+  duration.
 - `vacancies`: the seq vacancies the archive carries over. A vacancy `at the
   tip` delays a handoff until an event is written after it.
 

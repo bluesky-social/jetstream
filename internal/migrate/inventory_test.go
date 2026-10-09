@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -81,7 +82,7 @@ func TestTakeInventory(t *testing.T) {
 	require.False(t, inv.FinishedAt.IsZero())
 
 	require.Equal(t, InventorySegments{Sealed: 2, Active: 1, Blocks: 4, Contiguous: true, SealedBytes: 3000, ActiveBlocks: 1}, inv.Segments)
-	require.Equal(t, int64(3000+100), inv.SeedBytes)
+	require.Equal(t, int64(3000-3*8+100), inv.SeedBytes, "uploads strip each sealed block's length prefix")
 	require.Equal(t, int64(2+1+1+1+1), inv.SeedObjects, "a block and a footer per sealed block and segment, plus the active block")
 
 	require.Equal(t, string(lifecycle.PhaseSteadyState), inv.Phase)
@@ -137,4 +138,37 @@ func TestVacancyWhere(t *testing.T) {
 	require.Equal(t, "between segments 0 and 2", vacancyWhere(segs, 25))
 	require.Equal(t, "at the tip", vacancyWhere(segs, 41))
 	require.Equal(t, "at the tip", vacancyWhere(nil, 1))
+}
+
+// TestTakeInventoryProgressCopies reads every report Progress hands out,
+// on another goroutine, while the scan carries on; run under -race.
+func TestTakeInventoryProgressCopies(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	st, err := pebblestore.Open("/data", nil, pebblestore.WithFS(vfs.NewMem()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	b := st.NewBatch()
+	val := make([]byte, 4<<10)
+	for i := range 1500 {
+		b.Set(fmt.Appendf(nil, "p%03d/%d", i%300, i), val)
+	}
+	require.NoError(t, b.Commit(ctx))
+
+	reports := make(chan Inventory, 64)
+	read := make(chan int)
+	go func() {
+		n := 0
+		for inv := range reports {
+			_, err := json.Marshal(inv)
+			if err == nil {
+				n++
+			}
+		}
+		read <- n
+	}()
+	_, err = TakeInventory(ctx, InventoryConfig{Meta: st, Catalog: &viewCatalog{}, Progress: func(inv Inventory) { reports <- inv }})
+	close(reports)
+	require.NoError(t, err)
+	require.Greater(t, <-read, 3, "the scan reported progress several times")
 }

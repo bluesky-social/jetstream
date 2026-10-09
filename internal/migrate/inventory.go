@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"time"
@@ -82,7 +83,8 @@ type InventoryConfig struct {
 	FS vfs.FS
 	// ReadBytesPerSec throttles the metadata scan. Zero is unthrottled.
 	ReadBytesPerSec int64
-	// Progress, when set, receives the report as it fills in.
+	// Progress, when set, receives the report as it fills in. Each call
+	// gets its own copy, which it may keep and read from any goroutine.
 	Progress func(Inventory)
 }
 
@@ -97,7 +99,7 @@ func TakeInventory(ctx context.Context, cfg InventoryConfig) (Inventory, error) 
 	}
 	progress := func() {
 		if cfg.Progress != nil {
-			cfg.Progress(inv)
+			cfg.Progress(inv.clone())
 		}
 	}
 	fail := func(err error) (Inventory, error) {
@@ -180,6 +182,15 @@ func TakeInventory(ctx context.Context, cfg InventoryConfig) (Inventory, error) 
 	return inv, nil
 }
 
+// clone copies inv deeply: the scan keeps writing the original's maps.
+func (inv Inventory) clone() Inventory {
+	inv.MetaByPrefix = maps.Clone(inv.MetaByPrefix)
+	inv.MetaByClass = maps.Clone(inv.MetaByClass)
+	inv.Vacancies = slices.Clone(inv.Vacancies)
+	inv.Unclassified = slices.Clone(inv.Unclassified)
+	return inv
+}
+
 func add(m map[string]KeyStat, k string, n int64) {
 	s := m[k]
 	s.Keys++
@@ -187,10 +198,11 @@ func add(m map[string]KeyStat, k string, n int64) {
 	m[k] = s
 }
 
-// inventorySegments fills inv.Segments and the seed estimate: every
-// sealed file whole, one object per block and footer, and the active
-// segment's durable blocks. Identical frames dedupe on upload, so the
-// object count is an upper bound.
+// inventorySegments fills inv.Segments and the seed estimate: each sealed
+// file less its blocks' length prefixes, which uploads strip, one object
+// per block and footer, and the active segment's durable blocks. Identical
+// frames dedupe on upload, so both are upper bounds. SealedBytes is the
+// files whole, which is what the seed reads.
 func inventorySegments(inv *Inventory, segs []catalog.SegmentView, size func(uint64) (int64, error)) error {
 	s := &inv.Segments
 	s.Contiguous = true
@@ -206,8 +218,12 @@ func inventorySegments(inv *Inventory, segs []catalog.SegmentView, size func(uin
 			if err != nil {
 				return err
 			}
+			uploaded := n - 8*int64(len(v.Blocks))
+			if uploaded < 0 {
+				return fmt.Errorf("migrate: segment %d holds %d bytes, fewer than its %d blocks' length prefixes", v.Index, n, len(v.Blocks))
+			}
 			s.SealedBytes += n
-			inv.SeedBytes += n
+			inv.SeedBytes += uploaded
 			inv.SeedObjects += int64(len(v.Blocks)) + 1
 		case catalog.Active:
 			s.Active++
@@ -279,7 +295,7 @@ func NewInventoryMetrics(reg prometheus.Registerer) *InventoryMetrics {
 		metaKeys:     prometheus.NewGaugeVec(prometheus.GaugeOpts(o("meta_keys", "Source metadata keys by migration rule.")), []string{"class"}),
 		metaBytes:    prometheus.NewGaugeVec(prometheus.GaugeOpts(o("meta_bytes", "Source metadata key and value bytes by migration rule.")), []string{"class"}),
 		unclassified: prometheus.NewGauge(prometheus.GaugeOpts(o("unclassified_keys", "Source metadata keys with no migration rule; a migration refuses to start past one."))),
-		seedBytes:    prometheus.NewGauge(prometheus.GaugeOpts(o("seed_bytes", "Segment bytes a migration would upload."))),
+		seedBytes:    prometheus.NewGauge(prometheus.GaugeOpts(o("seed_bytes", "Segment bytes a migration would upload, at most."))),
 		seedObjects:  prometheus.NewGauge(prometheus.GaugeOpts(o("seed_objects", "Objects a migration would upload, at most."))),
 		vacancies:    prometheus.NewGauge(prometheus.GaugeOpts(o("vacancies", "Registered seq vacancies a migration would carry over."))),
 		finished:     prometheus.NewGauge(prometheus.GaugeOpts(o("finished_timestamp_seconds", "When the inventory finished; 0 until it does."))),
