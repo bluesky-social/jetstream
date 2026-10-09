@@ -6,13 +6,17 @@ package world
 // ingest validators. Invalid revs are signed into the commit to match the
 // envelope, with time taken from the logical clock.
 //
+// Path lies must be MST-valid keys (mst.IsValidMstKey: one interior slash,
+// ASCII [A-Za-z0-9_~-:.]) that fail the stricter atproto NSID/rkey specs.
+// A key that is not MST-valid makes atmos reject the whole tree — the
+// commit on the live path (inversion fails), the repo on the backfill path
+// (LoadCompleteFromCAR fails) — so it never reaches the gate; atmos's own
+// hostile-MST tests own that class.
+//
 // AdversarialLedger records expected drops, whole-event cursor gaps, and
 // required drop-counter increments. This lets the oracle distinguish injected
 // invalid input from unexpected loss.
 //
-// Invalid UTF-8 cannot appear in a live op.Path because CBOR text decoding
-// rejects it. CAR MST keys use byte strings, so
-// InjectAdversarialRecordForBackfill can test this case through getRepo.
 
 import (
 	"context"
@@ -23,6 +27,7 @@ import (
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/api/lextypes"
 	"github.com/jcalabro/atmos/cbor"
+	"github.com/jcalabro/atmos/mst"
 	"github.com/jcalabro/atmos/repo"
 	"github.com/jcalabro/gt"
 )
@@ -144,6 +149,9 @@ func (w *World) GenerateAdversarialOpForTest(ctx context.Context, idx int, badKe
 	if err := ctx.Err(); err != nil {
 		return GeneratedChainOp{}, err
 	}
+	if err := checkAdversarialKey(badKey); err != nil {
+		return GeneratedChainOp{}, err
+	}
 	author, rp, store, prevState, err := w.loadRepoForTargetedCommit(idx)
 	if err != nil {
 		return GeneratedChainOp{}, err
@@ -202,9 +210,7 @@ func (w *World) GenerateAdversarialOpForTest(ctx context.Context, idx int, badKe
 // precedent). The adversarial key rides the persisted MST, so
 // jetstream's backfill getRepo download walks straight into it and the
 // backfill half of the #197 gate must drop it while archiving the
-// account's honest records. This is also the ONLY route for
-// invalid-UTF-8 rkeys (wire-blocked on the live path; MST node keys
-// are CBOR byte strings and carry arbitrary bytes).
+// account's honest records.
 //
 // Must be called BEFORE jetstream bootstraps (or before the account's
 // repo is fetched) for the lie to be visible to backfill.
@@ -213,6 +219,9 @@ func (w *World) InjectAdversarialRecordForBackfill(ctx context.Context, idx int,
 	defer w.mutationMu.Unlock()
 
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkAdversarialKey(badKey); err != nil {
 		return err
 	}
 	author, rp, _, _, err := w.loadRepoForTargetedCommit(idx)
@@ -250,6 +259,15 @@ func (w *World) InjectAdversarialRecordForBackfill(ctx context.Context, idx int,
 		Collection: badColl,
 		Rkey:       badRkey,
 	}, badKey)
+	return nil
+}
+
+// checkAdversarialKey rejects a path lie that atmos would refuse as an
+// invalid tree, before any world state is touched.
+func checkAdversarialKey(badKey string) error {
+	if !mst.IsValidMstKey(badKey) {
+		return fmt.Errorf("simulator: adversarial key %q is not MST-valid, so atmos rejects the whole tree before the ingest gate: %w", badKey, mst.ErrInvalidKey)
+	}
 	return nil
 }
 

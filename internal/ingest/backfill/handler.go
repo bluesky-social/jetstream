@@ -231,10 +231,10 @@ func (h *SegmentHandler) validRecordPath(ctx context.Context, did atmos.DID, key
 
 // splitRecordPath splits an MST key and validates both halves against
 // the atproto specs (NSID + record key — the same checks as
-// atmos.ParseRepoPath). The MST layer's own key charset is broader
-// than the specs, and mst.LoadTree decodes keys from a downloaded CAR
-// without spec validation, so a hostile PDS can put arbitrary
-// MST-legal keys in front of this walk. reason == "" means valid.
+// atmos.ParseRepoPath). atmos rejects a tree holding any key that is
+// not MST-valid, but the MST key rules are broader than the specs, so a
+// hostile PDS can still put MST-legal, spec-invalid keys (a ".." rkey,
+// a two-segment NSID) in front of this walk. reason == "" means valid.
 func splitRecordPath(key string) (collection, rkey string, reason ingest.DropReason) {
 	collection, rkey, found := strings.Cut(key, "/")
 	if !found {

@@ -363,8 +363,9 @@ func TestSegmentHandler_InvalidRevFailsRepo(t *testing.T) {
 
 // buildHostileKeyRepo builds a repo whose MST contains records
 // inserted under raw keys, bypassing Repo.Create's path validation —
-// the shape a hostile or buggy PDS's CAR produces (mst.LoadTree
-// decodes keys from CBOR without spec validation).
+// the shape a hostile or buggy PDS's CAR produces. Keys must be
+// MST-valid: atmos rejects any other key as an invalid tree before the
+// repo reaches HandleRepo.
 func buildHostileKeyRepo(t *testing.T, did atmos.DID, keys ...string) (*atmosrepo.Repo, *atmosrepo.Commit) {
 	t.Helper()
 	mstore := mst.NewMemBlockStore()
@@ -388,7 +389,7 @@ func buildHostileKeyRepo(t *testing.T, did atmos.DID, keys ...string) (*atmosrep
 // TestSegmentHandler_SpecInvalidPathDropsRecordKeepsSiblings pins the
 // per-record half of the gate: a record whose MST key fails atproto
 // path validation (spec-invalid NSID or record key — including keys
-// the MST charset allows but the specs don't) is dropped and counted
+// the MST key rules allow but the specs don't) is dropped and counted
 // while well-formed siblings archive normally. Pre-#197 a malformed
 // key failed the whole repo.
 func TestSegmentHandler_SpecInvalidPathDropsRecordKeepsSiblings(t *testing.T) {
@@ -400,9 +401,9 @@ func TestSegmentHandler_SpecInvalidPathDropsRecordKeepsSiblings(t *testing.T) {
 	}{
 		{"nodots/rkey1", ingest.DropReasonInvalidCollection},
 		{"two.segments/rkey1", ingest.DropReasonInvalidCollection},
-		{"justonepart", ingest.DropReasonInvalidCollection},
+		{"app.bsky.feed./rkey1", ingest.DropReasonInvalidCollection},
 		{"app.bsky.feed.post/..", ingest.DropReasonInvalidRkey},
-		{"app.bsky.feed.post/bad/extra", ingest.DropReasonInvalidRkey},
+		{"app.bsky.feed.post/.", ingest.DropReasonInvalidRkey},
 	} {
 		w := newTestIngest(t)
 		dropMetrics := ingest.NewDropMetrics(prometheus.NewRegistry())

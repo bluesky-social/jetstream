@@ -38,20 +38,19 @@ import (
 )
 
 // adversarialLiveOpLies is the live per-op lie set, covering every
-// drop reason the live op gate owns. Keys must be MST-insertable and
-// wire-safe (valid UTF-8): the invalid-UTF-8 class is backfill-only
-// and lives in adversarialBackfillLies.
+// drop reason the live op gate owns. Keys must be MST-valid
+// (mst.IsValidMstKey) but spec-invalid: atmos rejects a non-MST-valid
+// key as an invalid tree, before the gate (see world/adversarial.go).
 var adversarialLiveOpLies = []struct {
 	name   string
 	badKey string
 	reason string
 }{
-	{"null_byte_rkey", "app.bsky.feed.post/bad\x00key", "invalid_rkey"},
+	{"dot_rkey", "app.bsky.feed.post/.", "invalid_rkey"},
 	{"dotdot_rkey", "app.bsky.feed.post/..", "invalid_rkey"},
 	{"rkey_over_512", "app.bsky.feed.post/" + longRunOfX(600), "invalid_rkey"},
-	{"dollar_collection", "$account/3lzzzzzzzzz2a", "invalid_collection"},
-	{"no_slash_path", "nosslashatall", "invalid_collection"},
-	{"unicode_collection", "app.bskÿ.feed.post/3lzzzzzzzzz2a", "invalid_collection"},
+	{"two_segment_nsid", "bsky.post/3lzzzzzzzzz2a", "invalid_collection"},
+	{"no_dot_collection", "nodots/3lzzzzzzzzz2a", "invalid_collection"},
 	{"unrepresentable_rkey_300", "app.bsky.feed.post/" + longRunOfX(300), "field_too_long"},
 }
 
@@ -63,9 +62,9 @@ var adversarialBackfillLies = []struct {
 	badKey string
 	reason string
 }{
-	{"invalid_utf8_rkey", "app.bsky.feed.post/bad\xff\xfekey", "invalid_rkey"},
+	{"dot_rkey", "app.bsky.feed.post/.", "invalid_rkey"},
 	{"dotdot_rkey", "app.bsky.feed.post/..", "invalid_rkey"},
-	{"no_slash_path", "nosslashbackfill", "invalid_collection"},
+	{"two_segment_nsid", "bsky.backfill/3lzzzzzzzzz2a", "invalid_collection"},
 	{"unrepresentable_rkey_300", "app.bsky.feed.post/" + strings.Repeat("y", 300), "field_too_long"},
 }
 
