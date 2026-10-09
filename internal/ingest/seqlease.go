@@ -101,7 +101,25 @@ func initializeSeqLease(cfg Config, w *Writer, durableNext uint64, seqFound, had
 	return initializedSeqLease{nextSeq: nextSeq, reservedEnd: reservedEnd, gaps: gaps}, nil
 }
 
-func loadSeqGaps(st metastore.Store) (*seqspace.Gaps, error) {
+// SeqReservedKey is the seq lease's reservation: the seq the next writer
+// session starts at if the last one did not close cleanly, registering the
+// seqs below it as a vacancy.
+const SeqReservedKey = seqReservedKey
+
+// SeqGapPrefix prefixes the vacancy registry's keys.
+const SeqGapPrefix = seqGapPrefix
+
+// Iterable is the read side of a metastore.Store, which a Pebble snapshot
+// also has.
+type Iterable interface {
+	NewIter(ctx context.Context, lower, upper []byte) (metastore.Iterator, error)
+}
+
+// LoadSeqGaps reads the vacancy registry: the seqs below seq/next that no
+// event holds because a writer session reserved them and never wrote them.
+func LoadSeqGaps(st Iterable) (*seqspace.Gaps, error) { return loadSeqGaps(st) }
+
+func loadSeqGaps(st Iterable) (*seqspace.Gaps, error) {
 	prefix := []byte(seqGapPrefix)
 	it, err := st.NewIter(context.Background(), prefix, metastore.PrefixUpperBound(prefix))
 	if err != nil {

@@ -5,14 +5,15 @@ oracle's detection power is visible over time. See
 `specs/mutation.md` for the method and `testing/mutation/run.sh` for the
 driver.
 
-**Current catalog (keep this line current): 69 active mutants on disk
-(m001–m078; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
-union baseline after disaggregated-storage compaction and GC coverage (Stage 4
+**Current catalog (keep this line current): 75 active mutants on disk
+(m001–m084; m007, m010, m013, m014, m020, m021, m023, m025, m048 retired). Current
+union baseline after local-to-disaggregated migration coverage (m079–m084),
+disaggregated-storage compaction and GC coverage (Stage 4
 S4.5, m073–m077), disaggregated-storage lifecycle coverage (Stage 3 S3.5,
 m070–m072), disaggregated-storage coverage (Stage 2 S2.19, m062–m069),
 issue #345 seq-lease coverage, PDS-direct backfill coverage, #206 frame-tier coverage, #208 footer-index/bloom
 verification, #203 account-status exactness, and #264 power-loss durability
-coverage: **69 killed, 0 survived,
+coverage: **75 killed, 0 survived,
 zero STALE/BUILD-BROKEN** in
 `testing/mutation/baseline.json` (the commit field is provenance-only). #208 banked the old m015 footer-index survivor as
 KILLED@default; #203 added m043 and banks it as KILLED@default.
@@ -35,6 +36,10 @@ sparse rewrite's vanished-DID count and collection counts, the compaction
 refresh after a publish, and GC_DELAY.
 m078 covers the in-database seq check of the one-round-trip inline hot
 batch commit.
+m079–m084 cover the migration from local to disaggregated storage: the
+metadata copy's range deletes and resync deletes, the local handoff guard at
+startup and before the done commit, the relay cursor's copy at handoff, and
+the import scripts' refusal of unregistered holes (the `migration` tier).
 m042 (the #206 frames-tier mutant) was renumbered from its original m036 id
 at this merge — the #204 branch minted m036–m040 concurrently; same
 precedent as m041's renumber in 82b2dd9.
@@ -85,6 +90,32 @@ The baseline's `disposition` field is the coarse verdict
 tier/seed detail the gate ignores. A seed-sensitive mutant (e.g. m002) is
 recorded by its full-campaign fixed-seed disposition; the gate does not re-run
 seed sweeps.
+
+## Update 2026-10-09 — local-to-disaggregated migration; m079–m084 added
+
+The migration (`specs/notes/2026-10-09-local-to-disagg-migration.md`) gets
+its own `migration` tier: the migration oracle (seed, tail, a shadow pod,
+handoff and pod carry-on, a kill at each of the eight migration crash
+points, and reclaim, against storagefake), the metadata-sync and guard unit
+tests, and the catalog import contract tests. It runs in about a second.
+Each new mutant was run alone with `testing/mutation/run.sh`.
+
+| mutant | result | what killed it |
+|---|---|---|
+| m079_migrate_dirty_set_drops_range_deletes | KILLED@migration | `TestMetaSync_ResyncAndFlush`, `TestDirtySet` |
+| m080_migrate_resync_keeps_catalog_only_keys | KILLED@migration | `TestMetaSync_ResyncAndFlush`, `TestMetaSync_ResyncRepairsDrift` |
+| m081_migrate_guard_ignored_at_startup | KILLED@migration | `TestMigration_CrashSeams/after-migration-done`, `TestMigration_LocalToDisaggregated` |
+| m082_migrate_handoff_skips_pending_guard | KILLED@migration | `TestMigration_CrashSeams/after-migration-guard-pending`, `.../after-migration-done` |
+| m083_import_accepts_unregistered_hole | KILLED@migration | `TestMigration_ImportRefusesHoles` |
+| m084_migrate_handoff_skips_relay_cursor | KILLED@migration | the handoff's critical-key check reverts; `TestMigration_LocalToDisaggregated`, `CrashSeams`, `Reclaim` |
+
+Not cataloged, because a correct migrator never reaches the code they
+remove: the handoff's seq/next and vacancy checks (H4) are defense in depth
+behind H3's own frontier check, and shipping an active block before the
+source's seq/next commit is repaired by local recovery reconciling seq/next
+with the file. A hand-made two-edit mutant (a rewound relay cursor copied
+without the sync chain state, with H4's cursor check removed) is killed by
+the migration oracle's seam check.
 
 ## Update 2026-10-08 — one-round-trip hot batch commit; m078 added, m067 refreshed
 

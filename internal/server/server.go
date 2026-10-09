@@ -89,6 +89,8 @@ type Server struct {
 	// drained once when Run builds the public mux, so registrations
 	// after Run starts are not observed.
 	extraPublicRoutes []publicRoute
+	// extraDebugRoutes is RegisterDebugRoute's, drained the same way.
+	extraDebugRoutes []publicRoute
 }
 
 // New wires up the muxes for both listeners. It does not bind any sockets;
@@ -145,6 +147,12 @@ func (s *Server) RegisterPublicRoute(pattern string, h http.Handler) {
 	})
 }
 
+// RegisterDebugRoute attaches an additional handler to the debug mux, like
+// RegisterPublicRoute. It is a no-op when the debug listener is disabled.
+func (s *Server) RegisterDebugRoute(pattern string, h http.Handler) {
+	s.extraDebugRoutes = append(s.extraDebugRoutes, publicRoute{pattern: pattern, handler: h})
+}
+
 // Run binds both listeners and serves until ctx is cancelled, at which point
 // it triggers graceful shutdown bounded by ShutdownTimeout. Run returns nil
 // if shutdown completed cleanly, or the first error encountered.
@@ -157,6 +165,9 @@ func (s *Server) Run(ctx context.Context) error {
 	// Build the public mux now so RegisterPublicRoute calls between
 	// New and Run are observed.
 	s.srv.Handler = s.publicMux()
+	if s.dbgSrv != nil && len(s.extraDebugRoutes) > 0 {
+		s.dbgSrv.Handler = s.debugMux()
+	}
 
 	// A zero-value ListenConfig matches the behavior of the package-level
 	// net.Listen but lets the bind respect ctx (e.g. cancelled while a
@@ -393,6 +404,9 @@ func (s *Server) debugMux() http.Handler {
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
+	for _, r := range s.extraDebugRoutes {
+		mux.Handle(r.pattern, r.handler)
+	}
 	return mux
 }
 

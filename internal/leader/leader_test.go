@@ -606,3 +606,84 @@ func TestDefaultFatal(t *testing.T) {
 	// A restart marker wrapped around corruption does not downgrade it.
 	require.True(t, DefaultFatal(fmt.Errorf("%w: %w", ErrRestartSession, sessionFatalErr{})))
 }
+
+// A session that finds it must stand by releases the lease at once and the
+// loop waits StandbyBackoff, not AcquireInterval, before the next acquire.
+func TestRun_StandbyReleasesAndBacksOff(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := bubbleCtx(t)
+		defer cancel()
+		lk := &fakeLocker{}
+		rec := newRecorder(cancel, 3)
+		rec.next = func(n int) error {
+			if n <= 2 {
+				return fmt.Errorf("migration in progress: %w", ErrStandby)
+			}
+			return nil
+		}
+		reg := prometheus.NewRegistry()
+		m := NewMetrics(reg)
+		require.NoError(t, Run(ctx, Config{Locker: lk, Metrics: m, StandbyBackoff: 7 * time.Second}, rec.session))
+
+		ends := rec.endsCopy()
+		require.Len(t, ends, 3)
+		require.Equal(t, time.Duration(0), ends[0].ended, "a standby session returns at once")
+		require.Equal(t, 7*time.Second, ends[1].started)
+		require.Equal(t, 14*time.Second, ends[2].started)
+		require.Equal(t, []uint64{1, 2, 3}, lk.releasedEpochs(), "every standby session released its lease")
+		require.InDelta(t, 2, testutil.ToFloat64(m.SessionsTotal.WithLabelValues(reasonStandby)), 0)
+		require.InDelta(t, 0, testutil.ToFloat64(m.SessionsTotal.WithLabelValues(reasonFatal)), 0)
+	})
+}
+
+// ErrStandby is never fatal, even when the caller supplies no Fatal.
+func TestDefaultFatal_Standby(t *testing.T) {
+	t.Parallel()
+	require.False(t, DefaultFatal(fmt.Errorf("x: %w", ErrStandby)))
+	require.True(t, DefaultFatal(errors.New("unclassified")))
+}
+
+// MayAcquire gates every attempt: no Acquire call happens while it reports
+// false, and the first attempt after it flips takes the lease.
+func TestRun_MayAcquireGatesAcquire(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := bubbleCtx(t)
+		defer cancel()
+		lk := &fakeLocker{}
+		var (
+			mu    sync.Mutex
+			allow bool
+			asked int
+		)
+		may := func(context.Context) bool {
+			mu.Lock()
+			defer mu.Unlock()
+			asked++
+			return allow
+		}
+		go func() {
+			time.Sleep(5*time.Second + 200*time.Millisecond)
+			mu.Lock()
+			allow = true
+			mu.Unlock()
+		}()
+		rec := newRecorder(cancel, 1)
+		reg := prometheus.NewRegistry()
+		m := NewMetrics(reg)
+		require.NoError(t, Run(ctx, Config{Locker: lk, Metrics: m, MayAcquire: may}, rec.session))
+
+		ends := rec.endsCopy()
+		require.Len(t, ends, 1)
+		// The next poll after the flip, on the AcquireInterval grid.
+		require.Equal(t, 5*time.Second+DefaultAcquireInterval, ends[0].started)
+		lk.mu.Lock()
+		acquires := lk.acquires
+		lk.mu.Unlock()
+		require.Equal(t, 1, acquires, "no acquire attempt while MayAcquire refused")
+		mu.Lock()
+		defer mu.Unlock()
+		require.Equal(t, asked-1, int(testutil.ToFloat64(m.AcquireSkips)))
+	})
+}

@@ -69,6 +69,12 @@
     {"id":"m075_sparse_collection_count_stale","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader, segment verify: collection count mismatch (all 8 seeds); unit: TestSparseRewriteMatchesRewrite"},
     {"id":"m076_compaction_skips_refresh_after_publish","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: leader exits on corruption, main segment not sealed at the source generation (seeds 2, 7, 8)"},
     {"id":"m077_gc_ignores_delay","disposition":"KILLED","result":"KILLED@disagg","note":"oracle: held reader read late, object no longer available (all 8 seeds); unit: TestGC"},
-    {"id":"m078_hot_batch_db_seq_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"unit only: TestScripts_SeqMismatch/SeqKeyCorrupt (correct leaders never reach the in-database seq check)"}
+    {"id":"m078_hot_batch_db_seq_check_skipped","disposition":"KILLED","result":"KILLED@disagg","note":"unit only: TestScripts_SeqMismatch/SeqKeyCorrupt (correct leaders never reach the in-database seq check)"},
+    {"id":"m079_migrate_dirty_set_drops_range_deletes","disposition":"KILLED","result":"KILLED@migration","note":"TestMetaSync_ResyncAndFlush, TestDirtySet"},
+    {"id":"m080_migrate_resync_keeps_catalog_only_keys","disposition":"KILLED","result":"KILLED@migration","note":"TestMetaSync_ResyncAndFlush, TestMetaSync_ResyncRepairsDrift"},
+    {"id":"m081_migrate_guard_ignored_at_startup","disposition":"KILLED","result":"KILLED@migration","note":"TestMigration_CrashSeams/after-migration-done, TestMigration_LocalToDisaggregated"},
+    {"id":"m082_migrate_handoff_skips_pending_guard","disposition":"KILLED","result":"KILLED@migration","note":"TestMigration_CrashSeams/after-migration-guard-pending and after-migration-done"},
+    {"id":"m083_import_accepts_unregistered_hole","disposition":"KILLED","result":"KILLED@migration","note":"TestMigration_ImportRefusesHoles"},
+    {"id":"m084_migrate_handoff_skips_relay_cursor","disposition":"KILLED","result":"KILLED@migration","note":"the handoff's critical-key check reverts: TestMigration_LocalToDisaggregated, CrashSeams, Reclaim"}
   ]
 }

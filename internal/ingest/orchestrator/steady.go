@@ -76,6 +76,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			SegmentMetrics:        o.cfg.SegmentMetrics,
 			ReadLogRetentionBytes: o.cfg.ReadLogRetentionBytes,
 			MaxEventsPerBlock:     o.cfg.SteadyMaxEventsPerBlock,
+			MaxSegmentBytes:       o.cfg.SteadyMaxSegmentBytes,
 			OnEvent:               o.cfg.OnEvent,
 			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
 			Namespace:             catalog.Main,

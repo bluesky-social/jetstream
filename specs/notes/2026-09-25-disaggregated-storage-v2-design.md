@@ -53,7 +53,9 @@ byte-for-byte the file local mode would have written from the same events.
 
 ### 2.2 Non-goals
 
-- Migrating an existing local archive. New deployments bootstrap from scratch.
+- Migrating an existing local archive. *Superseded:* a running local archive
+  can now be migrated live (`2026-10-09-local-to-disagg-migration.md`). New
+  deployments still bootstrap from scratch.
 - Point-in-time restore that keeps the same cursor namespace. A restored
   database is a new archive (§15).
 - Multi-region or multi-writer ingest.
@@ -69,7 +71,7 @@ byte-for-byte the file local mode would have written from the same events.
 | Wake-up | `NOTIFY` doorbell plus 250ms polling; correctness never depends on `NOTIFY` |
 | Leader election | PostgreSQL lease implementing atmos `streaming.DistributedLocker`, driven by a jetstream-owned election loop |
 | Fencing | `writer_epoch` checked by the first statement of every leader write transaction |
-| Seqs | Gap-free, from `seq/next` in PostgreSQL; no write-ahead seq lease, no vacancies |
+| Seqs | Gap-free for every seq this archive allocates, from `seq/next` in PostgreSQL; no write-ahead seq lease. A migrated archive keeps the local archive's vacancies, which are static (§10.2) |
 | Objects | Immutable, unique keys, never overwritten; SHA-256 recorded and verified |
 | S3 features used | PUT, GET (with Range), DELETE. Nothing else |
 | Metadata | Existing Pebble key/value encoding in a PostgreSQL table |
@@ -240,9 +242,19 @@ loop until process shutdown:
     err = runSession(sessionCtx, epoch)   // blocks until the session ends
     cancel(); wait for every session goroutine to exit
     locker.Release(ctx with 5s timeout)   // best effort
+    if err is ErrDone: return
+    if err is ErrStandby: sleep standbyBackoff; continue
     if err is fatal: exit the process non-zero
     sleep acquireInterval
 ```
+
+A `MayAcquire` hook runs before each `Acquire`; while it refuses, the loop
+does not try for the lease. Disaggregated mode uses it, and a fenced
+`migration/state` read at the start of every session, to keep pods off a
+catalog a migration still owns: the session ends with `leader.ErrStandby`
+and the lease is released at once. `leader.ErrDone` ends the loop without
+error once a session's work is over for good, such as the migrator's after
+the handoff commits (`2026-10-09-local-to-disagg-migration.md` §6.2).
 
 "Fatal" is the default: a session error is restartable only if it wraps
 `leader.ErrRestartSession` (lease loss, a fence failure, an unknown commit
@@ -613,6 +625,9 @@ session start.
 1. In `main`, the committed seqs `[1, seq/next)` are covered exactly once, in
    order, with no gaps, by:
    sealed generations, then active blocks, then hot batches.
+   The one exception is a registered vacancy in `seq/vacancies`, which only a
+   migrated archive has: those seqs are covered by nothing, and every other
+   seq exactly once.
    In `bootstrap_live` the same holds against `live_segments/seq/next`, with no
    hot batches.
 2. Segment indexes in a namespace are contiguous from 0. Exactly one segment is
@@ -680,8 +695,11 @@ in disaggregated mode, because a seq is never visible before it commits.
   seen the dropped events. Relay replay and retries re-deliver the underlying
   data.
 
-As a result, seqs are gap-free in disaggregated mode. The cold reader's
-registered-vacancy support stays for local mode and is simply never used here.
+As a result, disaggregated mode never creates a vacancy. A migrated archive
+keeps the vacancies its local archive registered before the handoff, in
+`seq/vacancies`. They are static: only the migration's import scripts write
+the key, and only above the imported frontier. The follower and the cold
+reader skip them as local mode does.
 
 ### 10.3 Hot mode: batching
 
@@ -1836,6 +1854,11 @@ from the AWS default chain, as in `serve`.
    so the first leader need not wait for it to expire. Leave `metadata_kv`
    empty; the orchestrator starts in `bootstrap` when `phase` is absent, as
    today.
+
+With `--migrate-from-local`, step 3 instead creates only `main`'s segment 0
+and sets `migration/state = seeding` in the same transaction, so no pod
+leads the catalog until a migration hands off
+(`2026-10-09-local-to-disagg-migration.md`).
 
 The probe runs first so that a bad credential or bucket leaves the database
 empty, and init can run again once it is fixed. If init ends after inserting
