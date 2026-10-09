@@ -77,6 +77,11 @@ type Runtime struct {
 	// migrator and migrationBackend are set when a migration runs.
 	migrator         *migrate.Migrator
 	migrationBackend *StorageBackend
+	// inventory runs the migration dry run, when it is enabled.
+	inventory func(context.Context) error
+	// steadyWriterOpen reports whether a session's steady-state writer is
+	// open.
+	steadyWriterOpen func() bool
 	// drained is set once this process handed its archive off: it serves
 	// archive reads and refuses subscribers.
 	drained atomic.Bool
@@ -295,6 +300,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// gate returns 503, so the nil-pointer window is harmless.
 	slot := &writerSlot{}
 	writerPtr := &slot.ptr
+	rt.steadyWriterOpen = func() bool { return writerPtr.Load() != nil }
 
 	relayHTTPURL, err := live.DeriveRelayHTTPURL(opts.RelayURL)
 	if err != nil {
@@ -622,6 +628,15 @@ func (r *Runtime) PublicAddr() string {
 	return r.server.PublicAddr()
 }
 
+// DebugAddr returns the bound debug listener address, or "" before Run binds
+// or when the debug listener is off.
+func (r *Runtime) DebugAddr() string {
+	if r == nil || r.server == nil {
+		return ""
+	}
+	return r.server.DebugAddr()
+}
+
 // Run starts the constructed service graph and blocks until shutdown or a
 // fatal subsystem error.
 func (r *Runtime) Run(ctx context.Context) (runErr error) {
@@ -719,6 +734,9 @@ func (r *Runtime) runLocal(gctx context.Context, g *errgroup.Group) {
 
 	if r.migrator != nil {
 		g.Go(r.goroutineRoot("migrator", func() error { return r.migrator.Run(gctx) }))
+	}
+	if r.inventory != nil {
+		g.Go(r.goroutineRoot("migration-dry-run", func() error { return r.inventory(gctx) }))
 	}
 
 	// Local mode always holds the lock, so the loop runs one session at a

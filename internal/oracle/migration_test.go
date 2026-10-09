@@ -224,6 +224,39 @@ func (r *migrationRig) startLocal(migrateOn bool, crash crashpoint.Injector) {
 	r.local = r.start("local", opts)
 }
 
+// dryRun runs the local process with the migration dry run until its
+// inventory finishes, and returns the inventory.
+func (r *migrationRig) dryRun() migrate.Inventory {
+	r.t.Helper()
+	opts := r.baseOptions("local")
+	opts.DataDir = r.dir
+	opts.StorageFS = r.fs
+	opts.DebugAddr = "127.0.0.1:0"
+	opts.Migration = jetstreamd.DefaultMigrationConfig()
+	opts.Migration.DryRun = true
+	opts.Migration.ReadBytesPerSec = 0
+	p := r.start("local", opts)
+	defer r.stop(p)
+	var inv migrate.Inventory
+	require.Eventually(r.t, func() bool {
+		resp, err := httpGet(r.ctx, "http://"+p.rt.DebugAddr()+"/debug/migration")
+		if err != nil {
+			return false
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var body struct {
+			Inventory *migrate.Inventory `json:"inventory"`
+		}
+		if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&body) != nil || body.Inventory == nil {
+			return false
+		}
+		inv = *body.Inventory
+		return !inv.FinishedAt.IsZero()
+	}, 10*time.Second, 10*time.Millisecond, "the dry run's inventory")
+	require.Empty(r.t, inv.Error)
+	return inv
+}
+
 // startPod starts a disaggregated pod on the migration's backend.
 func (r *migrationRig) startPod(name string) *rigRuntime {
 	r.t.Helper()
@@ -530,6 +563,17 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	r.stop(r.local)
 	r.abandonLease(50)
 
+	// The dry run sees what the migration will copy, and that every
+	// metadata key has a rule.
+	inv := r.dryRun()
+	require.True(t, inv.ReadyToMigrate, "unclassified keys: %v", inv.Unclassified)
+	require.Zero(t, inv.UnclassifiedN)
+	require.True(t, inv.Segments.Contiguous)
+	require.NotZero(t, inv.Segments.Sealed)
+	require.Equal(t, 1, inv.VacancyCount, "%+v", inv.Vacancies)
+	require.NotZero(t, inv.SeedBytes)
+	require.NotZero(t, inv.MetaByClass["copy"].Keys)
+
 	// The migration seeds, then tails.
 	require.NoError(t, r.fake.InitMigration(ctx))
 	r.startLocal(true, nil)
@@ -537,6 +581,7 @@ func TestMigration_LocalToDisaggregated(t *testing.T) {
 	r.waitArchived()
 	first := r.waitTailing(1)
 	require.NotZero(t, first.RemoteActiveSegment, "the seed imported sealed segments")
+	require.GreaterOrEqual(t, first.RemoteActiveSegment, uint64(inv.Segments.Sealed), "the seed imported every segment the dry run saw sealed")
 
 	// The source restarts uncleanly mid-migration: another vacancy, which
 	// the migrator ships with the first block after it.

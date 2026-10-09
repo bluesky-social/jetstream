@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	localcatalog "github.com/bluesky-social/jetstream/internal/catalog/local"
@@ -26,6 +27,10 @@ import (
 type MigrationConfig struct {
 	// Enabled runs the migrator (JETSTREAM_MIGRATE_TO_DISAGGREGATED).
 	Enabled bool
+	// DryRun takes a read-only inventory of what a migration would copy
+	// (JETSTREAM_MIGRATION_DRY_RUN), served at /debug/migration. It needs
+	// no PostgreSQL or S3, and excludes Enabled.
+	DryRun bool
 	// StandbyBackoff is how long a disaggregated pod waits after finding a
 	// catalog a migration still owns before it tries for the lease again.
 	StandbyBackoff time.Duration
@@ -72,6 +77,18 @@ func DefaultMigrationConfig() MigrationConfig {
 // validate checks the migration settings against the rest of opts. Errors
 // name variables, never values.
 func (c MigrationConfig) validate(opts Options) error {
+	if c.DryRun {
+		if c.Enabled {
+			return errors.New("serve: JETSTREAM_MIGRATION_DRY_RUN and JETSTREAM_MIGRATE_TO_DISAGGREGATED exclude each other; the dry run is for before a migration")
+		}
+		if opts.Storage.Disaggregated() {
+			return errors.New("serve: JETSTREAM_MIGRATION_DRY_RUN inventories a local-mode archive; unset it with JETSTREAM_STORAGE=disaggregated")
+		}
+		if c.ReadBytesPerSec < 0 {
+			return fmt.Errorf("serve: JETSTREAM_MIGRATION_READ_BYTES_PER_SEC must be >= 0, got %d", c.ReadBytesPerSec)
+		}
+		return nil
+	}
 	if !c.Enabled {
 		return nil
 	}
@@ -264,6 +281,10 @@ func (r *Runtime) openMigrationGates(ctx context.Context) error {
 // buildMigrator builds the migrator when the migration is enabled and
 // registers /debug/migration.
 func (r *Runtime) buildMigrator(ctx context.Context, reg prometheus.Registerer, cat *localcatalog.Catalog, ready func(context.Context) error) error {
+	if r.opts.Migration.DryRun {
+		r.buildInventory(reg, cat, ready)
+		return nil
+	}
 	if !r.opts.Migration.Enabled {
 		return nil
 	}
@@ -335,6 +356,60 @@ func (r *Runtime) buildMigrator(ctx context.Context, reg prometheus.Registerer, 
 	}))
 	r.logger.Info("migration to disaggregated storage enabled", "storage", st)
 	return nil
+}
+
+// buildInventory sets up the dry run: an inventory taken once the first
+// steady-state writer has opened, served at /debug/migration as it fills
+// in. The writer's open registers the vacancy an unclean stop left, so the
+// inventory sees it; and only a steady_state archive migrates.
+func (r *Runtime) buildInventory(reg prometheus.Registerer, cat *localcatalog.Catalog, ready func(context.Context) error) {
+	metrics := migrate.NewInventoryMetrics(reg)
+	var latest atomic.Pointer[migrate.Inventory]
+	r.server.RegisterDebugRoute("GET /debug/migration", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		inv := latest.Load()
+		if inv == nil {
+			_ = json.NewEncoder(w).Encode(map[string]string{"inventory": "waiting for the steady-state writer to open"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]migrate.Inventory{"inventory": *inv})
+	}))
+	r.inventory = func(ctx context.Context) error {
+		if err := ready(ctx); err != nil {
+			return nil
+		}
+		wait := time.NewTicker(50 * time.Millisecond)
+		defer wait.Stop()
+		for !r.steadyWriterOpen() {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-wait.C:
+			}
+		}
+		inv, err := migrate.TakeInventory(ctx, migrate.InventoryConfig{
+			Meta:            r.metaStore,
+			Catalog:         cat,
+			FS:              r.opts.StorageFS,
+			ReadBytesPerSec: r.opts.Migration.ReadBytesPerSec,
+			Progress: func(inv migrate.Inventory) {
+				latest.Store(&inv)
+				metrics.Set(inv)
+			},
+		})
+		switch {
+		case err != nil && ctx.Err() == nil:
+			// The dry run only reads; its failure is the operator's to see,
+			// never a reason to stop serving.
+			r.logger.Error("migration dry run failed", "err", err)
+		case err == nil:
+			r.logger.Info("migration dry run finished", "ready_to_migrate", inv.ReadyToMigrate,
+				"unclassified_keys", inv.UnclassifiedN, "seed_bytes", inv.SeedBytes, "seed_objects", inv.SeedObjects,
+				"vacancies", inv.VacancyCount, "took", inv.FinishedAt.Sub(inv.StartedAt))
+		}
+		return nil
+	}
+	r.logger.Info("migration dry run enabled; see /debug/migration on the debug listener")
 }
 
 // drain is the migrator's Drain: from now on the process only serves

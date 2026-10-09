@@ -1,7 +1,7 @@
 # Live migration from local to disaggregated storage
 
 2026-10-09. Branch `jc/local-to-disagg-migration`. Status: implemented
-(S1–S7). §15 records where the code departs from this plan; where they
+(S0–S7). §15 records where the code departs from this plan; where they
 disagree, §15 and the code win.
 
 This plan moves a running local-mode archive (segment files and Pebble on one
@@ -1201,13 +1201,19 @@ What landed, and where it departs from the plan above.
   are not skipped, so names from the handoff's active segment on repeat
   with different content (§8).
 
-**Not built.**
+- **S0's dry run is in-process and narrower.** `JETSTREAM_MIGRATION_DRY_RUN`
+  (excluding the migrator, and needing no PostgreSQL or S3) waits for the
+  first steady-state writer to open, so the vacancy an unclean stop left is
+  registered, then reports on `/debug/migration` and
+  `jetstream_migration_inventory_*`: the phase, segment counts and
+  contiguity, each vacancy and where it sits, metadata keys and bytes by
+  prefix and by migration rule, the keys with no rule, and the seed's bytes
+  and objects (an upper bound: identical frames dedupe). It does not audit
+  writes that bypass `metastore.Store` (the code audit found the identity
+  cache's, whose keys are dropped) or measure leftover directories.
 
-- **S0's dry-run inventory.** The migrator itself refuses a metadata key
-  with no rule (`errUnclassified`), which stops the migrator and not the
-  process, and `/debug/migration` and the status table report seed
-  progress. The inventory remains useful for sizing before a migration.
-- **S8 and S9** are operational: the rehearsals and the runbook.
+**Not built.** S8 and S9 are operational: the rehearsals, and the cutover
+itself. `docs/migrating-to-disaggregated.md` is the runbook.
 
 **Tests.**
 

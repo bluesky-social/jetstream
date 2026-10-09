@@ -28,6 +28,10 @@ func migrationFlags() []cli.Flag {
 			Name: "migrate-to-disaggregated", Category: cat, Usage: "Run the migrator in this local-mode process: copy the archive to the PostgreSQL and S3 that the storage flags name, keep it in step, and hand off on a jetstream migrate handoff request",
 			Sources: cli.EnvVars("JETSTREAM_MIGRATE_TO_DISAGGREGATED"),
 		},
+		&cli.BoolFlag{
+			Name: "migration-dry-run", Category: cat, Usage: "In a local-mode process, take a read-only inventory of what a migration would copy and serve it at /debug/migration on the debug listener; needs no PostgreSQL or S3",
+			Sources: cli.EnvVars("JETSTREAM_MIGRATION_DRY_RUN"),
+		},
 		&cli.DurationFlag{
 			Name: "migration-standby-backoff", Category: cat, Usage: "Disaggregated mode: wait this long after finding a catalog a migration still owns before trying for the lease again",
 			Sources: cli.EnvVars("JETSTREAM_MIGRATION_STANDBY_BACKOFF"), Value: def.StandbyBackoff,
@@ -98,6 +102,7 @@ func migrationFlags() []cli.Flag {
 func migrationConfigFromCommand(cmd *cli.Command) jetstreamd.MigrationConfig {
 	return jetstreamd.MigrationConfig{
 		Enabled:             cmd.Bool("migrate-to-disaggregated"),
+		DryRun:              cmd.Bool("migration-dry-run"),
 		StandbyBackoff:      cmd.Duration("migration-standby-backoff"),
 		SegmentConcurrency:  cmd.Int("migration-segment-concurrency"),
 		ReadBytesPerSec:     int64(cmd.Int("migration-read-bytes-per-sec")),

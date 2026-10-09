@@ -49,7 +49,26 @@ the sealed segments the catalog holds stay identical to the local files.
   satisfied with the pods. Restarts during seeding and tailing are fine: the
   migration resumes from what the catalog holds.
 
-## 1. Create the archive
+## 1. Take an inventory
+
+Restart the local process with `JETSTREAM_MIGRATION_DRY_RUN=true`. It changes
+nothing and needs no PostgreSQL or S3. Once local ingest is running, it reads
+the archive, throttled by `JETSTREAM_MIGRATION_READ_BYTES_PER_SEC`, and
+reports at `/debug/migration` on the debug listener (and as
+`jetstream_migration_inventory_*` metrics):
+
+- `ready_to_migrate`: the archive is in `steady_state`, its segments are
+  contiguous, and every metadata key has a migration rule. A key without a
+  rule (listed under `unclassified`) would stop the migrator; it means this
+  build does not know how to carry that key over.
+- `seed_bytes` and `seed_objects`: what the seed uploads. Divide by the read
+  throttle to estimate the seed's duration.
+- `vacancies`: the seq vacancies the archive carries over. A vacancy `at the
+  tip` delays a handoff until an event is written after it.
+
+Turn the dry run off again before the next step.
+
+## 2. Create the archive
 
 With the disaggregated storage settings in the environment:
 
@@ -61,7 +80,7 @@ This creates the archive with `migration/state = seeding`, so no
 disaggregated pod will lead it until the handoff. Running it again finishes an
 init that failed part way.
 
-## 2. Start the migration
+## 3. Start the migration
 
 Restart the local process with the same storage settings plus:
 
@@ -101,7 +120,7 @@ holds a metadata key with no migration rule, or a sealed segment changed
 behind its back), it logs it, reports it in `status`, and leaves the local
 process running normally. Fix the cause and restart, or abort.
 
-## 3. Validate the replica
+## 4. Validate the replica
 
 Start disaggregated pods (`JETSTREAM_STORAGE=disaggregated`) behind a
 non-public endpoint. While the state is `tailing` they serve the replica
@@ -115,7 +134,7 @@ read-only and stand by for the lease. Before the handoff, check:
   including every segment that contains a seq vacancy.
 - **Pod readiness.** At least one pod is ready and caught up with the replica.
 
-## 4. Hand off
+## 5. Hand off
 
 1. **Flip the public routes to the pods.** Pods serve everything the local
    process does, and the local process keeps serving archive downloads
