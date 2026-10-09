@@ -56,6 +56,16 @@ type StateStore struct {
 	promotedChain   map[atmos.DID][]byte
 	promotedHosting map[atmos.DID][]byte
 
+	// committedChain holds chain states this StateStore committed, which
+	// are exactly what the metadata store holds for those DIDs: nothing
+	// else writes sync/chain/ keys, a StateStore lives for one writer
+	// session, and a failed commit ends the session. Without it every
+	// commit after a DID's first missed both maps above and read the
+	// metadata store, which on a shared backend is a round trip to the
+	// catalog before the event is witnessed (about 400 a second in pop2,
+	// and the ceiling on how fast the verifier workers could go).
+	committedChain recentCache
+
 	// promotedIdent is the per-DID applied #identity seq ratchet
 	// (#234). Unlike chain/hosting it is jetstream-owned, not verifier
 	// state — atmos does not process #identity events, so there is no
@@ -160,11 +170,58 @@ func takePending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, max
 	return buf, true
 }
 
+// committedChainCap bounds StateStore.committedChain. An entry is about 200
+// bytes, so the cache stays near 50 MB.
+const committedChainCap = 1 << 18
+
+// recentCache is a map bounded to about limit entries that keeps the recently
+// used ones: when the current generation fills, it becomes the previous one
+// and the one before is dropped, and a hit in the previous generation moves
+// into the current one.
+type recentCache struct {
+	limit     int
+	cur, prev map[atmos.DID][]byte
+}
+
+func newRecentCache(limit int) recentCache {
+	return recentCache{limit: limit, cur: make(map[atmos.DID][]byte)}
+}
+
+func (c *recentCache) get(did atmos.DID) ([]byte, bool) {
+	if v, ok := c.cur[did]; ok {
+		return v, true
+	}
+	v, ok := c.prev[did]
+	if ok {
+		delete(c.prev, did)
+		c.put(did, v)
+	}
+	return v, ok
+}
+
+func (c *recentCache) put(did atmos.DID, v []byte) {
+	if _, ok := c.cur[did]; !ok && len(c.cur) >= c.limit/2 {
+		c.prev, c.cur = c.cur, make(map[atmos.DID][]byte, len(c.cur))
+	}
+	delete(c.prev, did)
+	c.cur[did] = v
+}
+
+func (c *recentCache) delete(did atmos.DID) {
+	delete(c.cur, did)
+	delete(c.prev, did)
+}
+
 // New returns a StateStore that stores chain and hosting state in s under the
 // keyspaces "sync/chain/<did>" and "sync/host/<did>".
 func New(s metastore.Store) *StateStore {
+	return newStateStore(s, committedChainCap)
+}
+
+func newStateStore(s metastore.Store, chainCap int) *StateStore {
 	p := &StateStore{
 		s:               s,
+		committedChain:  newRecentCache(chainCap),
 		pendingChain:    make(map[atmos.DID][]pending[string]),
 		pendingHosting:  make(map[atmos.DID][]pending[int64]),
 		promotedChain:   make(map[atmos.DID][]byte),
@@ -214,6 +271,8 @@ func (p *StateStore) LoadChain(ctx context.Context, did atmos.DID) (*atmossync.C
 		buf = append([]byte(nil), pending...)
 	} else if promoted, ok := p.promotedChain[did]; ok {
 		buf = append([]byte(nil), promoted...)
+	} else if committed, ok := p.committedChain.get(did); ok {
+		buf = append([]byte(nil), committed...)
 	}
 	p.mu.Unlock()
 	if buf != nil {
@@ -561,7 +620,8 @@ func carry[V any](dst, failed, promoted map[atmos.DID]V, equal func(a, b V) bool
 }
 
 // CommitStaged clears the promoted entries the oldest staged batch
-// captured, after that batch commits successfully. Entries promoted
+// captured, after that batch commits successfully, and caches its chain
+// states for LoadChain. Entries promoted
 // (or re-saved) after the capture are left in place for the next flush
 // — clearing the whole map here would silently discard a write that
 // was never in the batch.
@@ -578,6 +638,9 @@ func (p *StateStore) CommitStaged() {
 		if cur, ok := p.promotedChain[did]; ok && bytes.Equal(cur, captured) {
 			delete(p.promotedChain, did)
 		}
+		// Even when a newer promotion superseded it: this is what the
+		// metadata store now holds, and the promotion still shadows it.
+		p.committedChain.put(did, captured)
 	}
 	for did, captured := range s.hosting {
 		if cur, ok := p.promotedHosting[did]; ok && bytes.Equal(cur, captured) {
@@ -633,6 +696,7 @@ func (p *StateStore) Delete(ctx context.Context, did atmos.DID) error {
 	delete(p.pendingChain, did)
 	delete(p.pendingHosting, did)
 	delete(p.promotedChain, did)
+	p.committedChain.delete(did)
 	delete(p.promotedHosting, did)
 	delete(p.promotedIdent, did)
 	delete(p.promotedAccount, did)

@@ -1,0 +1,29 @@
+mutant: m078_hot_batch_db_seq_check_skipped
+target: internal/catalog/scripts.go
+failure-mode: |
+  The one-round-trip inline hot batch commit (FenceBumpAt) no longer sends
+  its seq check to the database. Nothing the script reads stops it, so a
+  leader whose in-memory seq diverged from the catalog commits a batch that
+  overlaps or skips the committed range and overwrites the seq key, on the
+  path every steady-state live commit takes.
+expected-detection: |
+  Correct leaders never diverge, so, as for m067, the layer 3 oracle has no
+  path that reaches this check. TestScripts_SeqMismatch and
+  TestScripts_SeqKeyCorrupt commit an inline batch at a wrong or corrupt
+  seq once the session knows its revision, and require SourceSeq
+  corruption from the fallback.
+expected-tier: disagg
+tiers: disagg
+
+diff --git a/internal/catalog/scripts.go b/internal/catalog/scripts.go
+--- a/internal/catalog/scripts.go
++++ b/internal/catalog/scripts.go
+@@ -458,7 +458,7 @@ func (s *Session) CommitHotBatches(ctx context.Context, bs []HotBatch) ([]HotBat
+ 	)
+ 	if len(refs) == 0 {
+ 		check := MetaCheck{Key: []byte(SeqKey(Main)), Value: EncodeSeq(bs[0].FirstSeq)}
+-		rev, ok, err = s.runAt(ctx, TxHotBatch, []MetaCheck{check}, func(tx Tx, rev uint64) error {
++		rev, ok, err = s.runAt(ctx, TxHotBatch, []MetaCheck{check}[:0], func(tx Tx, rev uint64) error {
+ 			return insert(tx, rev, nil)
+ 		})
+ 		if err != nil {

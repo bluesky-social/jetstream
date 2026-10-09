@@ -596,7 +596,7 @@ func TestEngineBackfillCreateThenLiveDeleteConverges(t *testing.T) {
 }
 
 // TestEngineLiveOnly covers the no-backfill path: Subscribe with no seq bound
-// tails live directly, with the max-latency flusher delivering low-volume
+// tails live directly, with partial-batch flushes delivering low-volume
 // batches promptly.
 func TestEngineLiveOnly(t *testing.T) {
 	t.Parallel()
@@ -608,7 +608,7 @@ func TestEngineLiveOnly(t *testing.T) {
 	cfg := engineConfig{
 		Host:           "https://h",
 		Backfill:       false,
-		BatchSize:      64, // larger than the stream: only the flusher delivers
+		BatchSize:      64, // larger than the stream: only a partial-batch flush delivers
 		MaxBatchDelay:  time.Millisecond,
 		LiveBackoffMin: time.Millisecond,
 		Dial:           dial,
@@ -2093,4 +2093,84 @@ func TestEngineCutoverInvalidRequestIsFatal(t *testing.T) {
 	require.ErrorIs(t, gotErr, errLiveInvalidRequest)
 	require.Equal(t, int64(1), dials.Load(), "permanent cutover rejection must not reconnect or re-backfill")
 	require.Equal(t, int64(1), h.planCalls.Load(), "permanent cutover rejection must not re-plan")
+}
+
+// TestEngineLiveOnlyFlushesBurstOnDrain pins the tip-latency fix on the pure
+// live path: a burst smaller than BatchSize is delivered once the consumer
+// drains it, not on the MaxBatchDelay tick (an hour here, so only the drain
+// flush can deliver), and each later burst likewise.
+func TestEngineLiveOnlyFlushesBurstOnDrain(t *testing.T) {
+	t.Parallel()
+	conn := newFeedConn()
+	cfg := engineConfig{
+		Host:           "https://h",
+		BatchSize:      64,
+		MaxBatchDelay:  time.Hour,
+		LiveBackoffMin: time.Millisecond,
+		Dial:           feedDialer(conn),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	delivered := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(events)
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		newReplayEngine(cfg).Run(ctx,
+			func(batch []Event) bool {
+				mu.Lock()
+				events = append(events, batch...)
+				mu.Unlock()
+				return true
+			},
+			func(err error) bool {
+				t.Errorf("unexpected error: %v", err)
+				return true
+			},
+		)
+	}()
+
+	conn.push(feedFrames(t, 1, 3)...)
+	require.Eventually(t, func() bool { return delivered() == 3 }, 5*time.Second, time.Millisecond)
+	conn.push(feedFrames(t, 4, 5)...)
+	require.Eventually(t, func() bool { return delivered() == 5 }, 5*time.Second, time.Millisecond)
+
+	cancel()
+	<-finished
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, seqs(events))
+}
+
+// TestEngineCutoverFlushesBurstOnDrain is the cutover-tail twin of
+// TestEngineLiveOnlyFlushesBurstOnDrain: after the archive sweep, a live burst
+// smaller than BatchSize is delivered on drain.
+func TestEngineCutoverFlushesBurstOnDrain(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness(t)
+	h.as.addSegment(t, segName(0), []segment.Event{
+		makeCreate(t, 1, "did:plc:a", "app.bsky.feed.post", "r1"),
+		makeCreate(t, 2, "did:plc:a", "app.bsky.feed.post", "r2"),
+	})
+	h.planned = 2
+	h.planEntry = []planSeg{{name: segName(0), index: 0, minSeq: 1, maxSeq: 2}}
+	h.installHandlers()
+
+	conn := newFeedConn()
+	conn.push(feedFrames(t, 3, 5)...)
+	cfg := h.cfg()
+	cfg.Dial = feedDialer(conn)
+	cfg.BatchSize = 64
+	cfg.MaxBatchDelay = time.Hour
+
+	events := h.runUntilSeq(t, cfg, 5)
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, seqs(events))
 }

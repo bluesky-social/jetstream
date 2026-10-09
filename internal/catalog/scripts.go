@@ -83,6 +83,9 @@ type Session struct {
 
 	mu  sync.Mutex
 	err error
+	// rev is the highest revision the session has committed, which
+	// runAt's fence takes the one after.
+	rev uint64
 
 	// uploads groups concurrent BeginUploads calls into one transaction.
 	uploads struct {
@@ -158,7 +161,64 @@ func (s *Session) run(ctx context.Context, kind TxKind, reads []Read, body func(
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 		return 0, s.fail(err)
 	}
+	s.committed(rev)
 	return rev, nil
+}
+
+// runAt is run in one round trip, for a script that reads nothing and
+// writes only queued statements: checks stand in for its reads, and the
+// fence takes the revision after the last one this session committed.
+// Each round trip the archive row lock is held across is time every other
+// leader transaction waits, and the commit's latency is the start of every
+// live event's.
+//
+// ok=false means a precondition failed and nothing committed: another
+// transaction took the revision, the epoch is stale, or a check failed.
+// The caller then runs the script the ordinary way, which tells those
+// apart. That is the one retry a session makes, and only of a transaction
+// known not to have committed.
+func (s *Session) runAt(ctx context.Context, kind TxKind, checks []MetaCheck, body func(tx Tx, rev uint64) error) (rev uint64, ok bool, err error) {
+	if err := s.ended(); err != nil {
+		return 0, false, err
+	}
+	s.mu.Lock()
+	rev = s.rev + 1
+	s.mu.Unlock()
+	if rev == 1 {
+		return 0, false, nil // the session has not learned the revision yet
+	}
+	tx, err := s.db.Begin(ctx, kind)
+	if err != nil {
+		return 0, false, s.fail(sessionEnded(string(kind)+": begin", err))
+	}
+	err = tx.FenceBumpAt(ctx, s.epoch, rev, checks...)
+	if err != nil {
+		err = sessionEnded(string(kind)+": fence", err)
+	} else if err = body(tx, rev); err != nil {
+		err = sessionEnded(string(kind), err)
+	} else if err = tx.Notify(ctx, rev); err != nil {
+		err = sessionEnded(string(kind)+": notify", err)
+	} else if err = tx.Commit(ctx); err != nil {
+		if errors.Is(err, ErrPrecondition) {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			s.metrics.fellBack(kind)
+			return 0, false, nil
+		}
+		err = sessionEnded(string(kind)+": commit result unknown", err)
+	}
+	if err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return 0, false, s.fail(err)
+	}
+	s.committed(rev)
+	return rev, true, nil
+}
+
+// committed records that the session committed rev.
+func (s *Session) committed(rev uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rev = max(s.rev, rev)
 }
 
 func (s *Session) runBody(ctx context.Context, kind TxKind, tx Tx, reads []Read, body func(tx Tx, rev uint64) error) (uint64, error) {
@@ -365,16 +425,8 @@ func (s *Session) CommitHotBatches(ctx context.Context, bs []HotBatch) ([]HotBat
 			refs = append(refs, b.Object)
 		}
 	}
-	seq, objs := seqRead(Main), newObjectReads(refs...)
 	out := make([]HotBatchCommit, len(bs))
-	rev, err := s.run(ctx, TxHotBatch, append([]Read{seq}, objs.reads()...), func(tx Tx, rev uint64) error {
-		if err := checkSeq(seq, bs[0].FirstSeq); err != nil {
-			return err
-		}
-		ids, err := objs.resolve(ctx, tx)
-		if err != nil {
-			return err
-		}
+	insert := func(tx Tx, rev uint64, ids []uint64) error {
 		for i, b := range bs {
 			row := HotBatchRow{
 				FirstSeq:       b.FirstSeq,
@@ -395,9 +447,39 @@ func (s *Session) CommitHotBatches(ctx context.Context, bs []HotBatch) ([]HotBat
 			}
 		}
 		return tx.ApplyMeta(ctx, withSeq(Main, bs[len(bs)-1].LastSeq+1, meta))
-	})
-	if err != nil {
-		return nil, err
+	}
+	// Inline batches read nothing the script must see, so the seq check
+	// can run in the database and the commit take one round trip. Object
+	// refs need their rows resolved first.
+	var (
+		rev uint64
+		ok  bool
+		err error
+	)
+	if len(refs) == 0 {
+		check := MetaCheck{Key: []byte(SeqKey(Main)), Value: EncodeSeq(bs[0].FirstSeq)}
+		rev, ok, err = s.runAt(ctx, TxHotBatch, []MetaCheck{check}, func(tx Tx, rev uint64) error {
+			return insert(tx, rev, nil)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !ok {
+		seq, objs := seqRead(Main), newObjectReads(refs...)
+		rev, err = s.run(ctx, TxHotBatch, append([]Read{seq}, objs.reads()...), func(tx Tx, rev uint64) error {
+			if err := checkSeq(seq, bs[0].FirstSeq); err != nil {
+				return err
+			}
+			ids, err := objs.resolve(ctx, tx)
+			if err != nil {
+				return err
+			}
+			return insert(tx, rev, ids)
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	for i := range out {
 		out[i].Revision = rev

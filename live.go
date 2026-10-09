@@ -110,6 +110,12 @@ type liveConfig struct {
 	// instance. nil disables in-place recovery; the consumer then degrades to
 	// an uncompressed tail on rejection. See refreshDict.
 	refetchDict func(ctx context.Context, host string) []byte
+	// onDrain, when non-nil, is called once the consumer has handled every
+	// frame received so far and emitted at least one event since the last
+	// call: the end of a server burst. The engine flushes its partial batch
+	// here so the tip is not held for the MaxBatchDelay ticker. Returning
+	// false stops the consumer, like emit.
+	onDrain func() bool
 }
 
 func (c liveConfig) minBackoff() time.Duration {
@@ -302,6 +308,8 @@ var errEmitStop = errors.New("jetstream: live emit stop")
 
 // session runs one connection: dial, read-decode-emit until an error or stop.
 // A successful read resets the caller's backoff via the return path (nil err).
+// Reads run on a separate goroutine (startFrameReader) so the loop can tell
+// when it has drained the connection and fire cfg.onDrain.
 func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) bool) error {
 	rawURL, seqResume := c.planSession()
 	conn, err := c.cfg.dial(ctx, rawURL)
@@ -309,13 +317,36 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		return &liveDialError{err: err}
 	}
 	conn.SetReadLimit(c.cfg.readLimit)
-	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "client closing") }()
+	frames, stopReader := startFrameReader(ctx, conn)
+	defer stopReader() // closes conn and waits out the reader goroutine
 	if c.cfg.timeMode && !seqResume {
 		c.adoptNamespace()
 	}
 
+	// undrained is set once an event has been emitted since the last drain
+	// signal, so a quiet connection (or one carrying only filtered or control
+	// frames) does not take the batcher's lock on every frame.
+	undrained := false
 	for {
-		typ, data, err := conn.Read(ctx)
+		// An empty queue means everything the server has sent so far is
+		// handled: the burst is over, so release the partial batch now rather
+		// than leaving it for the MaxBatchDelay ticker. Under a backlog the
+		// queue stays non-empty and batches still fill to size. A frame the
+		// reader is just finishing can lose this race; that costs only an
+		// early flush, never an event.
+		if undrained && len(frames) == 0 {
+			undrained = false
+			if c.cfg.onDrain != nil && !c.cfg.onDrain() {
+				return errEmitStop
+			}
+		}
+		var f liveFrame
+		select {
+		case f = <-frames:
+		case <-ctx.Done():
+			return fmt.Errorf("read: %w", ctx.Err())
+		}
+		typ, data, err := f.typ, f.data, f.err
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
@@ -386,6 +417,56 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		if !emit(&evCopy, nil) {
 			return errEmitStop
 		}
+		undrained = true
+	}
+}
+
+// liveFrameQueue bounds how many raw frames the reader holds ahead of decode.
+// The drain signal only needs to know whether any frame is waiting, so a
+// small queue suffices; keeping it small also bounds the memory a hostile
+// server can pin with read-limit-sized frames.
+const liveFrameQueue = 8
+
+// liveFrame is one conn.Read result. A non-nil err is the reader's last frame.
+type liveFrame struct {
+	typ  websocket.MessageType
+	data []byte
+	err  error
+}
+
+// startFrameReader reads conn on its own goroutine so the decode loop can see
+// when it has caught up with the server (an empty queue). Results arrive in
+// read order, ending with exactly one error frame unless stop is called
+// first. stop must run before the session returns: it closes the conn, which
+// unblocks a pending Read, and waits for the goroutine to exit.
+func startFrameReader(ctx context.Context, conn wsConn) (<-chan liveFrame, func()) {
+	readCtx, cancel := context.WithCancel(ctx)
+	frames := make(chan liveFrame, liveFrameQueue)
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		for {
+			typ, data, err := conn.Read(readCtx)
+			select {
+			case frames <- liveFrame{typ: typ, data: data, err: err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return frames, func() {
+		close(done)
+		// Close before cancelling the read ctx: on a real websocket a
+		// cancelled Read tears the connection down without the normal close
+		// handshake, while Close coexists with a concurrent Read and unblocks
+		// it once the peer answers (or its own timeout fires).
+		_ = conn.Close(websocket.StatusNormalClosure, "client closing")
+		cancel()
+		<-exited
 	}
 }
 

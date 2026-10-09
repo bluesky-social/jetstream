@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ func Run(t *testing.T, newBackend func(t *testing.T) Backend) {
 	}{
 		{"FenceRevisions", testFenceRevisions},
 		{"FenceStaleEpoch", testFenceStaleEpoch},
+		{"FenceBumpAt", testFenceBumpAt},
 		{"FenceSerializes", testFenceSerializes},
 		{"AcquireFencesOldEpoch", testAcquireFencesOldEpoch},
 		{"FenceReads", testFenceReads},
@@ -57,6 +59,7 @@ func Run(t *testing.T, newBackend func(t *testing.T) Backend) {
 		{"GC", testGC},
 		{"DeleteNamespace", testDeleteNamespace},
 		{"ReaderSnapshot", testReaderSnapshot},
+		{"ReadChanges", testReadChanges},
 		{"AbortedTransaction", testAbortedTransaction},
 		{"QueuedWrites", testQueuedWrites},
 		{"Notify", testNotify},
@@ -232,6 +235,56 @@ func testFenceStaleEpoch(t *testing.T, b Backend) {
 
 	// A fence that matched nothing holds no lock.
 	write(t, b, epoch, func(context.Context, catalog.Tx, uint64) {})
+}
+
+func testFenceBumpAt(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	r0 := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("seq"), Value: []byte("7")}}))
+	})
+	check := catalog.MetaCheck{Key: []byte("seq"), Value: []byte("7")}
+
+	// try commits a FenceBumpAt transaction that writes key "k" = v and
+	// returns Commit's error.
+	try := func(epoch, rev uint64, v string, checks ...catalog.MetaCheck) error {
+		t.Helper()
+		ctx := ctxT(t)
+		tx, err := b.DB.Begin(ctx, catalog.TxHotBatch)
+		require.NoError(t, err)
+		require.NoError(t, tx.FenceBumpAt(ctx, epoch, rev, checks...))
+		require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte(v)}}))
+		require.NoError(t, tx.Notify(ctx, rev))
+		err = tx.Commit(ctx)
+		require.NoError(t, tx.Rollback(ctx))
+		return err
+	}
+	for name, err := range map[string]error{
+		"revision taken":    try(epoch, r0, "stale rev", check),
+		"revision ahead":    try(epoch, r0+2, "ahead", check),
+		"stale epoch":       try(epoch+1, r0+1, "stale epoch", check),
+		"check fails":       try(epoch, r0+1, "bad check", catalog.MetaCheck{Key: []byte("seq"), Value: []byte("8")}),
+		"checked key gone":  try(epoch, r0+1, "no key", catalog.MetaCheck{Key: []byte("absent"), Value: []byte{}}),
+		"second check":      try(epoch, r0+1, "second", check, catalog.MetaCheck{Key: []byte("seq"), Value: []byte("")}),
+		"empty value check": try(epoch, r0+1, "empty", catalog.MetaCheck{Key: []byte("seq")}),
+	} {
+		require.ErrorIs(t, err, catalog.ErrPrecondition, name)
+	}
+	// None of them applied anything or held a lock.
+	a := snapshot(t, b).Archive
+	require.Equal(t, r0, a.CatalogRevision)
+	r := read(t, b)
+	got, err := r.MetaGet(ctxT(t), [][]byte{[]byte("k")})
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	require.NoError(t, try(epoch, r0+1, "ok", check))
+	require.NoError(t, try(epoch, r0+2, "no checks"))
+	a = snapshot(t, b).Archive
+	require.Equal(t, r0+2, a.CatalogRevision)
+	got, err = read(t, b).MetaGet(ctxT(t), [][]byte{[]byte("k")})
+	require.NoError(t, err)
+	require.Equal(t, "no checks", string(got["k"]))
+	require.Equal(t, r0+3, write(t, b, epoch, func(context.Context, catalog.Tx, uint64) {}))
 }
 
 func testFenceSerializes(t *testing.T, b Backend) {
@@ -1170,6 +1223,141 @@ func testReaderSnapshot(t *testing.T, b Backend) {
 	got, err = read(t, b).MetaGet(ctxT(t), [][]byte{[]byte("k")})
 	require.NoError(t, err)
 	require.Equal(t, "2", string(got["k"]))
+}
+
+// readChanges runs q through DB.ReadChanges and checks it against
+// catalog.ReadChangesTx, the reference, over a read of the same catalog.
+func readChanges(t *testing.T, b Backend, q catalog.ChangesQuery) catalog.Changes {
+	t.Helper()
+	got, err := b.DB.ReadChanges(ctxT(t), q)
+	require.NoError(t, err)
+	want, err := catalog.ReadChangesTx(ctxT(t), read(t, b), q)
+	require.NoError(t, err)
+	require.Equal(t, normalChanges(want), normalChanges(got))
+	return got
+}
+
+// normalChanges makes empty slices nil, which the comparison should not
+// see.
+func normalChanges(c catalog.Changes) catalog.Changes {
+	if len(c.Meta) == 0 {
+		c.Meta = nil
+	}
+	c.Segments = nilEmpty(c.Segments)
+	c.Generations = nilEmpty(c.Generations)
+	c.GenerationBlocks = nilEmpty(c.GenerationBlocks)
+	c.ActiveBlocks = nilEmpty(c.ActiveBlocks)
+	c.ActiveBlockKeys = nilEmpty(c.ActiveBlockKeys)
+	c.HotBatches = nilEmpty(c.HotBatches)
+	c.Objects = nilEmpty(c.Objects)
+	return c
+}
+
+func nilEmpty[T any](s []T) []T {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
+
+func testReadChanges(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	keys := [][]byte{[]byte("phase"), []byte("absent")}
+	rMeta := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, _ uint64) {
+		require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("phase"), Value: []byte("steady")}}))
+	})
+
+	c := readChanges(t, b, catalog.ChangesQuery{Since: rMeta, MetaKeys: keys})
+	require.Equal(t, rMeta, c.Archive.CatalogRevision)
+	require.Equal(t, map[string][]byte{"phase": []byte("steady")}, c.Meta)
+	require.Empty(t, c.Segments, "nothing past the mirror")
+	readChanges(t, b, catalog.ChangesQuery{Since: rMeta + 5, MetaKeys: keys})
+
+	// An active segment with blocks, and inline and pointer hot batches.
+	blk := availableObject(t, b, epoch, []byte("blk"))
+	ptr := availableObject(t, b, epoch, []byte("ptr"))
+	footer := availableObject(t, b, epoch, []byte("footer"))
+	rActive := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.Main, Index: 0, State: catalog.Active, Revision: rev}))
+		for i := range 2 {
+			ab := activeBlock(catalog.Main, 0, i, blk, uint64(i*10+1), uint64(i*10+10))
+			ab.Revision = rev
+			require.NoError(t, tx.InsertActiveBlock(ctx, ab))
+		}
+		for _, h := range []catalog.HotBatchRow{hot(21, 23, []byte("f1"), 0), hot(24, 24, nil, ptr), hot(25, 29, []byte("f3"), 0)} {
+			h.Revision = rev
+			require.NoError(t, tx.InsertHotBatch(ctx, h))
+		}
+	})
+	c = readChanges(t, b, catalog.ChangesQuery{Since: rMeta, FramesFrom: 25, MetaKeys: keys})
+	require.Len(t, c.Segments, 1)
+	require.Len(t, c.ActiveBlocks, 2)
+	require.Len(t, c.HotBatches, 3)
+	require.Nil(t, c.HotBatches[0].Frame, "frames below FramesFrom are not loaded")
+	require.Equal(t, "f3", string(c.HotBatches[2].Frame))
+	require.Len(t, c.Objects, 2, "the block and the pointer batch's object")
+	readChanges(t, b, catalog.ChangesQuery{Since: 0, FramesFrom: 0, MetaKeys: keys})
+	readChanges(t, b, catalog.ChangesQuery{Since: rActive, FramesFrom: math.MaxUint64})
+
+	// Sealing loads the generation, its blocks, and its footer.
+	rSeal := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		gen, err := tx.InsertGeneration(ctx, catalog.GenerationRow{Namespace: catalog.Main, Header: header(), FooterObjectID: footer, Revision: rev})
+		require.NoError(t, err)
+		require.NoError(t, tx.InsertGenerationBlocks(ctx, []catalog.GenerationBlockRow{
+			{GenerationID: gen, Ordinal: 0, ObjectID: blk, CompressedLength: 100},
+			{GenerationID: gen, Ordinal: 1, ObjectID: blk, CompressedLength: 100},
+		}))
+		_, err = tx.DeleteActiveBlocks(ctx, catalog.Main, 0)
+		require.NoError(t, err)
+		ok, err := tx.SealSegment(ctx, catalog.Main, 0, gen, rev)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.Main, Index: 1, State: catalog.Active, Revision: rev}))
+		ab := activeBlock(catalog.Main, 1, 0, ptr, 30, 30)
+		ab.Revision = rev
+		require.NoError(t, tx.InsertActiveBlock(ctx, ab))
+	})
+	c = readChanges(t, b, catalog.ChangesQuery{Since: rActive, FramesFrom: 25})
+	require.Len(t, c.Segments, 2)
+	require.Len(t, c.Generations, 1)
+	require.Len(t, c.GenerationBlocks, 2)
+	require.Len(t, c.ActiveBlocks, 1)
+	require.Equal(t, []catalog.ActiveBlockKey{{Namespace: catalog.Main, Segment: 1}}, c.ActiveBlockKeys)
+	require.Len(t, c.Objects, 3, "block, pointer, and footer")
+
+	// A hot-batch-only change still lists every hot batch and active key.
+	rHot := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		h := hot(30, 31, []byte("f4"), 0)
+		h.Revision = rev
+		require.NoError(t, tx.InsertHotBatch(ctx, h))
+	})
+	c = readChanges(t, b, catalog.ChangesQuery{Since: rSeal, FramesFrom: 30})
+	require.Empty(t, c.Segments)
+	require.Len(t, c.HotBatches, 4)
+	require.Len(t, c.ActiveBlockKeys, 1)
+
+	// More changed generations than MaxChangedGenerations overflows.
+	n := catalog.MaxChangedGenerations + 1
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		objs := make([]catalog.NewObject, n)
+		for i := range objs {
+			objs[i] = newObject(t, fmt.Appendf(nil, "footer%d", i))
+		}
+		ids := insertObjects(t, ctx, tx, objs...)
+		require.NoError(t, tx.SetObjectsAvailable(ctx, ids))
+		for i, id := range ids {
+			ns, seg := catalog.BootstrapLive, uint64(i)
+			require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: ns, Index: seg, State: catalog.Active, Revision: rev}))
+			gen, err := tx.InsertGeneration(ctx, catalog.GenerationRow{Namespace: ns, Segment: seg, Header: header(), FooterObjectID: id, Revision: rev})
+			require.NoError(t, err)
+			ok, err := tx.SealSegment(ctx, ns, seg, gen, rev)
+			require.NoError(t, err)
+			require.True(t, ok)
+		}
+	})
+	c = readChanges(t, b, catalog.ChangesQuery{Since: rHot, MetaKeys: keys})
+	require.True(t, c.Overflow)
+	require.Equal(t, map[string][]byte{"phase": []byte("steady")}, c.Meta)
 }
 
 func testAbortedTransaction(t *testing.T, b Backend) {

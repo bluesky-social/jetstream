@@ -267,6 +267,45 @@ func (t *tx) FenceBump(ctx context.Context, epoch uint64, reads ...catalog.Read)
 	return rev, true, nil
 }
 
+// fenceAtSQL is fenceSQL for FenceBumpAt: it also matches nothing, and so
+// fails the same way, unless the bump takes revision $2. The statement that
+// waits for the row lock rechecks its WHERE against the row it then locks,
+// so a transaction that committed meanwhile makes it match nothing.
+const fenceAtSQL = `WITH f AS (
+	UPDATE archive SET catalog_revision = catalog_revision + 1
+	WHERE id = 1 AND writer_epoch = $1 AND catalog_revision = $2::bigint - 1
+	RETURNING catalog_revision)
+ SELECT 1 / count(*) FROM f`
+
+// metaCheckSQL fails with division_by_zero unless key $1 holds $2. It needs
+// no row lock: every writer of metadata_kv holds the fence.
+const metaCheckSQL = `SELECT 1 / count(*) FROM metadata_kv WHERE key = $1 AND value = $2`
+
+// The statement names whose division_by_zero is ErrPrecondition.
+const (
+	stmtFenceAt   = "fence_at"
+	stmtMetaCheck = "meta_check"
+)
+
+func (t *tx) FenceBumpAt(_ context.Context, epoch, rev uint64, checks ...catalog.MetaCheck) error {
+	t.enqueue(stmtFenceAt, fenceAtSQL, epoch, clampSeq(rev))
+	for _, c := range checks {
+		t.enqueue(stmtMetaCheck, metaCheckSQL, nonNil(c.Key), nonNil(c.Value))
+	}
+	t.span.SetAttributes(attribute.Int64("revision", int64(rev)), attribute.Int64("epoch", int64(epoch)))
+	return nil
+}
+
+// precondition reports whether err is a FenceBumpAt fence or check failing.
+func precondition(err error) bool {
+	q, ok := errors.AsType[*queuedError](err)
+	if !ok || (q.stmt != stmtFenceAt && q.stmt != stmtMetaCheck) {
+		return false
+	}
+	pgErr, ok := errors.AsType[*pgconn.PgError](q.err)
+	return ok && pgErr.Code == fencedCode
+}
+
 func (t *tx) Read(ctx context.Context, reads ...catalog.Read) error {
 	if len(reads) == 0 {
 		return nil
@@ -994,6 +1033,18 @@ func (t *tx) Commit(ctx context.Context) error {
 		return fmt.Errorf("%w: pgstore %s: commit: %w", catalog.ErrSessionEnded, t.kind, pgx.ErrTxClosed)
 	}
 	err := t.commit(ctx)
+	if err != nil && precondition(err) {
+		// PostgreSQL skipped the rest of the pipeline, COMMIT included,
+		// so the transaction is aborted but still open. Ending it here
+		// keeps the connection, which the pool would otherwise destroy.
+		// It is not a transaction error: the script expects it sometimes.
+		t.span.SetAttributes(attribute.Bool("precondition_failed", true))
+		if _, rerr := t.conn.Exec(context.WithoutCancel(ctx), `ROLLBACK`); rerr != nil {
+			t.span.RecordError(rerr)
+		}
+		t.finish()
+		return fmt.Errorf("pgstore %s: %w: %w", t.kind, catalog.ErrPrecondition, err)
+	}
 	if err != nil {
 		err = t.fail("commit", err)
 	}

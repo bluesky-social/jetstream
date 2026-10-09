@@ -155,6 +155,34 @@ func (t *tx) FenceBump(ctx context.Context, epoch uint64, reads ...catalog.Read)
 	return rev, true, nil
 }
 
+// FenceBumpAt runs as pgstore pipelines it: queued, so its failure aborts
+// the transaction and reaches the script from Commit.
+func (t *tx) FenceBumpAt(ctx context.Context, epoch, rev uint64, checks ...catalog.MetaCheck) error {
+	return t.queue(func() error {
+		held := t.locked
+		if err := t.stmt(ctx, "fence_at", true); err != nil {
+			return err
+		}
+		if t.s.archive.WriterEpoch != epoch || t.s.archive.CatalogRevision+1 != rev {
+			// The UPDATE matched nothing, so it locked nothing.
+			if !held {
+				t.release()
+			}
+			return fmt.Errorf("storagefake: fence at revision %d: %w", rev, catalog.ErrPrecondition)
+		}
+		t.s.archive.CatalogRevision++
+		for _, c := range checks {
+			if err := t.stmt(ctx, "meta_check", false); err != nil {
+				return err
+			}
+			if v, ok := t.s.meta.get(string(c.Key)); !ok || !bytes.Equal(v, c.Value) {
+				return fmt.Errorf("storagefake: %q is not %q: %w", c.Key, c.Value, catalog.ErrPrecondition)
+			}
+		}
+		return nil
+	})
+}
+
 // Read runs each read as its own statement, which is what PostgreSQL does
 // with a pipeline: other transactions can run between them, and only locks
 // keep them out.

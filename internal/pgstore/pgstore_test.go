@@ -586,6 +586,11 @@ func TestPipelinedRoundTrips(t *testing.T) {
 		require.NoError(t, err)
 		next += 10
 	}
+	commitInline := func() {
+		_, err := sess.CommitHotBatches(ctx, []catalog.HotBatch{{FirstSeq: next, LastSeq: next + 9, Frame: []byte("inline")}})
+		require.NoError(t, err)
+		next += 10
+	}
 	fold := func() {
 		_, err := sess.Fold(ctx, catalog.Block{
 			Namespace: catalog.Main,
@@ -609,6 +614,11 @@ func TestPipelinedRoundTrips(t *testing.T) {
 		_, err := sess.InitNamespace(ctx, catalog.Main, nil)
 		require.NoError(t, err)
 	}
+	readChanges := func() {
+		c, err := s.ReadChanges(ctx, catalog.ChangesQuery{FramesFrom: 1, MetaKeys: [][]byte{[]byte("a")}})
+		require.NoError(t, err)
+		require.NotEmpty(t, c.Segments)
+	}
 
 	// Warm up: prepare every statement the measured transactions send.
 	beginUploads()
@@ -618,10 +628,14 @@ func TestPipelinedRoundTrips(t *testing.T) {
 	commitHot()
 	beginUploads()
 	fold()
+	commitInline()
+	beginUploads()
+	fold()
 	beginUploads()
 	markAvailable()
 	commitMeta()
 	initNamespace()
+	readChanges()
 
 	for _, tc := range []struct {
 		name  string
@@ -644,6 +658,10 @@ func TestPipelinedRoundTrips(t *testing.T) {
 		// BEGIN+fence, then the meta statements+NOTIFY+COMMIT.
 		{"CommitMeta", nil, commitMeta, 2},
 		{"InitNamespace", nil, initNamespace, 2},
+		// The follower's whole incremental read, BEGIN to COMMIT.
+		{"ReadChanges", nil, readChanges, 1},
+		// Everything, the seq check included, in one: FenceBumpAt.
+		{"CommitHotBatches inline", nil, commitInline, 1},
 	} {
 		if tc.setup != nil {
 			tc.setup()
@@ -653,7 +671,7 @@ func TestPipelinedRoundTrips(t *testing.T) {
 
 	got, ok := getMeta(t, s, "block")
 	require.True(t, ok)
-	require.Equal(t, "block at 21", got, "the pipelined commits applied")
+	require.Equal(t, "block at 31", got, "the pipelined commits applied")
 }
 
 // A queued write's failure surfaces from the next round trip, named for the
@@ -672,4 +690,44 @@ func TestQueuedFailureNamesItsStatement(t *testing.T) {
 	require.NoError(t, tx.Rollback(t.Context()))
 	_, found := getMeta(t, s, "k")
 	require.False(t, found)
+}
+
+// A FenceBumpAt precondition that fails aborts the pipeline before COMMIT.
+// The transaction reports ErrPrecondition rather than ending the session,
+// and its connection goes back to the pool rather than being replaced.
+func TestPreconditionKeepsConnection(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	_, u := pgtest.Open(t, nil)
+	s, err := pgstore.Open(ctx, pgstore.Config{URL: u, MaxConns: 1})
+	require.NoError(t, err)
+	t.Cleanup(s.Close)
+	l := s.NewLease()
+	require.NoError(t, l.Acquire(ctx, time.Minute))
+	rev := setMetaRev(t, s, l.Epoch())
+	conns := s.Pool().Stat().NewConnsCount()
+
+	tx, err := s.Begin(ctx, catalog.TxHotBatch)
+	require.NoError(t, err)
+	require.NoError(t, tx.FenceBumpAt(ctx, l.Epoch(), rev+1, catalog.MetaCheck{Key: []byte("absent")}))
+	require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte("v")}}))
+	err = tx.Commit(ctx)
+	require.ErrorIs(t, err, catalog.ErrPrecondition)
+	require.NotErrorIs(t, err, catalog.ErrSessionEnded)
+	require.NoError(t, tx.Rollback(ctx))
+
+	require.Equal(t, rev+1, setMetaRev(t, s, l.Epoch()), "the revision did not move")
+	require.Equal(t, conns, s.Pool().Stat().NewConnsCount())
+}
+
+// setMetaRev commits an empty fenced transaction and returns its revision.
+func setMetaRev(t *testing.T, s *pgstore.Store, epoch uint64) uint64 {
+	t.Helper()
+	tx, err := s.Begin(t.Context(), catalog.TxMetadata)
+	require.NoError(t, err)
+	rev, ok, err := tx.FenceBump(t.Context(), epoch)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, tx.Commit(t.Context()))
+	return rev
 }

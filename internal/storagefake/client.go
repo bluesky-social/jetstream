@@ -83,6 +83,11 @@ func (c *Client) BeginRead(ctx context.Context) (catalog.ReadTx, error) {
 	return c.db.beginRead(ctx, c)
 }
 
+// ReadChanges implements catalog.DB.
+func (c *Client) ReadChanges(ctx context.Context, q catalog.ChangesQuery) (catalog.Changes, error) {
+	return c.db.readChanges(ctx, c, q)
+}
+
 // Listen implements catalog.Listener. The channel closes when ctx ends or
 // the client is killed.
 func (c *Client) Listen(ctx context.Context) (<-chan uint64, error) {

@@ -18,6 +18,11 @@ var ErrSessionEnded = fmt.Errorf("catalog: leader session ended: %w", leader.Err
 // newer writer epoch (design §6.4). It is a session-ending error.
 var ErrFenced = fmt.Errorf("catalog: fenced out by a newer writer epoch: %w", ErrSessionEnded)
 
+// ErrPrecondition means a FenceBumpAt fence or check failed, so the
+// transaction applied nothing. Unlike every other transaction failure it
+// leaves the session usable: the result is known.
+var ErrPrecondition = errors.New("catalog: a fence precondition failed")
+
 // Corruption sources for jetstream_storage_corruption_total{source}.
 const (
 	SourceSeq        = "seq"        // stored seq key disagrees with the commit

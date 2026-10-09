@@ -368,6 +368,28 @@ func (db *DB) beginRead(ctx context.Context, cl *Client) (catalog.ReadTx, error)
 	return &readTx{db: db, cl: cl, s: db.current(), seam: true}, nil
 }
 
+// ReadChanges implements catalog.DB.
+func (db *DB) ReadChanges(ctx context.Context, q catalog.ChangesQuery) (catalog.Changes, error) {
+	return db.readChanges(ctx, nil, q)
+}
+
+// readChanges runs the reference statements over one read transaction, so
+// the fake's seams and injected faults reach it as they reach BeginRead.
+func (db *DB) readChanges(ctx context.Context, cl *Client, q catalog.ChangesQuery) (catalog.Changes, error) {
+	rtx, err := db.beginRead(ctx, cl)
+	if err != nil {
+		return catalog.Changes{}, err
+	}
+	c, err := catalog.ReadChangesTx(ctx, rtx, q)
+	if cerr := rtx.Close(ctx); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return catalog.Changes{}, err
+	}
+	return c, nil
+}
+
 // Listen implements catalog.Listener. Notifications to a listener that is
 // not keeping up are dropped, which LISTEN clients must tolerate anyway.
 func (db *DB) Listen(ctx context.Context) (<-chan uint64, error) {

@@ -38,9 +38,18 @@ type changes struct {
 	objects    map[uint64]catalog.ObjectRow
 }
 
+// metaKeys are the metadata_kv keys a tick reads.
+var metaKeys = [][]byte{[]byte(lifecycle.PhaseKey), []byte(catalog.CompactionDeadlineKey)}
+
 // read runs the tick's one read transaction. It returns nil changes when
 // the catalog revision equals old's.
 func (f *Follower) read(ctx context.Context, old *mirror) (*changes, error) {
+	if old != nil {
+		c, ok, err := f.readChanges(ctx, old)
+		if err != nil || ok {
+			return c, err
+		}
+	}
 	rtx, err := f.cfg.DB.BeginRead(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("follower: begin read: %w", err)
@@ -55,40 +64,149 @@ func (f *Follower) read(ctx context.Context, old *mirror) (*changes, error) {
 	return c, nil
 }
 
-func (f *Follower) readTx(ctx context.Context, rtx catalog.ReadTx, old *mirror) (*changes, error) {
-	arch, err := rtx.Archive(ctx)
+// readChanges is an incremental tick's read as one DB.ReadChanges, which
+// costs one round trip to the catalog where readTx costs about eight: every
+// live event waits for a tick to see it, so this is most of a follower's
+// visibility latency over a WAN link. ok is false when the tick needs
+// readTx after all: on a phase change, which reloads every segment, or
+// when more changed than ReadChanges reads.
+func (f *Follower) readChanges(ctx context.Context, old *mirror) (*changes, bool, error) {
+	rc, err := f.cfg.DB.ReadChanges(ctx, catalog.ChangesQuery{
+		Since: old.rev,
+		// Every hot batch not in old was committed at or above old's
+		// tip, so that is where frames start. Older inline frames are
+		// already in old.
+		FramesFrom: old.view.TipSeq(catalog.Main),
+		MetaKeys:   metaKeys,
+	})
 	if err != nil {
-		return nil, err
+		return nil, false, fmt.Errorf("follower: read changes: %w", err)
 	}
+	if unchanged, err := f.checkArchive(rc.Archive, old); err != nil || unchanged {
+		return nil, true, err
+	}
+	c := &changes{archive: rc.Archive, genBlocks: map[uint64][]catalog.GenerationBlockRow{}}
+	if err := f.parseMeta(c, rc.Meta); err != nil {
+		return nil, false, err
+	}
+	if c.phase != old.phase || rc.Overflow {
+		return nil, false, nil
+	}
+	c.segments = rc.Segments
+	fresh := map[uint64]bool{}
+	for _, s := range c.segments {
+		if s.State == catalog.Sealed && old.gens[s.GenerationID] == nil {
+			fresh[s.GenerationID] = true
+		}
+	}
+	for _, g := range rc.Generations {
+		if fresh[g.ID] {
+			c.gens = append(c.gens, g)
+		}
+	}
+	for _, gb := range rc.GenerationBlocks {
+		if fresh[gb.GenerationID] {
+			c.genBlocks[gb.GenerationID] = append(c.genBlocks[gb.GenerationID], gb)
+		}
+	}
+	c.activeRows, c.activeKeys, c.hot = rc.ActiveBlocks, rc.ActiveBlockKeys, rc.HotBatches
+	rows := make(map[uint64]catalog.ObjectRow, len(rc.Objects))
+	for _, o := range rc.Objects {
+		rows[o.ID] = o
+	}
+	c.objects = map[uint64]catalog.ObjectRow{}
+	for _, id := range c.wantObjects(old) {
+		if o, ok := rows[id]; ok {
+			c.objects[id] = o
+		}
+	}
+	return c, true, nil
+}
+
+// checkArchive checks a tick's archive row against old. unchanged reports
+// old's revision, which leaves nothing to read.
+func (f *Follower) checkArchive(arch catalog.ArchiveRow, old *mirror) (unchanged bool, err error) {
 	if arch.ArchiveID != f.cfg.ArchiveID {
-		return nil, &fatalError{fmt.Errorf("follower: catalog archive_id %s is not the configured %s",
+		return false, &fatalError{fmt.Errorf("follower: catalog archive_id %s is not the configured %s",
 			objstore.FormatUUID(arch.ArchiveID), objstore.FormatUUID(f.cfg.ArchiveID))}
 	}
 	if old != nil {
 		switch {
 		case arch.CatalogRevision == old.rev:
-			return nil, nil
+			return true, nil
 		case arch.CatalogRevision < old.rev:
-			return nil, catalog.Corruptf(catalog.SourceInvariant, "catalog_revision went from %d back to %d", old.rev, arch.CatalogRevision)
+			return false, catalog.Corruptf(catalog.SourceInvariant, "catalog_revision went from %d back to %d", old.rev, arch.CatalogRevision)
 		}
 	}
-	c := &changes{archive: arch, genBlocks: map[uint64][]catalog.GenerationBlockRow{}}
+	return false, nil
+}
 
-	meta, err := rtx.MetaGet(ctx, [][]byte{[]byte(lifecycle.PhaseKey), []byte(catalog.CompactionDeadlineKey)})
-	if err != nil {
-		return nil, err
-	}
+// parseMeta sets c's phase and compaction deadline from metaKeys' values.
+func (f *Follower) parseMeta(c *changes, meta map[string][]byte) error {
 	if v, ok := meta[lifecycle.PhaseKey]; ok {
+		var err error
 		if c.phase, err = lifecycle.ParsePhase(v); err != nil {
-			return nil, catalog.Corruptf(catalog.SourceMeta, "%v", err)
+			return catalog.Corruptf(catalog.SourceMeta, "%v", err)
 		}
 	}
 	if v, ok := meta[catalog.CompactionDeadlineKey]; ok {
 		// A bad value only costs the Cache-Control hint, so it is not worth
 		// taking every pod down over.
+		var err error
 		if c.deadline, c.deadlineOK, err = catalog.DecodeCompactionDeadline(v); err != nil {
 			f.log.Warn("ignoring malformed compaction deadline", slog.Any("error", err))
 		}
+	}
+	return nil
+}
+
+// wantObjects returns, sorted and deduplicated, the objects c references
+// that old has no row for.
+func (c *changes) wantObjects(old *mirror) []uint64 {
+	var want []uint64
+	need := func(id uint64) {
+		if old == nil {
+			want = append(want, id)
+		} else if _, ok := old.objects.get(id); !ok {
+			want = append(want, id)
+		}
+	}
+	for _, g := range c.gens {
+		need(g.FooterObjectID)
+	}
+	for _, gbs := range c.genBlocks {
+		for _, gb := range gbs {
+			need(gb.ObjectID)
+		}
+	}
+	for _, b := range c.activeRows {
+		need(b.ObjectID)
+	}
+	for _, h := range c.hot {
+		if !h.Inline {
+			need(h.ObjectID)
+		}
+	}
+	slices.Sort(want)
+	return slices.Compact(want)
+}
+
+func (f *Follower) readTx(ctx context.Context, rtx catalog.ReadTx, old *mirror) (*changes, error) {
+	arch, err := rtx.Archive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if unchanged, err := f.checkArchive(arch, old); err != nil || unchanged {
+		return nil, err
+	}
+	c := &changes{archive: arch, genBlocks: map[uint64][]catalog.GenerationBlockRow{}}
+
+	meta, err := rtx.MetaGet(ctx, metaKeys)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.parseMeta(c, meta); err != nil {
+		return nil, err
 	}
 
 	// A phase change reloads every segment row: DeleteNamespace, which
@@ -126,8 +244,6 @@ func (f *Follower) readTx(ctx context.Context, rtx catalog.ReadTx, old *mirror) 
 	if c.activeKeys, err = rtx.ActiveBlockKeys(ctx); err != nil {
 		return nil, err
 	}
-	// Every hot batch not in old was committed at or above old's tip, so
-	// that is where frames start. Older inline frames are already in old.
 	var framesFrom uint64
 	if old != nil {
 		framesFrom = old.view.TipSeq(catalog.Main)
@@ -136,34 +252,9 @@ func (f *Follower) readTx(ctx context.Context, rtx catalog.ReadTx, old *mirror) 
 		return nil, err
 	}
 
-	var want []uint64
-	need := func(id uint64) {
-		if old == nil {
-			want = append(want, id)
-		} else if _, ok := old.objects.get(id); !ok {
-			want = append(want, id)
-		}
-	}
-	for _, g := range c.gens {
-		need(g.FooterObjectID)
-	}
-	for _, gbs := range c.genBlocks {
-		for _, gb := range gbs {
-			need(gb.ObjectID)
-		}
-	}
-	for _, b := range c.activeRows {
-		need(b.ObjectID)
-	}
-	for _, h := range c.hot {
-		if !h.Inline {
-			need(h.ObjectID)
-		}
-	}
 	c.objects = map[uint64]catalog.ObjectRow{}
-	if len(want) > 0 {
-		slices.Sort(want)
-		objs, err := rtx.Objects(ctx, slices.Compact(want))
+	if want := c.wantObjects(old); len(want) > 0 {
+		objs, err := rtx.Objects(ctx, want)
 		if err != nil {
 			return nil, err
 		}

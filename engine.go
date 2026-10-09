@@ -44,6 +44,7 @@ func newEngine(host string, cfg config) engine {
 		BackfillOnly:   cfg.snapshotOnly,
 		LiveCursor:     cfg.liveCursor,
 		BatchSize:      cfg.batchSize,
+		MaxBatchDelay:  cfg.maxBatchDelay,
 		Concurrency:    cfg.downloadConc,
 		SegmentStripes: cfg.segmentStripes,
 		XRPC:           negotiationXRPC,

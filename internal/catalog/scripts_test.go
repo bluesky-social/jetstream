@@ -581,6 +581,8 @@ func TestScripts_FenceLost(t *testing.T) {
 	})
 }
 
+// The seq check fails the one-round-trip commit, and the ordinary one it
+// falls back to reports the corruption.
 func TestScripts_SeqMismatch(t *testing.T) {
 	t.Parallel()
 	eachBackend(t, func(t *testing.T, be backend) {
@@ -588,9 +590,14 @@ func TestScripts_SeqMismatch(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				t.Parallel()
 				h := newHarness(t, be)
+				db := &fenceDB{DB: h.db}
+				h.s = catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: h.lock.Epoch()})
 				h.hot(1, 1)
+				db.counts()
 				_, err := h.s.CommitHotBatch(t.Context(), catalog.HotBatch{FirstSeq: first, LastSeq: first, Frame: []byte("f")})
 				requireCorruption(t, err, catalog.SourceSeq)
+				bump, bumpAt := db.counts()
+				require.Equal(t, [2]int{1, 1}, [2]int{bump, bumpAt})
 				v, _ := h.meta(catalog.MainSeqKey)
 				require.Equal(t, catalog.EncodeSeq(2), v)
 			})
@@ -1002,6 +1009,106 @@ func TestScripts_CommitHotBatchesGroup(t *testing.T) {
 		}
 		require.Less(t, snap.HotBatches[0].Revision, out[0].Revision)
 		h.hot(9, 9)
+		require.NoError(t, h.s.Err())
+	})
+}
+
+// fenceDB counts the fences its transactions run, by kind of fence.
+type fenceDB struct {
+	catalog.DB
+	mu           sync.Mutex
+	bump, bumpAt int
+}
+
+func (d *fenceDB) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, error) {
+	tx, err := d.DB.Begin(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+	return &fenceTx{Tx: tx, db: d}, nil
+}
+
+// counts returns and resets the fence counts.
+func (d *fenceDB) counts() (bump, bumpAt int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	bump, bumpAt = d.bump, d.bumpAt
+	d.bump, d.bumpAt = 0, 0
+	return bump, bumpAt
+}
+
+type fenceTx struct {
+	catalog.Tx
+	db *fenceDB
+}
+
+func (tx *fenceTx) FenceBump(ctx context.Context, epoch uint64, reads ...catalog.Read) (uint64, bool, error) {
+	tx.db.mu.Lock()
+	tx.db.bump++
+	tx.db.mu.Unlock()
+	return tx.Tx.FenceBump(ctx, epoch, reads...)
+}
+
+func (tx *fenceTx) FenceBumpAt(ctx context.Context, epoch, rev uint64, checks ...catalog.MetaCheck) error {
+	tx.db.mu.Lock()
+	tx.db.bumpAt++
+	tx.db.mu.Unlock()
+	return tx.Tx.FenceBumpAt(ctx, epoch, rev, checks...)
+}
+
+// An inline hot batch commit takes FenceBumpAt's one round trip once the
+// session knows its revision, and falls back to FenceBump when another
+// transaction took that revision. Either way it commits the same thing.
+func TestScripts_CommitHotBatchesFenceAt(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		h := newHarness(t, be)
+		ctx := t.Context()
+		db := &fenceDB{DB: h.db}
+		m := catalog.NewMetrics(prometheus.NewRegistry())
+		session := func() *catalog.Session {
+			return catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: h.lock.Epoch(), Metrics: m})
+		}
+		h.s = session()
+		fallbacks := func() float64 { return testutil.ToFloat64(m.Fallbacks.WithLabelValues(string(catalog.TxHotBatch))) }
+		requireFences := func(bump, bumpAt int, msg string) {
+			t.Helper()
+			gotBump, gotAt := db.counts()
+			require.Equal(t, [2]int{bump, bumpAt}, [2]int{gotBump, gotAt}, msg)
+		}
+
+		c1 := h.hot(1, 2)
+		requireFences(1, 0, "a new session has not learned the revision")
+		c2 := h.hot(3, 3)
+		requireFences(0, 1, "then it has")
+		require.Equal(t, c1.Revision+1, c2.Revision)
+
+		// Another session with the epoch takes the next revision.
+		other := session()
+		_, err := other.CommitMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("k"), Value: []byte("v")}})
+		require.NoError(t, err)
+		db.counts()
+		c3 := h.hot(4, 6)
+		requireFences(1, 1, "the revision moved, so it falls back")
+		require.Equal(t, 1.0, fallbacks())
+		require.Equal(t, c2.Revision+2, c3.Revision)
+		h.hot(7, 7)
+		requireFences(0, 1, "and has learned the revision again")
+
+		_, err = h.s.CommitHotBatch(ctx, catalog.HotBatch{FirstSeq: 8, LastSeq: 8, Object: h.object([]byte("pointer"))})
+		require.NoError(t, err)
+		_, at := db.counts()
+		require.Zero(t, at, "a pointer batch resolves its object rows first")
+
+		snap, err := h.snapshot()
+		require.NoError(t, err)
+		require.Len(t, snap.HotBatches, 5)
+		for i, want := range []uint64{c1.Revision, c2.Revision, c3.Revision} {
+			require.Equal(t, want, snap.HotBatches[i].Revision)
+		}
+		v, _ := h.meta(catalog.MainSeqKey)
+		require.Equal(t, catalog.EncodeSeq(9), v)
+		require.Equal(t, 1.0, fallbacks())
 		require.NoError(t, h.s.Err())
 	})
 }
