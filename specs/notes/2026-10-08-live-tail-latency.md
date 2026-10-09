@@ -51,4 +51,42 @@ This was the first load test of the steady-state disaggregated deployment (v0.3.
 - catalogtest `ReadChanges` and `FenceBumpAt` run on both backends. `TestScripts_CommitHotBatchesFenceAt` covers the fast path, the fallback, and pointer batches.
 - Mutation catalog: m067 was refreshed for the restructured script and m078 added for the in-database check. Both are unit-only.
 - `just`, `just test-storage`, `just oracle-disagg`, `just test-long ./internal/oracle`, and `just oracle-sweep`.
-- Not measured on pop2 yet. The round-trip arithmetic predicts a p50 around 70–80 ms; `_jstest/relaylat` gives the before/after number.
+
+## Result on pop2
+
+Measured 2026-10-09 against v0.3.9 with the same harness. The run lasted 5 minutes and matched about 123k commits at about 430 events a second. The arithmetic predicted a p50 of 70–80 ms.
+
+| Relay to subscriber, ms | p10 | p50 | p90 | p99 |
+|---|---|---|---|---|
+| v0.3.8, raw websocket | 183 | 241 | — | 330 |
+| v0.3.9, raw websocket | 44 | 49 | 73 | 117 |
+| v0.3.9, Go client | 49 | 52 | 76 | 121 |
+| v0.3.9 server, pre-change Go client | 57 | 58 | 97 | 136 |
+
+Server metrics, per minute across the rollout:
+
+- **Follower visibility latency:**
+  - p50 went from 200 to 49 ms.
+  - p99 went from 491 to 127 ms.
+- **Follower ticks:**
+  - All of them now take `read_changes`, with a p50 of 19.5 ms.
+  - About 25 a second per pod, up from about 8, because each tick is shorter.
+  - `readTx` dropped to zero.
+- **`hot_batch`:** p50 went from 38 to 19 ms.
+- **Leader `meta_read`:** went from about 420 to about 96 a second, still falling as the chain cache warmed.
+- **Leader CPU:** went from 0.27 to 0.17 cores.
+
+The remaining ~49 ms is made of:
+
+- about 2 ms of ingest before witnessing (it was ~36 ms),
+- one round trip for the commit,
+- one round trip for the tick,
+- the wait for a tick already in progress.
+
+That is near the floor for two serial round trips to a catalog 17 ms away.
+
+**Fallbacks:** `jetstream_catalog_commit_fallbacks_total{kind="hot_batch"}` stays steady at 6–10 a minute on the leader, under 1% of hot batches.
+
+- The leader's other transactions (fold, objects, metadata, seal) still take the ordinary path at about 0.6 a second. When one commits while a hot batch is in flight, it takes the revision `runAt` predicted.
+- A hot batch is in flight about 40% of the time, which accounts for the rate.
+- Serializing those transactions inside the session would remove the fallbacks. At this rate it is not worth doing.
