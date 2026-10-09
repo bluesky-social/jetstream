@@ -12,6 +12,7 @@ const (
 	reasonLeaseLost = "lease_lost"
 	reasonShutdown  = "shutdown"
 	reasonRestart   = "restart"
+	reasonStandby   = "standby"
 )
 
 // Metrics owns the prometheus series for the election loop. A nil *Metrics
@@ -27,6 +28,8 @@ type Metrics struct {
 	RenewErrors    prometheus.Counter
 	ReleaseErrors  prometheus.Counter
 	FenceFailures  prometheus.Counter
+	// AcquireSkips counts acquire attempts MayAcquire refused.
+	AcquireSkips prometheus.Counter
 }
 
 // NewMetrics registers the series against reg. Construct exactly once per
@@ -52,7 +55,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		SessionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "sessions_total",
-			Help: "Writer sessions ended, by result (fatal, lease_lost, shutdown, restart).",
+			Help: "Writer sessions ended, by result (fatal, lease_lost, shutdown, restart, standby).",
 		}, []string{"result"}),
 		LeaseLostTotal: counter("lease_lost_total", "Sessions cancelled because the lease was lost."),
 		AcquireErrors:  counter("acquire_errors_total", "Acquire attempts that failed for a reason other than the lock being held."),
@@ -60,12 +63,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		RenewErrors:    counter("renew_errors_total", "Renew attempts that failed for a reason other than losing the lock."),
 		ReleaseErrors:  counter("release_errors_total", "Best-effort releases that failed."),
 		FenceFailures:  counter("fence_failures_total", "Leader write transactions rejected by the epoch fence."),
+		AcquireSkips:   counter("acquire_skips_total", "Acquire attempts skipped because the process may not lead yet (a migration in progress)."),
 	}
-	for _, r := range []string{reasonFatal, reasonLeaseLost, reasonShutdown, reasonRestart} {
+	for _, r := range []string{reasonFatal, reasonLeaseLost, reasonShutdown, reasonRestart, reasonStandby} {
 		m.SessionsTotal.WithLabelValues(r)
 	}
 	reg.MustRegister(m.IsLeader, m.Epoch, m.SessionStarts, m.SessionsTotal,
-		m.LeaseLostTotal, m.AcquireErrors, m.SlowAcquires, m.RenewErrors, m.ReleaseErrors, m.FenceFailures)
+		m.LeaseLostTotal, m.AcquireErrors, m.SlowAcquires, m.RenewErrors, m.ReleaseErrors, m.FenceFailures,
+		m.AcquireSkips)
 	return m
 }
 
@@ -98,6 +103,12 @@ func (m *Metrics) leaseLost() {
 func (m *Metrics) acquireError() {
 	if m != nil {
 		m.AcquireErrors.Inc()
+	}
+}
+
+func (m *Metrics) acquireSkipped() {
+	if m != nil {
+		m.AcquireSkips.Inc()
 	}
 }
 

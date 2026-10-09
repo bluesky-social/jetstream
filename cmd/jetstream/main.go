@@ -426,9 +426,12 @@ func storageCommand() *cli.Command {
 		Usage: "Administer disaggregated storage (PostgreSQL catalog plus S3 objects)",
 		Commands: []*cli.Command{
 			{
-				Name:   "init",
-				Usage:  "Create a new archive in the PostgreSQL database and S3 bucket that the storage flags name (design §15.1). Refuses a database that already holds an archive.",
-				Flags:  storageInitFlags(),
+				Name:  "init",
+				Usage: "Create a new archive in the PostgreSQL database and S3 bucket that the storage flags name (design §15.1). Refuses a database that already holds an archive.",
+				Flags: append(storageInitFlags(), &cli.BoolFlag{
+					Name:  "migrate-from-local",
+					Usage: "Create the archive for a running local-mode archive to migrate into: no bootstrap, and no disaggregated pod may lead until the migration hands off. Run again, it finishes an init that failed part way.",
+				}),
 				Action: runStorageInit,
 			},
 		},
@@ -459,7 +462,11 @@ func runStorageInit(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	archive, err := jetstreamd.InitStorage(runCtx, cfg)
+	initFn := jetstreamd.InitStorage
+	if cmd.Bool("migrate-from-local") {
+		initFn = jetstreamd.InitMigrationStorage
+	}
+	archive, err := initFn(runCtx, cfg)
 	if err != nil {
 		return err
 	}

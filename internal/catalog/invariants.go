@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -31,7 +32,7 @@ type Snapshot struct {
 const RelayCursorKey = "relay/cursor"
 
 // SnapshotMetaKeys are the metadata keys LoadSnapshot reads.
-var SnapshotMetaKeys = []string{MainSeqKey, BootstrapLiveSeqKey, RelayCursorKey}
+var SnapshotMetaKeys = []string{MainSeqKey, BootstrapLiveSeqKey, RelayCursorKey, VacanciesKey, MigrationStateKey}
 
 // LoadSnapshot reads the whole catalog through rtx. It loads frames of no
 // hot batch.
@@ -193,6 +194,16 @@ func checkNamespace(s *Snapshot, ns Namespace, opts InvariantOptions) error {
 	if err != nil {
 		return err
 	}
+	// Only Main can hold vacancies, imported from a local archive. They may
+	// sit between two sealed segments or two active blocks; hot batches and
+	// the seq key always continue exactly where the blocks end.
+	var gaps *seqspace.Gaps
+	if ns == Main {
+		v, ok := s.Meta[VacanciesKey]
+		if gaps, err = DecodeVacancies(v, ok); err != nil {
+			return err
+		}
+	}
 
 	// Invariant 2: indexes contiguous from 0, exactly one active segment,
 	// and it is the last.
@@ -244,7 +255,7 @@ func checkNamespace(s *Snapshot, ns Namespace, opts InvariantOptions) error {
 			// (§12.2), so it still tiles.
 			continue
 		}
-		if hdr.MinSeq != expect {
+		if hdr.MinSeq != expect && !Bridges(gaps, expect, hdr.MinSeq) {
 			return Corruptf(SourceInvariant, "invariant 1: %s segment %d starts at seq %d, want %d", ns, seg.Index, hdr.MinSeq, expect)
 		}
 		expect = hdr.MaxSeq + 1
@@ -266,7 +277,7 @@ func checkNamespace(s *Snapshot, ns Namespace, opts InvariantOptions) error {
 		if expect == 0 {
 			expect = b.MinSeq
 		}
-		if b.MinSeq != expect || b.MaxSeq < b.MinSeq || b.MaxSeq-b.MinSeq+1 != uint64(b.EventCount) {
+		if (b.MinSeq != expect && !Bridges(gaps, expect, b.MinSeq)) || b.MaxSeq < b.MinSeq || b.MaxSeq-b.MinSeq+1 != uint64(b.EventCount) {
 			return Corruptf(SourceInvariant, "invariant 1: %s segment %d block %d covers [%d,%d] with %d events, want start %d",
 				ns, b.Segment, b.Ordinal, b.MinSeq, b.MaxSeq, b.EventCount, expect)
 		}

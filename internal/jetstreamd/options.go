@@ -54,6 +54,9 @@ type Options struct {
 	// Storage selects local or disaggregated storage. The zero value is
 	// local mode.
 	Storage StorageConfig
+	// Migration configures the live migration from local to disaggregated
+	// storage. The zero value disables the migrator.
+	Migration MigrationConfig
 	// StorageFS is the filesystem for Jetstream-owned durable storage under
 	// DataDir (segments + Pebble). Nil uses the host OS filesystem.
 	StorageFS          vfs.FS

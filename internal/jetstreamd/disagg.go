@@ -403,6 +403,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		Fetcher:         f,
 		Ready:           f.Ready,
 		Floor:           f.LogFloor,
+		Gaps:            f.SeqGaps,
 		Keyer:           f,
 		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
 		Metrics:         subscribeMetrics,
@@ -588,7 +589,26 @@ func (r *Runtime) runLeaderSession(ctx context.Context, epoch uint64) error {
 		Metrics:       d.catalogMetrics,
 		LeaderMetrics: r.leaderMetrics,
 	})
+	// A catalog a migration is still building belongs to the migrator,
+	// which may only be restarting. Nothing else in the session may run
+	// first: without a phase, the orchestrator would start a bootstrap on
+	// top of the import (migration plan §6.2).
+	state, err := sess.ReadMigrationState(ctx)
+	if err != nil {
+		return sessionError(err, sess)
+	}
+	if state.BlocksLeader() {
+		return fmt.Errorf("%w: migration/state is %q", leader.ErrStandby, state)
+	}
 	return sessionError(r.leaderSession(ctx, epoch, sess), sess)
+}
+
+// mayLead is the disaggregated leader loop's MayAcquire: a pod does not
+// even try for the lease while its mirror says a migration owns the
+// catalog, or before it has a mirror.
+func (r *Runtime) mayLead(context.Context) bool {
+	state, ok := r.disagg.follower.MigrationState()
+	return ok && !state.BlocksLeader()
 }
 
 func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog.Session) error {
@@ -821,6 +841,8 @@ func (r *Runtime) runDisaggregated(gctx context.Context, g *errgroup.Group) {
 			Lease:           st.Leader.Lease,
 			RenewInterval:   st.Leader.RenewInterval,
 			AcquireInterval: st.Leader.AcquireInterval,
+			StandbyBackoff:  r.opts.Migration.StandbyBackoff,
+			MayAcquire:      r.mayLead,
 			Logger:          r.processLogger.With(slog.String("component", "leader")),
 			Metrics:         r.leaderMetrics,
 		}, r.runLeaderSession)

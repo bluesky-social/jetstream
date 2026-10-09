@@ -16,6 +16,7 @@ const (
 	DefaultRenewInterval   = 1 * time.Second
 	DefaultAcquireInterval = 500 * time.Millisecond
 	DefaultReleaseTimeout  = 5 * time.Second
+	DefaultStandbyBackoff  = 10 * time.Second
 )
 
 // Locker is the writer lock. It is the atmos DistributedLocker contract plus
@@ -53,8 +54,16 @@ func isLocal(l Locker) bool {
 // rule.
 var ErrRestartSession = errors.New("leader: restart session")
 
+// ErrStandby is what a session returns when it finds, after taking the
+// lease, that this process must not write yet: the catalog is still being
+// migrated from a local archive (specs/notes/2026-10-09-local-to-disagg-
+// migration.md §6.2). Run releases the lease at once and waits
+// StandbyBackoff before trying again, so the writer that owns the catalog
+// gets it back.
+var ErrStandby = errors.New("leader: standing by")
+
 // DefaultFatal is the default Config.Fatal. An error is fatal unless it
-// wraps ErrRestartSession, and always fatal when it wraps an error whose
+// wraps ErrRestartSession or ErrStandby, and always fatal when it wraps an error whose
 // SessionFatal method reports true. The second rule keeps storage
 // corruption fatal even if some layer also wrapped it with a restart
 // marker.
@@ -63,7 +72,7 @@ func DefaultFatal(err error) bool {
 	if errors.As(err, &f) && f.SessionFatal() {
 		return true
 	}
-	return !errors.Is(err, ErrRestartSession)
+	return !errors.Is(err, ErrRestartSession) && !errors.Is(err, ErrStandby)
 }
 
 // SessionFunc runs one writer session. It blocks until the session ends and
@@ -80,6 +89,13 @@ type Config struct {
 	RenewInterval   time.Duration
 	AcquireInterval time.Duration
 	ReleaseTimeout  time.Duration
+	// StandbyBackoff is the wait after a session returns ErrStandby.
+	StandbyBackoff time.Duration
+
+	// MayAcquire, when set, is asked before every acquire attempt. While it
+	// reports false the loop does not try to take the lease, only waits
+	// AcquireInterval and asks again. It must not block for long.
+	MayAcquire func(ctx context.Context) bool
 
 	// Fatal reports whether a session error must end the process instead of
 	// starting a new session. Nil means DefaultFatal.
@@ -101,6 +117,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ReleaseTimeout <= 0 {
 		c.ReleaseTimeout = DefaultReleaseTimeout
+	}
+	if c.StandbyBackoff <= 0 {
+		c.StandbyBackoff = DefaultStandbyBackoff
 	}
 	if c.Fatal == nil {
 		c.Fatal = DefaultFatal
@@ -128,10 +147,15 @@ func Run(ctx context.Context, cfg Config, session SessionFunc) error {
 		if !ok {
 			return nil
 		}
-		if err := runOnce(ctx, cfg, session, acquiredAt); err != nil {
+		standby, err := runOnce(ctx, cfg, session, acquiredAt)
+		if err != nil {
 			return err
 		}
-		if !sleep(ctx, cfg.AcquireInterval) {
+		wait := cfg.AcquireInterval
+		if standby {
+			wait = cfg.StandbyBackoff
+		}
+		if !sleep(ctx, wait) {
 			return nil
 		}
 	}
@@ -144,6 +168,13 @@ func acquire(ctx context.Context, cfg Config) (time.Time, bool) {
 	for {
 		if ctx.Err() != nil {
 			return time.Time{}, false
+		}
+		if cfg.MayAcquire != nil && !cfg.MayAcquire(ctx) {
+			cfg.Metrics.acquireSkipped()
+			if !sleep(ctx, cfg.AcquireInterval) {
+				return time.Time{}, false
+			}
+			continue
 		}
 		start := time.Now()
 		err := cfg.Locker.Acquire(ctx, cfg.Lease)
@@ -209,8 +240,9 @@ func confirm(ctx context.Context, cfg Config) (time.Time, bool) {
 }
 
 // runOnce runs one session under a held lock and releases the lock
-// afterwards. It returns the session error only when it is fatal.
-func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt time.Time) error {
+// afterwards. It returns the session error only when it is fatal, and
+// standby when the session ended with ErrStandby.
+func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt time.Time) (standby bool, _ error) {
 	epoch := cfg.Locker.Epoch()
 	cfg.Metrics.sessionStarted(epoch)
 	cfg.Logger.Info("leader: session starting", "epoch", epoch)
@@ -260,7 +292,11 @@ func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt ti
 		// lease was going away is still corruption.
 		cfg.Metrics.sessionEnded(reasonFatal)
 		cfg.Logger.Error("leader: session ended with a fatal error", "epoch", epoch, "err", err)
-		return fmt.Errorf("leader: session epoch %d: %w", epoch, err)
+		return false, fmt.Errorf("leader: session epoch %d: %w", epoch, err)
+	case errors.Is(err, ErrStandby):
+		cfg.Metrics.sessionEnded(reasonStandby)
+		cfg.Logger.Info("leader: standing by; lease released", "epoch", epoch, "err", err, "retry_in", cfg.StandbyBackoff)
+		return true, nil
 	case leaseLost:
 		cfg.Metrics.sessionEnded(reasonLeaseLost)
 		cfg.Logger.Warn("leader: lease lost; session ended", "epoch", epoch, "err", err)
@@ -271,7 +307,7 @@ func runOnce(ctx context.Context, cfg Config, session SessionFunc, acquiredAt ti
 		cfg.Metrics.sessionEnded(reasonRestart)
 		cfg.Logger.Warn("leader: session ended; starting a new one", "epoch", epoch, "err", err)
 	}
-	return nil
+	return false, nil
 }
 
 // renew extends the lease every RenewInterval. It closes lost and cancels

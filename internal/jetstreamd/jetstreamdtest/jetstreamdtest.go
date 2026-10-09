@@ -84,3 +84,33 @@ func (b *Backend) SeedPhase(ctx context.Context, p lifecycle.Phase) error {
 	}
 	return nil
 }
+
+// InitMigration runs `jetstream storage init --migrate-from-local` on the
+// fake: main segment 0 and migration/state seeding, with no phase.
+func (b *Backend) InitMigration(ctx context.Context) error {
+	if _, err := b.Backend.InitMigration(ctx, time.Minute); err != nil {
+		return fmt.Errorf("jetstreamdtest: %w", err)
+	}
+	return nil
+}
+
+// SetMigration moves migration/state from one state to another, with meta,
+// as the migrator does.
+func (b *Backend) SetMigration(ctx context.Context, from, to catalog.MigrationState, meta ...metastore.Op) error {
+	return b.withSession(ctx, func(sess *catalog.Session) error {
+		_, err := sess.SetMigrationState(ctx, from, to, meta)
+		return err
+	})
+}
+
+func (b *Backend) withSession(ctx context.Context, fn func(*catalog.Session) error) error {
+	lease := b.DB.NewLease()
+	if err := lease.Acquire(ctx, time.Minute); err != nil {
+		return fmt.Errorf("jetstreamdtest: acquire: %w", err)
+	}
+	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
+	if err := fn(catalog.NewSession(catalog.SessionConfig{DB: b.DB, Epoch: lease.Epoch()})); err != nil {
+		return fmt.Errorf("jetstreamdtest: %w", err)
+	}
+	return nil
+}
