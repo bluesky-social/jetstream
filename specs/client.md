@@ -86,6 +86,13 @@ The planner prunes by seq overlap conservatively: a segment/block whose range
 *straddles* `afterSeq` is included whole, so the client must still run its
 row selector below the floor (see Phase 4).
 
+**Retries** (`archivePlan`, `retryablePlanError`): a page request that times
+out, loses its connection, or gets a 5xx is retried up to the xrpc client's
+`MaxAttempts` (default 3) with backoff from `planRetryDelay`. The xrpc client
+does not retry POSTs on those itself, and a plan page is read-only, so the
+retry is safe. 4xx responses fail immediately. Before this, a single slow
+page from a loaded server failed the whole backfill.
+
 ## Phase 2: download + decode (the sweep)
 
 `replayEngine.sweepSealedArchive` (`client_core.go`) pages the plan and hands
@@ -106,6 +113,16 @@ work units to the downloader (`downloader.go`):
   `TypedBatch[T]` values directly from the decoded public `Event` slice and
   deliver them in seq order, bypassing the serial per-event batcher (the #142
   throughput path). Typed CBOR decoding therefore stays parallel too.
+
+**Memory ownership** (`ownRows`, `recordDecodeMode.aliasesBlock`): segment
+rows alias the decompressed block, so any string or payload a public `Event`
+keeps would pin the whole block for as long as the caller holds it (a
+consumer that keeps every DID string can hold gigabytes of blocks). Except in
+zero-copy `WithRawRecords` mode, the downloader copies each surviving row's
+identifier strings into one arena per block and clones its payload before
+decode; a retained event pins its own payload and at most its block's
+identifier arena. Zero-copy `WithRawRecords` keeps the aliasing and documents
+that retaining any field keeps the block alive.
 
 **Error contract**: per-block download/decode failures stream as in-order
 recoverable errors — the good prefix of an entry's blocks is emitted, then
@@ -157,6 +174,15 @@ queue look empty for a moment; the only cost is an early, smaller flush. The
 reader stops with the session: `stopReader` closes the conn (normal close
 handshake), then cancels the read ctx, then waits for the goroutine to exit.
 A read error reaches the decode loop after every frame read before it.
+
+**Parallel decode** (`liveDecodeWorkers`, `frameDecoder`): the reader queues
+each frame in read order, then hands it to one of `min(GOMAXPROCS, 8)`
+decoders that zstd-decompress and JSON-decode it. The emit loop takes frames
+from the ordered queue and waits for each one's decode, so emission order and
+seq dedup are unchanged. A single decoder capped catch-up replays of large
+records near 1k events/s while the server sent 7k/s. The `liveFrameQueue`
+bound covers frames waiting, decoding, and decoded, so the memory a hostile
+server can pin is unchanged.
 
 **Wire and framing** (`subscribeURL`, `dialWebsocket`, `livedecode.go`):
 the dial offers `xrpc.v1.json` via `Sec-WebSocket-Protocol` and verifies
