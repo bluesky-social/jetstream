@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
@@ -16,11 +17,13 @@ import (
 // uses decodeSegmentEventInto with a per-block Commit slab to avoid one heap
 // allocation per commit.
 //
-// segment.Event payloads alias a shared decompressed block buffer, so any
-// bytes retained in the returned Event (notably RecordCBOR) are copied.
+// segment.Event strings and payloads alias a shared decompressed block buffer,
+// so the returned Event is decoded from an owned copy of the row.
 func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 	var commit Commit
-	return decodeSegmentEventInto(ev, &commit, recordDecodeMode{})
+	rows := []segment.Event{*ev}
+	ownRows(rows)
+	return decodeSegmentEventInto(&rows[0], &commit, recordDecodeMode{})
 }
 
 // decodeSegmentEventInto is decodeSegmentEvent but writes a commit row's data
@@ -32,6 +35,9 @@ func decodeSegmentEvent(ev *segment.Event) (Event, error) {
 // individually (they are comparatively rare). The caller MUST ensure commit's
 // backing slab is not grown/reallocated while the returned Event is reachable.
 // mode is forwarded to decodeCommitInto (raw vs. map record materialization).
+// The returned Event references ev's strings and payload directly, so unless
+// mode aliases the block on purpose (WithRawRecords), ev must already have been
+// copied out of the decompressed block by ownRows.
 func decodeSegmentEventInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) (Event, error) {
 	out := Event{
 		DID:           ev.DID,
@@ -73,12 +79,54 @@ func decodeSegmentEventInto(ev *segment.Event, commit *Commit, mode recordDecode
 	return out, nil
 }
 
+// ownRows rewrites rows in place so they share no memory with the
+// decompressed block they were decoded from. A consumer that retains one
+// event's DID or Rev must not keep a multi-megabyte block alive: under a sparse
+// filter that pinned a whole block per retained event (8 GB of heap for a
+// 40-DID backfill). The rows' identifier strings share one allocation, which
+// costs one allocation per block and pins only these rows' identifiers; each
+// payload is cloned separately, so retaining one record pins only that record.
+func ownRows(rows []segment.Event) {
+	n := 0
+	for i := range rows {
+		ev := &rows[i]
+		n += len(ev.DID) + len(ev.Collection) + len(ev.Rkey) + len(ev.Rev)
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for i := range rows {
+		ev := &rows[i]
+		b.WriteString(ev.DID)
+		b.WriteString(ev.Collection)
+		b.WriteString(ev.Rkey)
+		b.WriteString(ev.Rev)
+	}
+	all := b.String()
+	take := func(n int) string {
+		s := all[:n]
+		all = all[n:]
+		return s
+	}
+	for i := range rows {
+		ev := &rows[i]
+		ev.DID = take(len(ev.DID))
+		ev.Collection = take(len(ev.Collection))
+		ev.Rkey = take(len(ev.Rkey))
+		ev.Rev = take(len(ev.Rev))
+		if ev.Payload != nil {
+			ev.Payload = bytes.Clone(ev.Payload)
+		}
+	}
+}
+
 // decodeCommit decodes a commit row into a freshly-allocated *Commit. The hot
 // path uses decodeCommitInto with a slab slot; this allocating form is kept for
 // tests and single-event callers.
 func decodeCommit(ev *segment.Event) (*Commit, error) {
 	commit := &Commit{}
-	if err := decodeCommitInto(ev, commit, recordDecodeMode{}); err != nil {
+	rows := []segment.Event{*ev}
+	ownRows(rows)
+	if err := decodeCommitInto(&rows[0], commit, recordDecodeMode{}); err != nil {
 		return nil, err
 	}
 	return commit, nil
@@ -89,14 +137,13 @@ func decodeCommit(ev *segment.Event) (*Commit, error) {
 // read) on a decode failure, so the partial write is harmless.
 //
 // mode selects record materialization. In the default (map) mode it builds the
-// generic Record map[string]any, computes the CID, and clones RecordCBOR so the
-// caller may retain it. In raw mode it SKIPS the map build entirely (the
-// dominant decode allocation): Record stays nil, RecordCBOR aliases ev.Payload
-// zero-copy, and the CID is computed only if mode.wantCIDs. The raw aliasing is
-// safe because ev.Payload aliases the decompressed block buffer, which outlives
-// the batch (the segment events already alias it for DID/Collection/Rkey/Rev);
-// the contract — valid for the batch lifetime, copy to retain — is the same one
-// the default Record (built via UnmarshalNoCopy) already carries.
+// generic Record map[string]any and computes the CID. In raw mode it SKIPS the
+// map build entirely (the dominant decode allocation): Record stays nil and the
+// CID is computed only if mode.wantCIDs. Either way RecordCBOR and every decoded
+// string reference ev's memory directly, so ev must already be owned
+// (ownRows) unless mode aliases the block on purpose (WithRawRecords). That
+// alias is safe because the decompressed block outlives the batch; its contract
+// is valid for the batch lifetime, copy to retain.
 func decodeCommitInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) error {
 	*commit = Commit{
 		Operation:  commitOperation(ev.Kind),
@@ -108,14 +155,10 @@ func decodeCommitInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) 
 		return nil
 	}
 
+	commit.RecordCBOR = ev.Payload
 	if mode.raw {
 		if mode.wantCIDs {
 			commit.CID = cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload).String()
-		}
-		if mode.copyCBOR {
-			commit.RecordCBOR = bytes.Clone(ev.Payload) // safe to retain (WithRawRecordsCopied)
-		} else {
-			commit.RecordCBOR = ev.Payload // zero-copy alias; see doc + WithRawRecords contract
 		}
 		return nil
 	}
@@ -127,7 +170,6 @@ func decodeCommitInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) 
 	}
 	commit.Record = record
 	commit.CID = cbor.ComputeCID(cbor.CodecDagCBOR, ev.Payload).String()
-	commit.RecordCBOR = bytes.Clone(ev.Payload)
 	return nil
 }
 
@@ -136,10 +178,10 @@ func decodeCommitInto(ev *segment.Event, commit *Commit, mode recordDecodeMode) 
 // become {"$bytes": base64-raw}, and links become {"$link": cid-string}.
 //
 // UnmarshalNoCopy avoids reader indirection and string copies, and rejects
-// trailing bytes. The returned strings and bytes alias the read-only
-// decompressed block. References in the Event and Record map keep that buffer
-// alive; callers must not mutate it. decodeCommit separately clones
-// RecordCBOR.
+// trailing bytes. The returned strings and bytes alias payload, so references
+// in the Record map keep payload alive; callers must not mutate it. Archive
+// callers pass an owned copy of the row's payload (ownRows), never the
+// decompressed block itself.
 func decodeRecordMap(payload []byte) (map[string]any, error) {
 	val, err := cbor.UnmarshalNoCopy(payload)
 	if err != nil {

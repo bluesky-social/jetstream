@@ -107,9 +107,14 @@ func TestDecodeLiveRecordRejectsInvalidAtprotoJSON(t *testing.T) {
 		`{"n":-9223372036854775809}`,
 		`{"n":1,"n":2}`,
 		`{} {}`,
+		`[1,2]`,
+		`"text"`,
+		`{"$link":"bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}`,
 	} {
-		_, _, err := decodeLiveRecord([]byte(input))
-		require.Error(t, err, input)
+		for _, wantMap := range []bool{true, false} {
+			_, _, err := decodeLiveRecord([]byte(input), wantMap)
+			require.Error(t, err, "%s wantMap=%v", input, wantMap)
+		}
 	}
 }
 

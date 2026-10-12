@@ -284,14 +284,12 @@ func liveCommitToEvent(c *jetstream.JetstreamSubscribeEvents_Commit, mode record
 		// here for the unified Event API and TypedEvents. This is deliberately not
 		// a backfill optimization: archive workers still consume segment CBOR
 		// directly without a JSON round trip.
-		recordCBOR, record, err := decodeLiveRecord(c.Record)
+		recordCBOR, record, err := decodeLiveRecord(c.Record, !mode.raw)
 		if err != nil {
 			return Event{}, nil, fmt.Errorf("jetstream: decode live record (collection=%s rkey=%s): %w", c.Collection, c.Rkey, err)
 		}
 		commit.RecordCBOR = recordCBOR
-		if !mode.raw {
-			commit.Record = record
-		}
+		commit.Record = record
 	case OpDelete:
 		// No record payload on deletes.
 	default:
@@ -304,10 +302,18 @@ func liveCommitToEvent(c *jetstream.JetstreamSubscribeEvents_Commit, mode record
 // representations. DRISL makes the DAG-CBOR encoding deterministic, so callers
 // can verify the declared CID from these bytes without a duplicate byte string
 // on the wire.
-func decodeLiveRecord(data []byte) ([]byte, map[string]any, error) {
+//
+// wantMap is false in raw mode, which discards the generic map, so the map
+// is not built; the top-level-object check it implies still runs.
+func decodeLiveRecord(data []byte, wantMap bool) ([]byte, map[string]any, error) {
 	val, err := cbor.FromJSON(data)
 	if err != nil {
 		return nil, nil, fmt.Errorf("atproto JSON: %w", err)
+	}
+	// $bytes and $link objects convert to non-map values, so this is the same
+	// fail-closed rule decodeRecordMap applies to archive records.
+	if _, ok := val.(map[string]any); !ok {
+		return nil, nil, fmt.Errorf("cbor decode: record is not an object")
 	}
 
 	var buf bytes.Buffer
@@ -315,6 +321,9 @@ func decodeLiveRecord(data []byte) ([]byte, map[string]any, error) {
 		return nil, nil, fmt.Errorf("canonical DAG-CBOR: %w", err)
 	}
 	recordCBOR := buf.Bytes()
+	if !wantMap {
+		return recordCBOR, nil, nil
+	}
 	record, err := decodeRecordMap(recordCBOR)
 	if err != nil {
 		return nil, nil, err

@@ -39,7 +39,8 @@ type Config struct {
 
 	// ColdEventsPerSec caps the events per second this process serves from
 	// cold reads, summed over all subscribers, so that replays cannot starve
-	// the live tail of CPU. 0 means unlimited.
+	// the live tail of CPU. Events a subscriber's filter skips count at
+	// 1/coldSkipsPerToken. 0 means unlimited.
 	ColdEventsPerSec float64
 }
 

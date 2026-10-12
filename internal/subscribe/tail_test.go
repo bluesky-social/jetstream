@@ -271,7 +271,7 @@ func TestTail_ColdBudget(t *testing.T) {
 		}
 		return out, cursor + uint64(len(out)), nil
 	}
-	replay := func(t *testing.T, eventsPerSec float64) (time.Duration, *Metrics) {
+	replay := func(t *testing.T, eventsPerSec float64, wants func(*segment.Event) bool) (time.Duration, *Metrics) {
 		var elapsed time.Duration
 		m := NewMetrics(prometheus.NewRegistry())
 		synctest.Test(t, func(t *testing.T) {
@@ -283,7 +283,7 @@ func TestTail_ColdBudget(t *testing.T) {
 			start := time.Now()
 			cursor := uint64(1)
 			for range reads {
-				got, next, err := tl.ReadFrom(t.Context(), cursor, batch)
+				got, next, err := tl.ReadFromFiltered(t.Context(), cursor, batch, wants)
 				require.NoError(t, err)
 				require.Len(t, got, batch)
 				cursor = next
@@ -293,16 +293,26 @@ func TestTail_ColdBudget(t *testing.T) {
 		return elapsed, m
 	}
 
-	elapsed, m := replay(t, 0)
+	elapsed, m := replay(t, 0, nil)
 	require.Zero(t, elapsed, "0 is unlimited")
 	require.Zero(t, testutil.ToFloat64(m.ColdThrottle))
 
 	// A one-second burst (1000 events) is free, then the other 2000 events
 	// cost 2s. The last batch is charged after it is read, so the final
 	// wait is included.
-	elapsed, m = replay(t, 1000)
+	elapsed, m = replay(t, 1000, nil)
 	require.Equal(t, 2*time.Second, elapsed)
 	require.InDelta(t, 2.0, testutil.ToFloat64(m.ColdThrottle), 0.01)
+
+	// A subscriber whose filter keeps one event in ten is charged for those
+	// in full and for the other 90 per batch at one token per eight, rounded
+	// up: 22 per batch, 660 in all. Past a 200-event burst that is 2.3s,
+	// where the unfiltered stream would wait 14s.
+	tenth := func(e *segment.Event) bool { return e.Seq%10 == 0 }
+	elapsed, _ = replay(t, 200, tenth)
+	require.InDelta(t, 2.3, elapsed.Seconds(), 0.01)
+	elapsed, _ = replay(t, 200, nil)
+	require.InDelta(t, 14.0, elapsed.Seconds(), 0.01)
 
 	_, err := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ColdEventsPerSec: -1}, cold, nil)
 	require.ErrorIs(t, err, ErrInvalidConfig)

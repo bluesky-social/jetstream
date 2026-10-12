@@ -636,6 +636,19 @@ func runSubscriberLoop(
 	// row. Log the first on each connection; the counter has the rest.
 	encodeErrLogged := false
 
+	// wants mirrors the skips in the delivery loop below so that a cold
+	// batch is charged for what this subscriber is sent. Encode-time skips
+	// are rare and still charged in full.
+	wants := func(evt *segment.Event) bool {
+		if !timestampReached && evt.WitnessedAt < timeFloorUS {
+			return false
+		}
+		if evt.Kind.IsResyncReplacement() && !deps.V2 {
+			return false
+		}
+		return loadFilter().Wants(evt)
+	}
+
 	writeFailed := func(err error) {
 		if reason := writeFailureReason(ctx, err); reason == "" {
 			deps.Metrics.incCleanDisconnects()
@@ -667,7 +680,7 @@ func runSubscriberLoop(
 		// Bound the read so the loop wakes periodically to send keepalive
 		// pings even when the stream is idle (ReadFrom blocks at the tip).
 		readCtx, rcancel := context.WithTimeout(ctx, pingInterval)
-		batch, next, err := deps.Tail.ReadFrom(readCtx, cursor, batchMax)
+		batch, next, err := deps.Tail.ReadFromFiltered(readCtx, cursor, batchMax, wants)
 		rcancel()
 		if err != nil {
 			if ctx.Err() != nil {

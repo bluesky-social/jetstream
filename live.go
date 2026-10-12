@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/seqspace"
@@ -317,8 +319,8 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 		return &liveDialError{err: err}
 	}
 	conn.SetReadLimit(c.cfg.readLimit)
-	frames, stopReader := startFrameReader(ctx, conn)
-	defer stopReader() // closes conn and waits out the reader goroutine
+	frames, stopReader := startFrameReader(ctx, conn, c.frameDecoder())
+	defer stopReader() // closes conn and waits out the reader and decoders
 	if c.cfg.timeMode && !seqResume {
 		c.adoptNamespace()
 	}
@@ -340,33 +342,31 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 				return errEmitStop
 			}
 		}
-		var f liveFrame
+		var f *liveFrame
 		select {
 		case f = <-frames:
 		case <-ctx.Done():
 			return fmt.Errorf("read: %w", ctx.Err())
 		}
-		typ, data, err := f.typ, f.data, f.err
-		if err != nil {
-			return fmt.Errorf("read: %w", err)
+		if f.err != nil {
+			return fmt.Errorf("read: %w", f.err)
 		}
-		switch {
-		case c.zstdDecoder != nil && typ == websocket.MessageBinary:
-			// dict-zstd connection: every event frame is a BINARY zstd
-			// frame; decompress before decode. DecodeAll enforces the
-			// decoder's memory limit, bounding a hostile frame.
-			data, err = c.zstdDecoder.DecodeAll(data, nil)
-			if err != nil {
-				// Upstream input, never crash: surface and keep the tail.
-				if !emit(nil, fmt.Errorf("jetstream: zstd frame decode: %w", err)) {
-					return errEmitStop
-				}
-				continue
-			}
-		case typ != websocket.MessageText:
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return fmt.Errorf("read: %w", ctx.Err())
+		}
+		if f.skip {
 			continue // jetstream frames are text JSON; ignore stray binary
 		}
-		ev, info, derr := decodeLiveFrame(data, c.cfg.mode)
+		if f.zstdErr != nil {
+			// Upstream input, never crash: surface and keep the tail.
+			if !emit(nil, fmt.Errorf("jetstream: zstd frame decode: %w", f.zstdErr)) {
+				return errEmitStop
+			}
+			continue
+		}
+		ev, info, derr := f.ev, f.info, f.derr
 		if errors.Is(derr, errSkipFrame) {
 			if info != nil {
 				// An #info advisory (OutdatedCursor on a clamped timestamp
@@ -421,43 +421,108 @@ func (c *liveConsumer) session(ctx context.Context, emit func(*Event, error) boo
 	}
 }
 
-// liveFrameQueue bounds how many raw frames the reader holds ahead of decode.
-// The drain signal only needs to know whether any frame is waiting, so a
-// small queue suffices; keeping it small also bounds the memory a hostile
-// server can pin with read-limit-sized frames.
+// liveFrameQueue bounds how many frames a session holds between conn.Read and
+// the emit loop, whether waiting for a decoder, decoding, or decoded. The drain
+// signal only needs to know whether any frame is waiting, so a small queue
+// suffices; keeping it small also bounds the memory a hostile server can pin
+// with read-limit-sized frames.
 const liveFrameQueue = 8
 
-// liveFrame is one conn.Read result. A non-nil err is the reader's last frame.
-type liveFrame struct {
-	typ  websocket.MessageType
-	data []byte
-	err  error
+// liveDecodeWorkers is how many frames a session decodes at once. One
+// goroutine decoding JSON (and rebuilding DAG-CBOR) caps a catch-up replay far
+// below what the server sends: about 1k events/s for 10 KB records against
+// 7k/s on the wire. Decoding in parallel and emitting in read order keeps the
+// stream's order while using the cores.
+func liveDecodeWorkers() int {
+	return max(1, min(runtime.GOMAXPROCS(0), liveFrameQueue))
 }
 
-// startFrameReader reads conn on its own goroutine so the decode loop can see
-// when it has caught up with the server (an empty queue). Results arrive in
-// read order, ending with exactly one error frame unless stop is called
-// first. stop must run before the session returns: it closes the conn, which
-// unblocks a pending Read, and waits for the goroutine to exit.
-func startFrameReader(ctx context.Context, conn wsConn) (<-chan liveFrame, func()) {
+// liveFrame is one conn.Read result. A non-nil err is the reader's last frame
+// and is never decoded. Otherwise a decoder fills the result fields and then
+// closes done.
+type liveFrame struct {
+	err error
+
+	typ  websocket.MessageType
+	data []byte
+
+	done    chan struct{}
+	skip    bool  // not a jetstream frame (stray binary); ignore it
+	zstdErr error // the zstd frame failed to decompress
+	ev      Event
+	info    *liveInfo
+	derr    error // decodeLiveFrame's error
+}
+
+// frameDecoder returns the session's decode step: decompress a dict-zstd frame
+// if needed, then decode its JSON. It runs on several goroutines at once, so it
+// touches only the frame and immutable consumer state.
+func (c *liveConsumer) frameDecoder() func(*liveFrame) {
+	dec, mode := c.zstdDecoder, c.cfg.mode
+	return func(f *liveFrame) {
+		data := f.data
+		f.data = nil
+		switch {
+		case dec != nil && f.typ == websocket.MessageBinary:
+			// dict-zstd connection: every event frame is a BINARY zstd
+			// frame; decompress before decode. DecodeAll enforces the
+			// decoder's memory limit, bounding a hostile frame.
+			var err error
+			if data, err = dec.DecodeAll(data, nil); err != nil {
+				f.zstdErr = err
+				return
+			}
+		case f.typ != websocket.MessageText:
+			f.skip = true
+			return
+		}
+		f.ev, f.info, f.derr = decodeLiveFrame(data, mode)
+	}
+}
+
+// startFrameReader reads conn on its own goroutine and decodes frames on
+// liveDecodeWorkers more, so the emit loop can see when it has caught up with
+// the server (an empty queue) without decoding serially. Frames arrive in read
+// order; each is usable once its done channel closes. The stream ends with
+// exactly one error frame unless stop is called first. stop must run before
+// the session returns: it closes the conn, which unblocks a pending Read, and
+// waits for the reader and decoders to exit.
+func startFrameReader(ctx context.Context, conn wsConn, decode func(*liveFrame)) (<-chan *liveFrame, func()) {
 	readCtx, cancel := context.WithCancel(ctx)
-	frames := make(chan liveFrame, liveFrameQueue)
+	frames := make(chan *liveFrame, liveFrameQueue)
+	work := make(chan *liveFrame, liveFrameQueue)
 	done := make(chan struct{})
-	exited := make(chan struct{})
-	go func() {
-		defer close(exited)
+	var wg sync.WaitGroup
+	for range liveDecodeWorkers() {
+		wg.Go(func() {
+			for f := range work {
+				decode(f)
+				close(f.done)
+			}
+		})
+	}
+	wg.Go(func() {
+		defer close(work)
 		for {
 			typ, data, err := conn.Read(readCtx)
+			f := &liveFrame{typ: typ, data: data, err: err, done: make(chan struct{})}
+			// Queue before decoding: the queue's bound is what limits frames in
+			// flight, and its order is the emit order.
 			select {
-			case frames <- liveFrame{typ: typ, data: data, err: err}:
+			case frames <- f:
 			case <-done:
 				return
 			}
 			if err != nil {
 				return
 			}
+			select {
+			case work <- f:
+			case <-done:
+				return
+			}
 		}
-	}()
+	})
 	return frames, func() {
 		close(done)
 		// Close before cancelling the read ctx: on a real websocket a
@@ -466,7 +531,7 @@ func startFrameReader(ctx context.Context, conn wsConn) (<-chan liveFrame, func(
 		// it once the peer answers (or its own timeout fires).
 		_ = conn.Close(websocket.StatusNormalClosure, "client closing")
 		cancel()
-		<-exited
+		wg.Wait()
 	}
 }
 
@@ -479,7 +544,7 @@ func startFrameReader(ctx context.Context, conn wsConn) (<-chan liveFrame, func(
 func newZstdDecoder(dict []byte, readLimit int64) (*zstd.Decoder, error) {
 	return zstd.NewReader(nil,
 		zstd.WithDecoderDicts(dict),
-		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderConcurrency(liveDecodeWorkers()),
 		zstd.WithDecoderMaxMemory(uint64(readLimit)))
 }
 

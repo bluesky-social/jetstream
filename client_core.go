@@ -121,6 +121,11 @@ type recordDecodeMode struct {
 	wantCIDs bool // in raw mode, still compute Commit.CID
 }
 
+// aliasesBlock reports whether decoded archive events may reference the
+// decompressed block buffer directly. Only WithRawRecords trades ownership for
+// zero-copy decoding; every other mode gives each event its own memory.
+func (m recordDecodeMode) aliasesBlock() bool { return m.raw && !m.copyCBOR }
+
 func (c engineConfig) recordMode() recordDecodeMode {
 	return recordDecodeMode{raw: c.RawRecords, copyCBOR: c.RawRecordsCopied, wantCIDs: c.RawRecordCIDs}
 }

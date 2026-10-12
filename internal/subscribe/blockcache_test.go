@@ -53,7 +53,8 @@ func TestBlockCache_GetOrDecode_RunsDecodeOnce(t *testing.T) {
 
 func TestBlockCache_EvictsByByteBudget(t *testing.T) {
 	t.Parallel()
-	c := newBlockCache(200)
+	const budget = 1000
+	c := newBlockCache(budget)
 	mk := func(seg uint64) func() ([]segment.Event, error) {
 		return func() ([]segment.Event, error) { return decodedFixture(seg*10, seg*10+1, seg*10+2), nil }
 	}
@@ -61,7 +62,7 @@ func TestBlockCache_EvictsByByteBudget(t *testing.T) {
 		_, err := c.getOrDecode(testKey(seg), mk(seg))
 		require.NoError(t, err)
 	}
-	require.LessOrEqual(t, c.bytes(), 200, "cache must respect byte budget")
+	require.LessOrEqual(t, c.bytes(), budget, "cache must respect byte budget")
 
 	// The earliest key was evicted: a re-get re-decodes.
 	var redecoded atomic.Bool
@@ -159,3 +160,59 @@ var assertErr = errorString("decode failed")
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// TestBlockCache_KeepsBlockInUse pins that a block a subscriber is reading is
+// not evicted by its own insert or memo growth, even when it alone outgrows
+// the budget. Evicting it made every cold batch of a large-record block
+// re-fetch and re-decode the whole block. The next insert still evicts it.
+func TestBlockCache_KeepsBlockInUse(t *testing.T) {
+	t.Parallel()
+	c := newBlockCache(600)
+	var decodes atomic.Int64
+	get := func(seg uint64) []*Entry {
+		evs, err := c.getOrDecode(testKey(seg), func() ([]segment.Event, error) {
+			decodes.Add(1)
+			return decodedFixture(seg*10, seg*10+1, seg*10+2), nil
+		})
+		require.NoError(t, err)
+		return evs
+	}
+
+	get(1)
+	get(2) // two ~414-byte blocks: 1 is evicted, 2 stays though over budget
+	require.EqualValues(t, 2, decodes.Load())
+	get(2)
+	require.EqualValues(t, 2, decodes.Load(), "the block just inserted stays cached")
+
+	// Memoized encodes push block 2 far past the budget; it must survive.
+	c.grow(testKey(2), 5000)
+	get(2)
+	require.EqualValues(t, 2, decodes.Load(), "memo growth must not evict the block being encoded")
+
+	// A different block's insert reclaims the overshoot.
+	get(3)
+	require.EqualValues(t, 3, decodes.Load())
+	get(2)
+	require.EqualValues(t, 4, decodes.Load(), "the next insert evicts the oversized block")
+}
+
+// TestBlockCache_GrowEvictsOthersFirst pins that memo growth on one block
+// evicts the least recently used other blocks rather than itself.
+func TestBlockCache_GrowEvictsOthersFirst(t *testing.T) {
+	t.Parallel()
+	c := newBlockCache(1500)
+	for seg := range uint64(3) {
+		_, err := c.getOrDecode(testKey(seg), func() ([]segment.Event, error) { return decodedFixture(seg), nil })
+		require.NoError(t, err)
+	}
+	// Block 0 is least recently used; growing it makes it most recent, so
+	// block 1 is the one evicted.
+	c.grow(testKey(0), 1200) // 3x138 + 1200 > 1500
+	require.LessOrEqual(t, c.bytes(), 1500)
+	c.mu.Lock()
+	_, has0 := c.items[testKey(0)]
+	_, has1 := c.items[testKey(1)]
+	c.mu.Unlock()
+	require.True(t, has0)
+	require.False(t, has1)
+}

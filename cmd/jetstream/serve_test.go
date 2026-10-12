@@ -92,7 +92,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Equal(t, xrpcapi.DefaultPlanMaxEntries, opts.PlanMaxEntries)
 	require.Equal(t, xrpcapi.DefaultPlanWholeSegmentThreshold, opts.PlanWholeSegmentThreshold)
 	require.Equal(t, 256<<20, opts.SubscribeReadLogRetentionBytes)
-	require.Equal(t, 64<<20, opts.SubscribeBlockCacheBytes)
+	require.Equal(t, 1<<30, opts.SubscribeBlockCacheBytes)
 	require.Equal(t, 1024, opts.SubscribeReadBatch)
 	require.Equal(t, 60*time.Second, opts.SubscribeSlowWindow)
 	require.Equal(t, float64(5), opts.SubscribeSlowMinRate)

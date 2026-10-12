@@ -349,19 +349,23 @@ func WithLogger(l *slog.Logger) Option {
 // and non-commit events are unchanged, as are Operation, Collection, Rkey,
 // and Rev. CID stays empty unless WithRawRecordCIDs is set.
 //
-// Archive RecordCBOR aliases the decompressed buffer and is valid only for
-// the delivering Batch's lifetime. Decoded strings or slices that alias it
-// share this limit. Copy retained values or use WithRawRecordsCopied.
+// Archive events reference the decompressed block directly: RecordCBOR and the
+// DID, Collection, Rkey, and Rev strings (and marker fields) are views into a
+// block buffer shared by thousands of events. They stay valid after the Batch,
+// but retaining any one of them keeps the whole block in memory. Copy what you
+// retain, or use WithRawRecordsCopied.
 func WithRawRecords() Option {
 	return func(c *config) { c.rawRecords = true }
 }
 
-// WithRawRecordsCopied is like WithRawRecords but Commit.RecordCBOR is a private
-// copy of the record bytes (not an alias of the internal buffer), so it — and
-// anything decoded from it — is safe to retain past the delivering Batch. It
-// still skips the generic map build; the only cost over WithRawRecords is one
-// allocation + copy of the raw bytes per commit. Use this when the consumer
-// keeps records around; use WithRawRecords for maximum throughput when records
+// WithRawRecordsCopied is like WithRawRecords but archive events do not
+// reference the decompressed block: Commit.RecordCBOR (and anything decoded
+// from it) is a private copy of the record, and the event's strings live in a
+// small per-block arena holding only identifiers. Retaining them costs that
+// record plus at most the arena, as in the default (map) mode. It still skips
+// the generic map build; the cost over WithRawRecords is one allocation and
+// copy of the record per event. Use this when the consumer keeps records or
+// identifiers around; use WithRawRecords for maximum throughput when events
 // are processed within the iteration.
 func WithRawRecordsCopied() Option {
 	return func(c *config) {

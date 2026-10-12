@@ -7,7 +7,9 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -233,6 +235,82 @@ func TestPlanXRPCErrorIsWrapped(t *testing.T) {
 	_, err := ps.planner().archivePlan(context.Background(), planRequest{AfterSeq: 0})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "planSnapshot")
+}
+
+// scriptedPlanServer answers planSnapshot attempt i with steps[i] (the last
+// step repeats) and counts attempts. A step with hang set never answers, so
+// the client's response-header timeout fires.
+type planStep struct {
+	status int
+	body   string
+	hang   bool
+}
+
+func newScriptedPlanner(t *testing.T, attempts int, steps ...planStep) (*planner, *atomic.Int64) {
+	t.Helper()
+	var calls atomic.Int64
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step := steps[min(int(calls.Add(1))-1, len(steps)-1)]
+		if step.hang {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(step.status)
+		_, _ = io.WriteString(w, step.body)
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+	p := newPlanner(&xrpc.Client{
+		Host:       srv.URL,
+		HTTPClient: gt.Some(&http.Client{Transport: &http.Transport{ResponseHeaderTimeout: 50 * time.Millisecond}}),
+		Retry:      gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(attempts), BaseDelay: gt.Some(time.Millisecond)}),
+	})
+	p.retryDelay = time.Millisecond
+	return p, &calls
+}
+
+const okPlanBody = `{"plannedThroughSeq":0,"segments":[],"stats":{"segmentsExamined":0,"segmentsMatched":0,"blocksMatched":0,"entries":0}}`
+
+// TestPlanRetriesTransientFailures pins that planSnapshot, a read-only
+// procedure, is retried after the failures xrpc will not retry for a POST:
+// a 5xx and a response-header timeout. Before this, one slow response ended
+// the whole backfill with ErrFatal.
+func TestPlanRetriesTransientFailures(t *testing.T) {
+	t.Parallel()
+	for name, first := range map[string]planStep{
+		"5xx":     {status: http.StatusBadGateway, body: `{"error":"BadGateway"}`},
+		"timeout": {hang: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			p, calls := newScriptedPlanner(t, 3, first, planStep{status: http.StatusOK, body: okPlanBody})
+			plan, err := p.archivePlan(context.Background(), planRequest{})
+			require.NoError(t, err)
+			require.NotNil(t, plan)
+			require.EqualValues(t, 2, calls.Load())
+		})
+	}
+}
+
+func TestPlanDoesNotRetryClientErrors(t *testing.T) {
+	t.Parallel()
+	p, calls := newScriptedPlanner(t, 3, planStep{status: http.StatusBadRequest, body: `{"error":"InvalidRequest","message":"bad"}`})
+	_, err := p.archivePlan(context.Background(), planRequest{})
+	require.Error(t, err)
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestPlanRetryBudgetIsBounded(t *testing.T) {
+	t.Parallel()
+	p, calls := newScriptedPlanner(t, 3, planStep{status: http.StatusServiceUnavailable, body: `{"error":"Unavailable"}`})
+	_, err := p.archivePlan(context.Background(), planRequest{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "planSnapshot")
+	require.EqualValues(t, 3, calls.Load())
 }
 
 func TestPlanRejectsMalformedSegments(t *testing.T) {

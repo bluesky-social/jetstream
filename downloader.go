@@ -664,25 +664,40 @@ func (d *downloader) decodeFrame(frame []byte, segName string, blockIdx int) ([]
 	}
 	// witnessed_at is monotonic with seq, so the last row carries the block max.
 	d.observeWitnessed(rows[len(rows)-1].WitnessedAt)
+	return d.decodeRows(rows)
+}
 
+// decodeRows selects and decodes one block's rows, which alias the block's
+// decompressed buffer, into public Events.
+func (d *downloader) decodeRows(rows []segment.Event) ([]Event, error) {
+	// The selector runs exactly once per row, compacting the survivors in place,
+	// before anything is copied out of the decompressed block.
+	if d.selector != nil {
+		kept := 0
+		for i := range rows {
+			if d.selector(&rows[i]) {
+				rows[kept] = rows[i]
+				kept++
+			}
+		}
+		rows = rows[:kept]
+	}
+	if !d.mode.aliasesBlock() {
+		ownRows(rows)
+	}
 	// One Commit slab + one Event slab for the whole block, instead of a separate
-	// *Commit heap allocation per commit row. Each surviving commit takes the next
-	// slab slot (&commits[ci]); the events reference those pointers. The slab is
-	// sized to len(rows) and NEVER appended to, so &commits[ci] never dangles (a
-	// realloc would). It is sized to the row count rather than the surviving-
-	// commit count to keep this a single pass that runs the selector exactly once;
-	// when a collection/DID filter drops rows, the unused tail slots are zeroed
-	// Commits that are never referenced and are dropped to GC with the block. The
-	// slab is a fresh per-block allocation, never pooled, so a consumer still
-	// holding an earlier batch can never observe a mutation.
+	// *Commit heap allocation per commit row. Each commit takes the next slab
+	// slot (&commits[ci]); the events reference those pointers. The slab is sized
+	// to the surviving rows and NEVER appended to, so &commits[ci] never dangles
+	// (a realloc would). Non-commit rows leave their slots as zeroed Commits that
+	// are never referenced. The slab is a fresh per-block allocation, never
+	// pooled, so a consumer still holding an earlier batch can never observe a
+	// mutation.
 	commits := make([]Commit, len(rows))
 	out := make([]Event, 0, len(rows))
 	var decodeErrs []error
 	ci := 0
 	for i := range rows {
-		if d.selector != nil && !d.selector(&rows[i]) {
-			continue
-		}
 		var commit *Commit
 		if isCommitKind(rows[i].Kind) {
 			commit = &commits[ci]
