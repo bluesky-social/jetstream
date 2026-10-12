@@ -227,7 +227,13 @@ func decodeRef(ctx context.Context, cache *blockCache, f catalog.Fetcher, ref ca
 
 // DefaultBlockCacheBytes bounds the shared decoded-block cache for the cold
 // (disk replay) path. Operator-tunable via --subscribe-block-cache-bytes.
-const DefaultBlockCacheBytes = 64 << 20
+//
+// Each concurrent replay at a distinct position keeps one block resident, and
+// a block with its memoized encodes runs to several MiB. At 64 MiB, pop1's ~54
+// concurrent replays evicted each other's blocks, so nearly every 1024-event
+// cold Read decoded its block again (a quarter of the process's CPU). 1 GiB
+// holds a few hundred replay positions.
+const DefaultBlockCacheBytes = 1 << 30
 
 // ColdReaderConfig wires the cold read path. The writer is held by
 // reference (atomic.Pointer) because cmd/jetstream publishes it after

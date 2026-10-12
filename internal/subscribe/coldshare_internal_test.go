@@ -99,12 +99,13 @@ func TestColdReader_MemoGrowthChargedToCache(t *testing.T) {
 	require.Zero(t, rd.cache.bytes(), "memo growth on an evicted block must not resurrect accounting")
 }
 
-// TestColdReader_MemoGrowthTriggersEviction proves the charged growth is
-// live: when memo growth pushes the cache past its budget, eviction runs
-// (the cache does not just track a number, it enforces the bound). The
-// budget is sized to admit the raw decoded block but not the block plus
-// its memoized bodies.
-func TestColdReader_MemoGrowthTriggersEviction(t *testing.T) {
+// TestColdReader_MemoGrowthKeepsBlockInUse proves memo growth is charged
+// to the block being encoded without evicting it. The budget admits the raw
+// decoded block but not the block plus its memoized bodies. Evicting the
+// block mid-batch would make the next Read of the same replay decode it
+// again; the next insert of a different block reclaims the overshoot
+// instead (TestBlockCache_KeepsBlockInUse).
+func TestColdReader_MemoGrowthKeepsBlockInUse(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	segDir := filepath.Join(dir, "segments")
@@ -138,5 +139,11 @@ func TestColdReader_MemoGrowthTriggersEviction(t *testing.T) {
 
 	_, err = batch[0].Encoded()
 	require.NoError(t, err)
-	require.Zero(t, rd.cache.bytes(), "over-budget memo growth must evict, not accumulate")
+	grown := rd.cache.bytes()
+	require.Greater(t, grown, rawBytes, "memo growth must be charged")
+
+	again, _, err := rd.Read(context.Background(), 0, 10)
+	require.NoError(t, err)
+	require.Same(t, batch[0], again[0], "the block in use must stay cached")
+	require.Equal(t, grown, rd.cache.bytes())
 }

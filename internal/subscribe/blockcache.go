@@ -206,7 +206,7 @@ func (c *blockCache) getOrDecode(key blockKey, decode func() ([]segment.Event, e
 	el := c.ll.PushFront(item)
 	c.items[key] = el
 	c.curBytes += item.bytes
-	c.evictLocked()
+	c.evictLocked(el)
 	return inf.entries, nil
 }
 
@@ -224,7 +224,8 @@ func (c *blockCache) wrapEntries(key blockKey, evs []segment.Event) []*Entry {
 }
 
 // grow charges delta freshly-memoized bytes to the cached block identified
-// by key, then enforces the budget. If the block has been evicted or
+// by key, then enforces the budget. Memoizing means a subscriber is encoding
+// the block now, so it also counts as a use. If the block has been evicted or
 // invalidated the charge is a no-op: the entries are no longer reachable
 // through the cache, so their memo growth dies with the in-flight batches
 // that still hold them.
@@ -235,18 +236,30 @@ func (c *blockCache) grow(key blockKey, delta int) {
 	if !ok {
 		return
 	}
+	c.ll.MoveToFront(el)
 	itemOf(el).bytes += delta
 	c.curBytes += delta
-	c.evictLocked()
+	c.evictLocked(el)
 }
 
-func (c *blockCache) evictLocked() {
-	for c.curBytes > c.maxBytes && c.ll.Len() > 0 {
-		el := c.ll.Back()
-		item := itemOf(el)
-		c.ll.Remove(el)
-		delete(c.items, item.key)
-		c.curBytes -= item.bytes
+// evictLocked drops least-recently-used blocks until the cache fits its
+// budget, but never keep, the block just inserted or charged. A subscriber is
+// reading or encoding keep right now, and a cold Read returns at most one
+// batch of it, so evicting it makes the next Read decode the same block again.
+// For a block of large records that alone outgrows the budget once its encodes
+// are memoized, that meant one fetch and decode per batch instead of per block.
+// The cache may therefore exceed its budget by keep's size until the next
+// insert evicts it.
+func (c *blockCache) evictLocked(keep *list.Element) {
+	for el := c.ll.Back(); el != nil && c.curBytes > c.maxBytes; {
+		prev := el.Prev()
+		if el != keep {
+			item := itemOf(el)
+			c.ll.Remove(el)
+			delete(c.items, item.key)
+			c.curBytes -= item.bytes
+		}
+		el = prev
 	}
 }
 

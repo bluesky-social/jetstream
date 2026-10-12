@@ -362,7 +362,7 @@ func serveCommand() *cli.Command {
 				Name:    "subscribe-block-cache-bytes",
 				Usage:   "Decoded-byte budget of the shared cold-path block cache (sealed + flushed blocks).",
 				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_BLOCK_CACHE_BYTES"),
-				Value:   64 << 20,
+				Value:   1 << 30,
 			},
 			&cli.IntFlag{
 				Name:    "subscribe-read-batch",
@@ -384,9 +384,9 @@ func serveCommand() *cli.Command {
 			},
 			&cli.FloatFlag{
 				Name:    "subscribe-cold-events-per-sec",
-				Usage:   "Events/sec this process serves from cold (archive) reads, summed over all subscribers, so replays cannot starve the live tail. 0 disables the limit.",
+				Usage:   "Events/sec this process serves from cold (archive) reads, summed over all subscribers, so replays cannot starve the live tail. Events a subscriber's filter skips count as 1/8 of an event. 0 disables the limit.",
 				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_COLD_EVENTS_PER_SEC"),
-				Value:   200_000,
+				Value:   400_000,
 			},
 			&cli.IntFlag{
 				Name:    "cursor-block-index-cache-size",

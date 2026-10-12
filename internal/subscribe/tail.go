@@ -10,6 +10,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/segment"
 )
 
 // errColdUnavailable is returned by the cold reader when disk replay deps
@@ -133,6 +134,21 @@ func (t *Tail) SetReadLogSource(fn func() *ingest.ReadableLog) {
 // is at the live edge with nothing available. Cold-misses delegate to the
 // injected coldReader. The hot/cold boundary is transparent to the caller.
 func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
+	return t.ReadFromFiltered(ctx, cursor, max, nil)
+}
+
+// coldSkipsPerToken is how many cold events a subscriber's filter may skip
+// for the price of one delivered event. Skipping an event costs the scan
+// share of a cold read but none of the encode, compress, or write, so a
+// narrowly filtered replay should not drain the budget at the full-stream
+// rate while delivering almost nothing.
+const coldSkipsPerToken = 8
+
+// ReadFromFiltered is ReadFrom for a subscriber whose filter is wants (nil
+// wants everything). The batch is unfiltered, the caller still applies its
+// own filter; wants only sets what a cold batch costs: each wanted event is
+// charged in full and each skipped one at 1/coldSkipsPerToken.
+func (t *Tail) ReadFromFiltered(ctx context.Context, cursor uint64, max int, wants func(*segment.Event) bool) ([]*Entry, uint64, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, cursor, err
@@ -155,7 +171,7 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 					return out, next, nil
 				}
 				if !atTip && cursor < log.FloorSeq() {
-					return t.readCold(ctx, cursor, max)
+					return t.readCold(ctx, cursor, max, wants)
 				}
 				select {
 				case t.blocked <- cursor:
@@ -175,7 +191,7 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 			}
 		}
 		if nextSeq != nil && cursor < nextSeq() {
-			return t.readCold(ctx, cursor, max)
+			return t.readCold(ctx, cursor, max, wants)
 		}
 
 		select {
@@ -191,12 +207,12 @@ func (t *Tail) ReadFrom(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 }
 
 // readCold serves a cold batch, then charges it to the process's cold
-// budget. It pays after reading because the batch size is only known then;
+// budget. It pays after reading because the batch cost is only known then;
 // the wait delays this subscriber's next read, and the budget reserves in
 // arrival order, so concurrent replays slow down evenly instead of one
 // monopolizing it. A cancelled wait still returns the batch: the tokens are
 // spent, and the caller sees ctx on its next write or read.
-func (t *Tail) readCold(ctx context.Context, cursor uint64, max int) ([]*Entry, uint64, error) {
+func (t *Tail) readCold(ctx context.Context, cursor uint64, max int, wants func(*segment.Event) bool) ([]*Entry, uint64, error) {
 	t.metrics.incColdReads()
 	batch, next, err := t.cold(ctx, cursor, max)
 	if err != nil || t.coldLimit == nil || len(batch) == 0 {
@@ -204,7 +220,7 @@ func (t *Tail) readCold(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 	}
 	// ReserveN fails only for n above the burst, which New sizes to at least
 	// one batch; a cold reader returning more than max is not charged.
-	r := t.coldLimit.ReserveN(time.Now(), len(batch))
+	r := t.coldLimit.ReserveN(time.Now(), coldCost(batch, wants))
 	if d := r.Delay(); r.OK() && d > 0 {
 		t.metrics.addColdThrottle(d)
 		timer := time.NewTimer(d)
@@ -215,6 +231,22 @@ func (t *Tail) readCold(ctx context.Context, cursor uint64, max int) ([]*Entry, 
 		}
 	}
 	return batch, next, nil
+}
+
+// coldCost is the budget a cold batch draws: wanted events in full, skipped
+// ones rounded up to whole tokens, so any non-empty batch costs at least one.
+func coldCost(batch []*Entry, wants func(*segment.Event) bool) int {
+	if wants == nil {
+		return len(batch)
+	}
+	wanted := 0
+	for _, e := range batch {
+		if wants(e.Event) {
+			wanted++
+		}
+	}
+	skipped := len(batch) - wanted
+	return wanted + (skipped+coldSkipsPerToken-1)/coldSkipsPerToken
 }
 
 // Tip returns the live-edge seq where a no-cursor (live) subscriber starts: it
