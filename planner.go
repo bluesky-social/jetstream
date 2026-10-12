@@ -2,8 +2,12 @@ package jetstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"net/url"
+	"syscall"
+	"time"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/jcalabro/atmos/xrpc"
@@ -93,14 +97,19 @@ type planRequest struct {
 	BeforeSeq    uint64
 }
 
+// planRetryDelay is the backoff before the second planSnapshot attempt; later
+// attempts double it, capped like the download retries.
+const planRetryDelay = 500 * time.Millisecond
+
 // planner negotiates snapshot plans with a Jetstream server over XRPC.
 type planner struct {
-	xc *xrpc.Client
+	xc         *xrpc.Client
+	retryDelay time.Duration
 }
 
 // newPlanner returns a planner that issues planSnapshot calls on xc.
 func newPlanner(xc *xrpc.Client) *planner {
-	return &planner{xc: xc}
+	return &planner{xc: xc, retryDelay: planRetryDelay}
 }
 
 // archivePlan calls network.bsky.jetstream.planSnapshot and converts the response
@@ -118,11 +127,42 @@ func (p *planner) archivePlan(ctx context.Context, req planRequest) (*archivePla
 		return nil, fmt.Errorf("jetstream: beforeSeq %d exceeds int64 max", req.BeforeSeq)
 	}
 	in := planInput(req)
-	out, err := jetstream.JetstreamPlanSnapshot(ctx, p.xc, in)
-	if err != nil {
-		return nil, fmt.Errorf("jetstream: planSnapshot: %w", err)
+	// The attempt budget is the xrpc client's, so WithMaxDownloadAttempts
+	// bounds planning the same way it bounds downloads.
+	attempts := max(p.xc.Retry.ValOr(xrpc.DefaultRetryPolicy).MaxAttempts.ValOr(3), 1)
+	var lastErr error
+	for attempt := range attempts {
+		if attempt > 0 && !sleep(ctx, retryBackoff(p.retryDelay, attempt, nil)) {
+			return nil, fmt.Errorf("jetstream: planSnapshot: %w", ctx.Err())
+		}
+		out, err := jetstream.JetstreamPlanSnapshot(ctx, p.xc, in)
+		if err == nil {
+			return planFromOutput(out)
+		}
+		lastErr = fmt.Errorf("jetstream: planSnapshot: %w", err)
+		if ctx.Err() != nil || !retryablePlanError(err) {
+			return nil, lastErr
+		}
 	}
-	return planFromOutput(out)
+	return nil, lastErr
+}
+
+// retryablePlanError reports whether a failed planSnapshot call may succeed on
+// a fresh attempt. planSnapshot is an XRPC procedure, and xrpc retries a POST
+// only when the request provably never ran (refused connection, 429), because
+// replaying a write is unsafe. planSnapshot only reads, so a 5xx or an
+// ambiguous transport failure (timeout, reset) is safe to retry here. A
+// refused connection and a 429 were already retried inside the call.
+func retryablePlanError(err error) bool {
+	var xe *xrpc.Error
+	if errors.As(err, &xe) {
+		return xe.StatusCode >= 500
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return false
+	}
+	var ue *url.Error
+	return errors.As(err, &ue)
 }
 
 func planInput(req planRequest) *jetstream.JetstreamPlanSnapshot_Input {
