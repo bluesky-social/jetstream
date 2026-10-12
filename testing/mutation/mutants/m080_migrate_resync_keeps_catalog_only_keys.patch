@@ -1,0 +1,26 @@
+mutant: m080_migrate_resync_keeps_catalog_only_keys
+target: internal/migrate/meta.go
+failure-mode: |
+  The full metadata resync copies keys the catalog lacks or holds stale,
+  but never deletes keys only the catalog holds. A key the source deleted
+  while the dirty set was lost (a restart, an overflow) survives in the
+  catalog forever, and the pods inherit it at handoff.
+expected-detection: |
+  TestMetaSync_ResyncAndFlush and TestMetaSync_ResyncRepairsDrift seed
+  catalog-only keys and require a resync to remove them; the end-to-end
+  migration's full verify at handoff refuses on any difference.
+expected-tier: migration
+tiers: migration
+
+diff --git a/internal/migrate/meta.go b/internal/migrate/meta.go
+index 56211ff..773c849 100644
+--- a/internal/migrate/meta.go
++++ b/internal/migrate/meta.go
+@@ -237,7 +237,6 @@ func (ms *metaSync) diffRange(ctx context.Context, sess *catalog.Session, src it
+ 		case cmp < 0:
+ 			err = emit(metastore.Op{Kind: metastore.OpSet, Key: l.key, Value: l.val})
+ 		case cmp > 0:
+-			err = emit(metastore.Op{Kind: metastore.OpDelete, Key: r.key})
+ 		case !bytes.Equal(l.val, r.val):
+ 			err = emit(metastore.Op{Kind: metastore.OpSet, Key: l.key, Value: l.val})
+ 		}

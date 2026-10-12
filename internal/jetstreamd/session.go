@@ -10,6 +10,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/bluesky-social/jetstream/internal/leader"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/subscribe"
@@ -106,11 +107,22 @@ func (f *sessionFactory) buildWith(store metastore.Store, disagg *orchestrator.D
 // closed, so per-session state is gone before the next session starts or the
 // metadata store closes.
 func (r *Runtime) runSession(ctx context.Context, epoch uint64) error {
+	sctx, leave, err := r.ingest.enter(ctx)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	s, err := r.takeSession()
 	if err != nil {
 		return err
 	}
-	return r.runWriterSession(ctx, epoch, s)
+	err = r.runWriterSession(sctx, epoch, s)
+	if ctx.Err() == nil && sctx.Err() != nil {
+		// The migration stopped local ingest. The next session waits at
+		// the gate until it is let through again.
+		return fmt.Errorf("%w: local ingest stopped for the migration handoff (session: %w)", leader.ErrRestartSession, err)
+	}
+	return err
 }
 
 // runWriterSession runs s to completion. It returns only after the
@@ -222,11 +234,16 @@ func (s *writerSlot) publish(w *ingest.Writer) {
 // unknown, so responses are not cached.
 type compactionDeadline struct {
 	cur atomic.Pointer[orchestrator.CompactionScheduleState]
+	// gate, when paused, means no pass is coming, so no deadline holds.
+	gate *orchestrator.CompactionGate
 }
 
 func (d *compactionDeadline) set(s *orchestrator.CompactionScheduleState) { d.cur.Store(s) }
 
 // NextCompactionAt implements xrpcapi.CompactionDeadline.
 func (d *compactionDeadline) NextCompactionAt() (time.Time, bool) {
+	if d.gate.Paused() {
+		return time.Time{}, false
+	}
 	return d.cur.Load().NextCompactionAt()
 }

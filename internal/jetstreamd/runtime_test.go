@@ -80,6 +80,34 @@ func TestOptionsValidateRejectsNegativeCompactionCacheGrace(t *testing.T) {
 	require.ErrorContains(t, err, "CompactionCacheGrace must be >= 0")
 }
 
+func TestOptionsValidateMigrationDryRun(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		mutate func(*Options)
+		want   string
+	}{
+		"with the migrator": {func(o *Options) { o.Migration.Enabled = true }, "exclude each other"},
+		"in disaggregated mode": {func(o *Options) {
+			o.Storage = DefaultStorageConfig()
+			o.Storage.Mode = StorageDisaggregated
+		}, "inventories a local-mode archive"},
+		"negative throttle": {func(o *Options) { o.Migration.ReadBytesPerSec = -1 }, "READ_BYTES_PER_SEC must be >= 0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := testOptions(t)
+			opts.Migration = DefaultMigrationConfig()
+			opts.Migration.DryRun = true
+			tc.mutate(&opts)
+			require.ErrorContains(t, opts.Migration.validate(opts), tc.want)
+		})
+	}
+	opts := testOptions(t)
+	opts.Migration = DefaultMigrationConfig()
+	opts.Migration.DryRun = true
+	require.NoError(t, opts.Migration.validate(opts), "the dry run needs no PostgreSQL or S3")
+}
+
 func TestOptionsValidateRejectsNegativeBackfillFleetLimits(t *testing.T) {
 	t.Parallel()
 

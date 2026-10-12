@@ -50,6 +50,7 @@ type Metrics struct {
 	CompactionPasses            *prometheus.CounterVec
 	CompactionPassDuration      prometheus.Histogram
 	CompactionEarlyPasses       prometheus.Counter
+	CompactionPausedPasses      prometheus.Counter
 	CompactionTombstones        *prometheus.CounterVec
 	CompactionTombstoneEntries  prometheus.Collector
 	CompactionTombstoneBytes    prometheus.Collector
@@ -141,6 +142,11 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
 		Name: "passes_early_total",
 		Help: "Compaction passes triggered by the tombstone cap.",
+	})
+	m.CompactionPausedPasses = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
+		Name: "passes_paused_total",
+		Help: "Steady-state compaction passes skipped because a migration paused compaction.",
 	})
 	m.CompactionTombstones = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace, Subsystem: compactionMetricsSubsystem,
@@ -238,6 +244,7 @@ func NewMetrics(reg prometheus.Registerer, tombstones ...*tombstone.Set) *Metric
 		m.CompactionPasses,
 		m.CompactionPassDuration,
 		m.CompactionEarlyPasses,
+		m.CompactionPausedPasses,
 		m.CompactionTombstones,
 		m.CompactionTombstoneEntries,
 		m.CompactionTombstoneBytes,
@@ -341,6 +348,12 @@ func (m *Metrics) observeCompactionPass(start time.Time, err error) {
 func (m *Metrics) incCompactionEarlyPass() {
 	if m != nil {
 		m.CompactionEarlyPasses.Inc()
+	}
+}
+
+func (m *Metrics) incCompactionPausedPass() {
+	if m != nil {
+		m.CompactionPausedPasses.Inc()
 	}
 }
 

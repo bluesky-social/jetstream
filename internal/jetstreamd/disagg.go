@@ -23,6 +23,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	metapg "github.com/bluesky-social/jetstream/internal/metastore/pg"
+	"github.com/bluesky-social/jetstream/internal/migrate"
 	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/objstore/objcache"
 	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
@@ -74,6 +75,12 @@ type StorageBackend struct {
 	Now func() time.Time
 	// Close releases the backend after the runtime stops. May be nil.
 	Close func()
+	// MigrationControl returns the migration's operator control channel,
+	// creating its tables if needed. Only a local-mode process migrating
+	// to this backend calls it; nil means the backend has none.
+	MigrationControl func(ctx context.Context) (migrate.Control, error)
+	// MigrationOperator is the operator's side of that channel.
+	MigrationOperator func(ctx context.Context) (MigrationOperator, error)
 }
 
 // identityCacheEntries bounds the pod-local identity LRU. Disaggregated
@@ -188,6 +195,18 @@ func openBackend(ctx context.Context, cfg StorageConfig, pgMetrics *pgstore.Metr
 			return metapg.New(metapg.Config{DB: pg, Commit: commit})
 		},
 		Close: pg.Close,
+		MigrationControl: func(ctx context.Context) (migrate.Control, error) {
+			if err := pg.EnsureMigrationControl(ctx); err != nil {
+				return nil, err
+			}
+			return pgMigrationControl{pg: pg}, nil
+		},
+		MigrationOperator: func(ctx context.Context) (MigrationOperator, error) {
+			if err := pg.EnsureMigrationControl(ctx); err != nil {
+				return nil, err
+			}
+			return pgMigrationOperator{pg: pg}, nil
+		},
 	}, nil
 }
 
@@ -403,6 +422,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		Fetcher:         f,
 		Ready:           f.Ready,
 		Floor:           f.LogFloor,
+		Gaps:            f.SeqGaps,
 		Keyer:           f,
 		BlockCacheBytes: opts.SubscribeBlockCacheBytes,
 		Metrics:         subscribeMetrics,
@@ -588,7 +608,26 @@ func (r *Runtime) runLeaderSession(ctx context.Context, epoch uint64) error {
 		Metrics:       d.catalogMetrics,
 		LeaderMetrics: r.leaderMetrics,
 	})
+	// A catalog a migration is still building belongs to the migrator,
+	// which may only be restarting. Nothing else in the session may run
+	// first: without a phase, the orchestrator would start a bootstrap on
+	// top of the import (migration plan §6.2).
+	state, err := sess.ReadMigrationState(ctx)
+	if err != nil {
+		return sessionError(err, sess)
+	}
+	if state.BlocksLeader() {
+		return fmt.Errorf("%w: migration/state is %q", leader.ErrStandby, state)
+	}
 	return sessionError(r.leaderSession(ctx, epoch, sess), sess)
+}
+
+// mayLead is the disaggregated leader loop's MayAcquire: a pod does not
+// even try for the lease while its mirror says a migration owns the
+// catalog, or before it has a mirror.
+func (r *Runtime) mayLead(context.Context) bool {
+	state, ok := r.disagg.follower.MigrationState()
+	return ok && !state.BlocksLeader()
 }
 
 func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog.Session) error {
@@ -821,6 +860,8 @@ func (r *Runtime) runDisaggregated(gctx context.Context, g *errgroup.Group) {
 			Lease:           st.Leader.Lease,
 			RenewInterval:   st.Leader.RenewInterval,
 			AcquireInterval: st.Leader.AcquireInterval,
+			StandbyBackoff:  r.opts.Migration.StandbyBackoff,
+			MayAcquire:      r.mayLead,
 			Logger:          r.processLogger.With(slog.String("component", "leader")),
 			Metrics:         r.leaderMetrics,
 		}, r.runLeaderSession)

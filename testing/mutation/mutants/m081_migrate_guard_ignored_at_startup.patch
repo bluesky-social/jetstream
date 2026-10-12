@@ -1,0 +1,28 @@
+mutant: m081_migrate_guard_ignored_at_startup
+target: internal/jetstreamd/migration.go
+failure-mode: |
+  A local process starts ingest without reading the handoff guard. After a
+  handoff committed, a restart of the source ingests again while a
+  disaggregated pod leads the archive: two writers, and the source's new
+  seqs collide with nothing anyone reads.
+expected-detection: |
+  TestMigration_CrashSeams/after-migration-done restarts the source on a
+  pending guard after the done commit and requires its seq/next unchanged;
+  TestMigration_LocalToDisaggregated restarts a handed-off source and
+  requires the same.
+expected-tier: migration
+tiers: migration
+
+diff --git a/internal/jetstreamd/migration.go b/internal/jetstreamd/migration.go
+index 68fdec2..326448c 100644
+--- a/internal/jetstreamd/migration.go
++++ b/internal/jetstreamd/migration.go
+@@ -234,7 +234,7 @@ func (r *Runtime) openMigrationGates(ctx context.Context) error {
+ 	if err != nil {
+ 		return fmt.Errorf("serve: %w", err)
+ 	}
+-	r.ingest = newIngestGate(guard == migrate.GuardNone)
++	r.ingest = newIngestGate(true)
+ 	switch {
+ 	case guard == migrate.GuardDone:
+ 		r.drained.Store(true)

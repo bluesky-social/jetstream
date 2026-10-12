@@ -1,0 +1,28 @@
+mutant: m084_migrate_handoff_skips_relay_cursor
+target: internal/migrate/handoff.go
+failure-mode: |
+  The handoff never copies relay/cursor, which the migration withholds
+  while tailing. The pods' first leader starts from no cursor, at the
+  relay's tip, and every frame between the source's last block and the
+  tip is lost.
+expected-detection: |
+  The handoff's critical-key check finds the catalog's relay/cursor missing
+  and reverts, so TestMigration_LocalToDisaggregated's handoff never
+  reports done.
+expected-tier: migration
+tiers: migration
+
+diff --git a/internal/migrate/handoff.go b/internal/migrate/handoff.go
+index 007487b..0bf855f 100644
+--- a/internal/migrate/handoff.go
++++ b/internal/migrate/handoff.go
+@@ -107,9 +107,6 @@ func (m *Migrator) handoff(ctx context.Context, sess *catalog.Session, tr *track
+ 	} else if err != nil {
+ 		return "failed: " + err.Error(), err
+ 	}
+-	if err := m.copyKey(ctx, sess, catalog.RelayCursorKey); err != nil {
+-		return "failed: " + err.Error(), err
+-	}
+ 	if m.cfg.HandoffFullVerify {
+ 		m.setStep("handoff: comparing all metadata")
+ 		diffs, err := m.meta.resyncLocked(ctx, sess, true, true)

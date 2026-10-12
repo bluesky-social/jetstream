@@ -6,6 +6,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -22,6 +23,10 @@ type mirror struct {
 	phase      lifecycle.Phase
 	deadline   time.Time
 	deadlineOK bool
+	// migration is migration/state, empty on a catalog no migration built.
+	migration catalog.MigrationState
+	// gaps is Main's registered vacancies, imported from a local archive.
+	gaps *seqspace.Gaps
 
 	// sealed is each namespace's sealed segments. SegmentView.Generation is
 	// the segment_generations ID.

@@ -166,6 +166,9 @@ type Config struct {
 	// use a tiny limit to make the steady writer fsync without thousands of
 	// events.
 	SteadyMaxEventsPerBlock int
+	// SteadyMaxSegmentBytes forwards to the local steady-state writer's
+	// rotation threshold. Zero is the ingest default. Test-only.
+	SteadyMaxSegmentBytes int64
 
 	// BackfillRepos, when non-empty, replaces bootstrap listRepos
 	// discovery with this explicit DID list. Debug-only knob for
@@ -252,6 +255,10 @@ type Config struct {
 	// to the archive serving layer. It is optional for callers that do not
 	// expose archive downloads.
 	CompactionSchedule *CompactionScheduleState
+
+	// CompactionGate, when non-nil, can pause steady-state compaction
+	// passes. It outlives sessions; nil never pauses.
+	CompactionGate *CompactionGate
 
 	// CompactionTombstoneCap is the operator cap for tombstone entries. The
 	// first implementation exposes the knob and uses it for trigger accounting;

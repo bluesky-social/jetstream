@@ -9,11 +9,13 @@
 package pebblestore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -36,6 +38,32 @@ type Store struct {
 	st      *store.Store
 	dataDir string
 	onDisk  bool
+	// observer, when set, hears about every synced commit.
+	observer atomic.Pointer[CommitObserver]
+}
+
+// CommitObserver hears about each synced write after it commits: the point
+// keys it set or deleted, and the [start, end) ranges it deleted. It gets
+// keys only, never values, and owns the slices. It runs on the writer's
+// goroutine, so it must not block. Unsynced writes (SetNoSync, DeleteNoSync)
+// are not observed.
+type CommitObserver func(keys [][]byte, ranges [][2][]byte)
+
+// SetCommitObserver installs fn, or removes the observer when fn is nil. A
+// commit that returns after SetCommitObserver returns is observed, so a
+// snapshot taken after installing an observer misses no later write.
+func (s *Store) SetCommitObserver(fn CommitObserver) {
+	if fn == nil {
+		s.observer.Store(nil)
+		return
+	}
+	s.observer.Store(&fn)
+}
+
+func (s *Store) observe(key []byte) {
+	if fn := s.observer.Load(); fn != nil {
+		(*fn)([][]byte{bytes.Clone(key)}, nil)
+	}
 }
 
 var (
@@ -99,11 +127,19 @@ func (s *Store) GetMany(ctx context.Context, keys [][]byte) ([][]byte, error) {
 }
 
 func (s *Store) Set(_ context.Context, key, value []byte) error {
-	return s.st.Set(key, value, store.SyncWrites)
+	if err := s.st.Set(key, value, store.SyncWrites); err != nil {
+		return err
+	}
+	s.observe(key)
+	return nil
 }
 
 func (s *Store) Delete(_ context.Context, key []byte) error {
-	return s.st.Delete(key, store.SyncWrites)
+	if err := s.st.Delete(key, store.SyncWrites); err != nil {
+		return err
+	}
+	s.observe(key)
+	return nil
 }
 
 // SetNoSync writes without syncing the WAL. Only for rebuildable caches (the
@@ -120,6 +156,45 @@ func (s *Store) DeleteNoSync(key []byte) error {
 func (s *Store) NewBatch() metastore.Batch {
 	return &batch{s: s, b: s.st.NewBatch()}
 }
+
+// Snapshot is a consistent, read-only view of the store at the moment
+// NewSnapshot returned. It pins the LSM state it reads, so close it promptly.
+type Snapshot struct {
+	sn *pebble.Snapshot
+}
+
+// NewSnapshot returns a view of the store as of now.
+func (s *Store) NewSnapshot() *Snapshot {
+	return &Snapshot{sn: s.st.NewSnapshot()}
+}
+
+// Get reads key as of the snapshot.
+func (sn *Snapshot) Get(_ context.Context, key []byte) ([]byte, error) {
+	val, closer, err := sn.sn.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, metastore.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := bytes.Clone(val)
+	if err := closer.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NewIter iterates [lower, upper) as of the snapshot.
+func (sn *Snapshot) NewIter(_ context.Context, lower, upper []byte) (metastore.Iterator, error) {
+	it, err := sn.sn.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return nil, err
+	}
+	return &iter{it: it}, nil
+}
+
+// Close releases the snapshot.
+func (sn *Snapshot) Close() error { return sn.sn.Close() }
 
 func (s *Store) NewIter(_ context.Context, lower, upper []byte) (metastore.Iterator, error) {
 	it, err := s.st.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
@@ -199,7 +274,42 @@ func (b *batch) Commit(context.Context) error {
 	if b.err != nil {
 		return fmt.Errorf("pebblestore: stage batch: %w", b.err)
 	}
-	return b.s.st.Commit(b.b, store.SyncWrites)
+	if err := b.s.st.Commit(b.b, store.SyncWrites); err != nil {
+		return err
+	}
+	if fn := b.s.observer.Load(); fn != nil {
+		keys, ranges, err := batchKeys(b.b)
+		if err != nil {
+			return fmt.Errorf("pebblestore: read committed batch: %w", err)
+		}
+		(*fn)(keys, ranges)
+	}
+	return nil
+}
+
+// batchKeys lists the keys and deleted ranges a batch holds. Pebble keeps
+// the staged ops in the batch's own encoding, so reading them back costs
+// nothing when no observer is installed.
+func batchKeys(b *pebble.Batch) ([][]byte, [][2][]byte, error) {
+	var keys [][]byte
+	var ranges [][2][]byte
+	r := b.Reader()
+	for {
+		kind, key, value, ok, err := r.Next()
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
+			return keys, ranges, nil
+		}
+		switch kind {
+		case pebble.InternalKeyKindRangeDelete:
+			ranges = append(ranges, [2][]byte{bytes.Clone(key), bytes.Clone(value)})
+		case pebble.InternalKeyKindLogData:
+		default:
+			keys = append(keys, bytes.Clone(key))
+		}
+	}
 }
 
 type iter struct {

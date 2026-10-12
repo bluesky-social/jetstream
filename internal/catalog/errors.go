@@ -37,6 +37,7 @@ const (
 	SourceGeneration = "generation" // a generation header or footer is malformed
 	SourceCompaction = "compaction" // a compaction publish or watermark disagrees with the catalog
 	SourceGC         = "gc"         // a GC claim is still referenced
+	SourceMigration  = "migration"  // an import disagrees with the catalog it extends
 )
 
 // CorruptionError is storage corruption or a broken catalog invariant (design

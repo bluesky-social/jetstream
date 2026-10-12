@@ -1,0 +1,26 @@
+mutant: m082_migrate_handoff_skips_pending_guard
+target: internal/migrate/handoff.go
+failure-mode: |
+  The handoff commits migration/state=done without first recording the
+  local guard as pending. A crash between the commit and the done guard
+  restarts the source with no guard, so local ingest starts before the
+  migrator reads the catalog and finds the archive is no longer its own.
+expected-detection: |
+  TestMigration_CrashSeams/after-migration-done kills the source right
+  after the commit and requires the guard to read pending.
+expected-tier: migration
+tiers: migration
+
+diff --git a/internal/migrate/handoff.go b/internal/migrate/handoff.go
+index 007487b..949a522 100644
+--- a/internal/migrate/handoff.go
++++ b/internal/migrate/handoff.go
+@@ -133,7 +133,7 @@ func (m *Migrator) handoff(ctx context.Context, sess *catalog.Session, tr *track
+ 	// H5. From here the outcome is the catalog's, and only a session that
+ 	// reads it restarts local ingest.
+ 	prepared = true
+-	if err := writeGuard(ctx, m.cfg.Meta, GuardPending); err != nil {
++	if err := writeGuard(ctx, m.cfg.Meta, GuardNone); err != nil {
+ 		return "failed: " + err.Error(), err
+ 	}
+ 	if err := m.crash(ctx, crashpoint.AfterMigrationGuardPending); err != nil {

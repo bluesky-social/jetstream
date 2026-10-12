@@ -38,7 +38,7 @@ The durability ordering between these two is the invariant that keeps a crash sa
 
 #### Storage seams
 
-Core packages (ingest, orchestrator, subscribe, xrpcapi, repoexport, status, manifest) reach storage only through interfaces, so a disaggregated backend (S3 plus PostgreSQL, `specs/notes/2026-09-25-disaggregated-storage-v2-design.md`) can replace the local one without touching call sites. Disaggregated mode (`JETSTREAM_STORAGE=disaggregated`, after `jetstream storage init`) runs bootstrap, merge and steady state over `internal/catalog`, `internal/metastore/pg` and `internal/objstore/s3`. The leader also runs sparse compaction over the catalog (design §12) and object GC (design §13). The table lists the local implementations.
+Core packages (ingest, orchestrator, subscribe, xrpcapi, repoexport, status, manifest) reach storage only through interfaces, so a disaggregated backend (S3 plus PostgreSQL, `specs/notes/2026-09-25-disaggregated-storage-v2-design.md`) can replace the local one without touching call sites. Disaggregated mode (`JETSTREAM_STORAGE=disaggregated`, after `jetstream storage init`) runs bootstrap, merge and steady state over `internal/catalog`, `internal/metastore/pg` and `internal/objstore/s3`. The leader also runs sparse compaction over the catalog (design §12) and object GC (design §13). A running local archive moves to disaggregated mode without downtime through `internal/migrate`: the local process replicates itself into the catalog as a fenced leader, then hands the lease to the pods (`specs/notes/2026-10-09-local-to-disagg-migration.md`). The table lists the local implementations.
 
 | Interface | Package | Local implementation |
 |---|---|---|
@@ -98,6 +98,7 @@ The test rig checks storage and delivery across the full lifecycle.
 | The oracle / simulator | `specs/oracle.md`, `internal/oracle/doc.go`, `internal/simulator/doc.go` |
 | The mutation campaign (oracle scorecard) | `specs/mutation.md`, `testing/mutation/RESULTS.md` |
 | Coding conventions, workflow, task tracking | `AGENTS.md` |
+| Migrating a local archive to disaggregated storage | `internal/migrate/doc.go`, `docs/migrating-to-disaggregated.md`, `specs/notes/2026-10-09-local-to-disagg-migration.md` |
 | Design history / why a thing is the way it is | `specs/notes/` (dated design + implementation notes) |
 
 `specs/notes/` records past designs and implementation decisions. Use the living docs above for current behavior.

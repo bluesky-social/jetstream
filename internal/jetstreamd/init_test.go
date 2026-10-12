@@ -127,3 +127,29 @@ func TestInitStorage_Validation(t *testing.T) {
 		})
 	}
 }
+
+// Migration plan §6.2: init for a migration creates only main's segment 0
+// and migration/state seeding, together; it finishes a run that failed
+// after the archive row, and refuses any archive with more in it.
+func TestStorageInit_MigrateFromLocal(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	fake := jetstreamdtest.New(storagefake.Config{})
+	require.NoError(t, fake.Backend.CreateArchive(ctx, [16]byte{1}), "a failed run left the archive row")
+
+	for range 2 {
+		_, err := fake.Backend.InitMigration(ctx, time.Minute)
+		require.NoError(t, err)
+		require.Equal(t, map[catalog.Namespace][]uint64{catalog.Main: {0}}, activeSegments(t, fake.DB))
+		require.NoError(t, fake.DB.Violation())
+	}
+	snap, err := fake.DB.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, []byte(catalog.MigrationSeeding), snap.Meta[catalog.MigrationStateKey])
+	require.NoError(t, fake.DB.NewLease().Acquire(ctx, time.Minute), "init released the lease")
+
+	plain := jetstreamdtest.New(storagefake.Config{})
+	require.NoError(t, plain.InitNamespaces(ctx))
+	_, err = plain.Backend.InitMigration(ctx, time.Minute)
+	require.ErrorIs(t, err, catalog.ErrNotEmpty)
+}

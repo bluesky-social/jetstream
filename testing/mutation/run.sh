@@ -390,6 +390,19 @@ for patch in "$MUTANTS_DIR"/*.patch; do
                          ./internal/oracle ./internal/ingest/live
                          -run 'TestOracle_RelaySeq|TestProcessBatch_ReplayedAccountEvent'
                          -count=1 -timeout "$default_timeout") ;;
+                migration)
+                    # Local-to-disaggregated migration tier: kills mutants
+                    # in the migrator's metadata copy and handoff, the
+                    # local guard, and the catalog import scripts (m079-
+                    # m084). Layers in one `go test`: the migration oracle
+                    # (seed, tail, a shadow pod, handoff and pod carry-on,
+                    # a kill at every migration crash point, and reclaim,
+                    # all against storagefake), the metadata-sync and guard
+                    # unit tests, and the catalog import contract tests.
+                    cmd=(go test "${RACE_FLAG[@]}"
+                         ./internal/oracle ./internal/migrate ./internal/catalog
+                         -run '^TestMigration_|^TestMetaSync_|^TestDirtySet$|^TestClassify$|^TestGuardAndPause$|^TestReconcileSealed$'
+                         -count=1 -timeout "$default_timeout") ;;
                 disagg)
                     # Disaggregated-storage tier (Stage 2 S2.19, extended in
                     # S3.5 and S4.5): kills mutants in the catalog scripts,

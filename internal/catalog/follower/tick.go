@@ -18,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
+	"github.com/bluesky-social/jetstream/internal/seqspace"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -29,6 +30,8 @@ type changes struct {
 	phase      lifecycle.Phase
 	deadline   time.Time
 	deadlineOK bool
+	migration  catalog.MigrationState
+	gaps       *seqspace.Gaps
 	segments   []catalog.SegmentRow
 	gens       []catalog.GenerationRow
 	genBlocks  map[uint64][]catalog.GenerationBlockRow
@@ -38,8 +41,14 @@ type changes struct {
 	objects    map[uint64]catalog.ObjectRow
 }
 
-// metaKeys are the metadata_kv keys a tick reads.
-var metaKeys = [][]byte{[]byte(lifecycle.PhaseKey), []byte(catalog.CompactionDeadlineKey)}
+// metaKeys are the metadata_kv keys a tick reads. The migration state and
+// the vacancies are tiny, and change only on a migrated catalog.
+var metaKeys = [][]byte{
+	[]byte(lifecycle.PhaseKey),
+	[]byte(catalog.CompactionDeadlineKey),
+	[]byte(catalog.MigrationStateKey),
+	[]byte(catalog.VacanciesKey),
+}
 
 // read runs the tick's one read transaction. It returns nil changes when
 // the catalog revision equals old's.
@@ -141,13 +150,25 @@ func (f *Follower) checkArchive(arch catalog.ArchiveRow, old *mirror) (unchanged
 	return false, nil
 }
 
-// parseMeta sets c's phase and compaction deadline from metaKeys' values.
+// parseMeta sets c's phase, compaction deadline, migration state, and
+// vacancies from metaKeys' values.
 func (f *Follower) parseMeta(c *changes, meta map[string][]byte) error {
 	if v, ok := meta[lifecycle.PhaseKey]; ok {
 		var err error
 		if c.phase, err = lifecycle.ParsePhase(v); err != nil {
 			return catalog.Corruptf(catalog.SourceMeta, "%v", err)
 		}
+	}
+	if v, ok := meta[catalog.MigrationStateKey]; ok {
+		var err error
+		if c.migration, err = catalog.ParseMigrationState(v); err != nil {
+			return catalog.Corruptf(catalog.SourceMeta, "%v", err)
+		}
+	}
+	v, ok := meta[catalog.VacanciesKey]
+	var err error
+	if c.gaps, err = catalog.DecodeVacancies(v, ok); err != nil {
+		return err
 	}
 	if v, ok := meta[catalog.CompactionDeadlineKey]; ok {
 		// A bad value only costs the Cache-Control hint, so it is not worth
@@ -308,6 +329,8 @@ func (f *Follower) build(ctx context.Context, old *mirror, c *changes, rd *proto
 		phase:      c.phase,
 		deadline:   c.deadline,
 		deadlineOK: c.deadlineOK,
+		migration:  c.migration,
+		gaps:       c.gaps,
 		objects:    objects,
 	}
 	if err := m.applySegments(old, c, newGens); err != nil {
@@ -640,7 +663,8 @@ func (m *mirror) tails(objects objIndex) (map[catalog.Namespace]catalog.SegmentV
 // seq appears at most once and in order. Hot batches and active blocks are
 // dense; a sealed block may lack seqs inside its envelope, because a
 // compaction pass that ran since the last tick dropped them (design §12).
-// The caller leaves those seqs vacant in the log.
+// Two blocks may also sit either side of a vacancy a migrated local archive
+// registered. The caller leaves all those seqs vacant in the log.
 func (f *Follower) feed(ctx context.Context, next *mirror, from uint64, rd *protocol.Reader) ([]segment.Event, uint64, error) {
 	tip := next.view.TipSeq(catalog.Main)
 	if tip <= from {
@@ -664,7 +688,10 @@ func (f *Follower) feed(ctx context.Context, next *mirror, from uint64, rd *prot
 			return nil, 0, fmt.Errorf("follower: read main block [%d,%d]: %w", ref.MinSeq, ref.MaxSeq, err)
 		}
 		if want < ref.MinSeq {
-			return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] starts after seq %d", ref.MinSeq, ref.MaxSeq, want)
+			if !catalog.Bridges(next.gaps, want, ref.MinSeq) {
+				return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] starts after seq %d", ref.MinSeq, ref.MaxSeq, want)
+			}
+			want = ref.MinSeq
 		}
 		// Only a sealed generation can have been compacted.
 		sealed := ref.Generation != 0

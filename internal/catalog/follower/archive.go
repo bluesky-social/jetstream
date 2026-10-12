@@ -21,9 +21,27 @@ func (f *Follower) NextSeq() uint64 {
 	return max(f.Snapshot().TipSeq(catalog.Main), 1)
 }
 
-// SeqGaps returns nil: disaggregated seqs are allocated by the committer
-// without vacancies.
-func (f *Follower) SeqGaps() *seqspace.Gaps { return nil }
+// SeqGaps returns Main's registered vacancies. Disaggregated mode never
+// creates one; a catalog migrated from a local archive keeps the source's
+// (specs/notes/2026-10-09-local-to-disagg-migration.md §7). Nil before the
+// first mirror.
+func (f *Follower) SeqGaps() *seqspace.Gaps {
+	if m := f.cur.Load(); m != nil {
+		return m.gaps
+	}
+	return nil
+}
+
+// MigrationState returns the mirror's migration/state, and ok=false before
+// the first mirror. The empty state means the catalog was never a
+// migration's.
+func (f *Follower) MigrationState() (catalog.MigrationState, bool) {
+	m := f.cur.Load()
+	if m == nil {
+		return "", false
+	}
+	return m.migration, true
+}
 
 // ActiveTimeFloorSeq returns the first seq of the first tail block (active
 // blocks, then hot batches) witnessed at or after timeUS, or NextSeq when

@@ -747,6 +747,12 @@ type SealCommit struct {
 
 // Seal is the §10.8 seal transaction.
 func (s *Session) Seal(ctx context.Context, sl Seal) (SealCommit, error) {
+	return s.seal(ctx, sl, nil)
+}
+
+// seal is Seal. A non-nil migration read is ImportSeal's: the transaction
+// also reads the migration state and refuses unless it is importing.
+func (s *Session) seal(ctx context.Context, sl Seal, migration *MetaRead) (SealCommit, error) {
 	hdr, err := segment.ReadSealedHeader(bytes.NewReader(sl.Header))
 	if err != nil {
 		return SealCommit{}, s.fail(fmt.Errorf("catalog: seal %s segment %d: %w", sl.Namespace, sl.Segment, err))
@@ -760,8 +766,17 @@ func (s *Session) Seal(ctx context.Context, sl Seal) (SealCommit, error) {
 		refs = append(refs, ObjectRef{ID: b.ObjectID})
 	}
 	seg, objs := &ActiveSegmentRead{Namespace: sl.Namespace}, newObjectReads(refs...)
+	reads := append([]Read{seg}, objs.reads()...)
+	if migration != nil {
+		reads = append(reads, migration)
+	}
 	var out SealCommit
-	rev, err := s.run(ctx, TxSeal, append([]Read{seg}, objs.reads()...), func(tx Tx, rev uint64) error {
+	rev, err := s.run(ctx, TxSeal, reads, func(tx Tx, rev uint64) error {
+		if migration != nil {
+			if err := checkImporting(migration); err != nil {
+				return err
+			}
+		}
 		if !seg.Found || seg.Row.Index != sl.Segment {
 			return Corruptf(SourceSeal, "%s segment %d is not the active segment", sl.Namespace, sl.Segment)
 		}

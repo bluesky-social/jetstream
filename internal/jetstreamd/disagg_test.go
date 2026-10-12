@@ -14,6 +14,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd/jetstreamdtest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
+	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/objstore/memblob"
 	"github.com/bluesky-social/jetstream/internal/storagefake"
@@ -184,5 +185,68 @@ func TestRunDisaggregated_GCCorruptionIsFatal(t *testing.T) {
 			defer closeCancel()
 			require.NoError(t, rt.Close(closeCtx))
 		})
+	}
+}
+
+// A pod never runs a writer session on a catalog a migration still owns,
+// though the lease is free and there is no phase: the orchestrator would
+// bootstrap on top of the import. Once the migration is done, a pod takes
+// the lease and runs one (migration plan §6.2).
+func TestRunDisaggregated_StandsByDuringMigration(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	fake := jetstreamdtest.New(storagefake.Config{})
+	require.NoError(t, fake.InitMigration(ctx))
+	epoch := fake.DB.Archive().WriterEpoch
+
+	started := make(chan uint64, 1)
+	opts := disaggOptions(t, fake.Backend)
+	opts.Migration.StandbyBackoff = 10 * time.Millisecond
+	opts.OnSessionStart = func(e uint64) {
+		select {
+		case started <- e:
+		default:
+		}
+	}
+	rt, err := jetstreamd.Build(ctx, opts)
+	require.NoError(t, err)
+	runCtx, cancel := context.WithCancel(ctx)
+	runErr := make(chan error, 1)
+	go func() { runErr <- rt.Run(runCtx) }()
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, <-runErr)
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		require.NoError(t, rt.Close(closeCtx))
+	})
+
+	steps := []catalog.MigrationState{catalog.MigrationSeeding, catalog.MigrationTailing, catalog.MigrationHandingOff}
+	for i, st := range steps[1:] {
+		select {
+		case e := <-started:
+			t.Fatalf("session %d started in %s", e, steps[i])
+		case <-time.After(200 * time.Millisecond):
+		}
+		var meta []metastore.Op
+		if st == catalog.MigrationTailing {
+			meta = append(meta, metastore.Op{Kind: metastore.OpSet, Key: []byte(lifecycle.PhaseKey), Value: []byte(lifecycle.PhaseSteadyState)})
+		}
+		require.NoError(t, fake.SetMigration(ctx, steps[i], st, meta...))
+	}
+	select {
+	case e := <-started:
+		t.Fatalf("session %d started in handing_off", e)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Every acquire was the test's own: the pod never took the lease.
+	require.Equal(t, epoch+2, fake.DB.Archive().WriterEpoch)
+
+	require.NoError(t, fake.SetMigration(ctx, catalog.MigrationHandingOff, catalog.MigrationDone))
+	select {
+	case e := <-started:
+		require.Greater(t, e, epoch+2)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no session after the migration finished")
 	}
 }

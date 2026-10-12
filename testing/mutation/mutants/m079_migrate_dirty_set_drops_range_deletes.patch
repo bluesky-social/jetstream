@@ -1,0 +1,25 @@
+mutant: m079_migrate_dirty_set_drops_range_deletes
+target: internal/migrate/meta.go
+failure-mode: |
+  The migration's changed-key set drops the ranges of Pebble range
+  deletes. Point writes still reach the catalog, but keys a DeleteRange
+  removes locally stay in the catalog until the next full resync, so a
+  handoff between resyncs hands the pods metadata the source no longer has.
+expected-detection: |
+  TestMetaSync_ResyncAndFlush range-deletes repo/ after a resync and
+  requires the next flush to leave the catalog equal to the source.
+expected-tier: migration
+tiers: migration
+
+diff --git a/internal/migrate/meta.go b/internal/migrate/meta.go
+index 56211ff..e62911e 100644
+--- a/internal/migrate/meta.go
++++ b/internal/migrate/meta.go
+@@ -46,7 +46,6 @@ func (d *dirtySet) observe(keys [][]byte, ranges [][2][]byte) {
+ 		}
+ 		d.keys[string(k)] = struct{}{}
+ 	}
+-	d.ranges = append(d.ranges, ranges...)
+ 	if len(d.keys)+len(d.ranges) > d.max {
+ 		d.keys, d.ranges, d.overflow = map[string]struct{}{}, nil, true
+ 		d.metrics.overflow()

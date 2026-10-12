@@ -242,8 +242,8 @@ const DefaultBlockCacheBytes = 1 << 30
 // the catalog and fetcher supply the blocks.
 //
 // A disaggregated pod has no writer: it sets Floor instead of WriterRef,
-// and Keyer to cache blocks by content (design §11.4). Its seqs have no
-// registered gaps.
+// Gaps for the vacancies a migrated local archive registered, and Keyer to
+// cache blocks by content (design §11.4).
 type ColdReaderConfig struct {
 	Catalog catalog.Catalog
 	Fetcher catalog.Fetcher
@@ -253,7 +253,10 @@ type ColdReaderConfig struct {
 	WriterRef *atomic.Pointer[ingest.Writer]
 	// Floor, used when WriterRef is nil, returns the readable log's floor,
 	// or ok=false while there is no log yet.
-	Floor           func() (floor uint64, ok bool)
+	Floor func() (floor uint64, ok bool)
+	// Gaps, used with Floor, returns the registered seq vacancies. Nil
+	// means none.
+	Gaps            func() *seqspace.Gaps
 	Keyer           BlockKeyer
 	BlockCacheBytes int // 0 -> DefaultBlockCacheBytes
 	Metrics         *Metrics
@@ -271,6 +274,7 @@ type ColdReader struct {
 	ready     func(context.Context) error
 	writerRef *atomic.Pointer[ingest.Writer]
 	floor     func() (uint64, bool)
+	gaps      func() *seqspace.Gaps
 	cache     *blockCache
 	metrics   *Metrics
 }
@@ -292,6 +296,7 @@ func NewColdReader(cfg ColdReaderConfig) *ColdReader {
 		ready:     cfg.Ready,
 		writerRef: cfg.WriterRef,
 		floor:     cfg.Floor,
+		gaps:      cfg.Gaps,
 		cache:     cache,
 		metrics:   cfg.Metrics,
 	}
@@ -319,7 +324,11 @@ func (r *ColdReader) floorAndGaps() (uint64, *seqspace.Gaps, bool) {
 	}
 	if r.floor != nil {
 		floor, ok := r.floor()
-		return floor, nil, ok
+		var gaps *seqspace.Gaps
+		if r.gaps != nil {
+			gaps = r.gaps()
+		}
+		return floor, gaps, ok
 	}
 	return 0, nil, false
 }
