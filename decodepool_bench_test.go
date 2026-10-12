@@ -63,13 +63,25 @@ func buildLikeBlockFrame(tb testing.TB, n int) []byte {
 // ceiling on single-core decode throughput.
 func BenchmarkDecodeFrameBlock(b *testing.B) {
 	frame := buildLikeBlockFrame(b, 4096)
-	d := newDownloader(nil, 1, nil)
-	b.ReportAllocs()
-	b.SetBytes(int64(len(frame)))
-	for b.Loop() {
-		events, err := d.decodeFrame(frame, "seg_bench.jss", 0)
-		if err != nil || len(events) != 4096 {
-			b.Fatalf("decode: %v (n=%d)", err, len(events))
-		}
+	for _, mode := range []struct {
+		name string
+		mode recordDecodeMode
+	}{
+		{"map", recordDecodeMode{}},
+		{"raw", recordDecodeMode{raw: true}},
+		{"raw-copied", recordDecodeMode{raw: true, copyCBOR: true}},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			d := newDownloader(nil, 1, nil)
+			d.setRecordMode(mode.mode)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(frame)))
+			for b.Loop() {
+				events, err := d.decodeFrame(frame, "seg_bench.jss", 0)
+				if err != nil || len(events) != 4096 {
+					b.Fatalf("decode: %v (n=%d)", err, len(events))
+				}
+			}
+		})
 	}
 }
