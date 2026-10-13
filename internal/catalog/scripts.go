@@ -138,7 +138,7 @@ func (s *Session) ended() error {
 // run is the shape every leader write transaction takes: fence first, with
 // reads in its round trip, then the script body, NOTIFY, commit. Any error
 // rolls back and ends the session; a failed COMMIT is an unknown result and
-// is never retried.
+// is never retried. A guarded write that fails is corruption (Tx).
 //
 // The archive row lock is held from the fence to COMMIT, and every leader
 // transaction waits for it, so a script passes every read it can name up
@@ -153,9 +153,12 @@ func (s *Session) run(ctx context.Context, kind TxKind, reads []Read, body func(
 	}
 	rev, err := s.runBody(ctx, kind, tx, reads, body)
 	if err == nil {
-		if err = tx.Commit(ctx); err != nil {
+		if err = tx.Commit(ctx); err != nil && !errors.Is(err, ErrPrecondition) {
 			err = sessionEnded(string(kind)+": commit result unknown", err)
 		}
+	}
+	if errors.Is(err, ErrPrecondition) {
+		err = Corruptf(SourceInvariant, "%s: a guarded write changed no row: %v", kind, err)
 	}
 	if err != nil {
 		_ = tx.Rollback(context.WithoutCancel(ctx))
@@ -176,7 +179,8 @@ func (s *Session) run(ctx context.Context, kind TxKind, reads []Read, body func(
 // transaction took the revision, the epoch is stale, or a check failed.
 // The caller then runs the script the ordinary way, which tells those
 // apart. That is the one retry a session makes, and only of a transaction
-// known not to have committed.
+// known not to have committed. Its body makes no guarded write, which
+// would fail the same way.
 func (s *Session) runAt(ctx context.Context, kind TxKind, checks []MetaCheck, body func(tx Tx, rev uint64) error) (rev uint64, ok bool, err error) {
 	if err := s.ended(); err != nil {
 		return 0, false, err
@@ -921,29 +925,26 @@ func (s *Session) PublishGeneration(ctx context.Context, p Publish) (PublishComm
 	for _, b := range p.Blocks {
 		refs = append(refs, b.Object)
 	}
+	// Every read rides with the fence, and every write is queued, so the
+	// archive row lock is held for COMMIT's round trip alone: a compaction
+	// pass publishes thousands of generations, and each round trip under the
+	// lock is one every live event's hot batch commit waits behind.
 	objs := newObjectReads(append(refs, p.Footer)...)
+	seg := &SegmentRead{Namespace: Main, Index: p.Segment}
+	src := &GenerationRead{ID: p.Source}
+	srcBlocks := &GenerationBlocksRead{ID: p.Source}
+	newGen := &NewGenerationIDRead{}
+	reads := append([]Read{seg, src, srcBlocks, newGen}, objs.reads()...)
 	var out PublishCommit
-	rev, err := s.run(ctx, TxCompaction, objs.reads(), func(tx Tx, rev uint64) error {
-		seg, found, err := tx.SegmentForUpdate(ctx, Main, p.Segment)
-		if err != nil {
-			return err
-		}
-		if !found || seg.State != Sealed || seg.GenerationID != p.Source {
+	rev, err := s.run(ctx, TxCompaction, reads, func(tx Tx, rev uint64) error {
+		if !seg.Found || seg.Row.State != Sealed || seg.Row.GenerationID != p.Source {
 			return Corruptf(SourceCompaction, "main segment %d is not sealed at generation %d (found=%t, %v)",
-				p.Segment, p.Source, found, seg)
+				p.Segment, p.Source, seg.Found, seg.Row)
 		}
-		src, found, err := tx.Generation(ctx, p.Source)
-		if err != nil {
-			return err
-		}
-		if !found {
+		if !src.Found {
 			return Corruptf(SourceCompaction, "main segment %d names missing generation %d", p.Segment, p.Source)
 		}
-		srcBlocks, err := tx.BlocksOfGeneration(ctx, p.Source)
-		if err != nil {
-			return err
-		}
-		if err := checkPublish(p, hdr, src, srcBlocks); err != nil {
+		if err := checkPublish(p, hdr, src.Row, srcBlocks.Rows); err != nil {
 			return err
 		}
 		ids, err := objs.resolve(ctx, tx)
@@ -951,15 +952,15 @@ func (s *Session) PublishGeneration(ctx context.Context, p Publish) (PublishComm
 			return err
 		}
 		out.ObjectIDs, ids = ids[:len(p.Blocks)], ids[len(p.Blocks):]
-		footerID := ids[0]
-		gen, err := tx.InsertGeneration(ctx, GenerationRow{
+		footerID, gen := ids[0], newGen.ID
+		if err := tx.InsertGenerationAt(ctx, GenerationRow{
+			ID:             gen,
 			Namespace:      Main,
 			Segment:        p.Segment,
 			Header:         p.Header,
 			FooterObjectID: footerID,
 			Revision:       rev,
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 		gbs := make([]GenerationBlockRow, len(p.Blocks))
@@ -969,18 +970,14 @@ func (s *Session) PublishGeneration(ctx context.Context, p Publish) (PublishComm
 		if err := tx.InsertGenerationBlocks(ctx, gbs); err != nil {
 			return err
 		}
-		ok, err := tx.SetSegmentGeneration(ctx, Main, p.Segment, gen, rev)
-		if err != nil {
+		// The segment row is locked, and the checks above found it sealed at
+		// the source generation, so neither guard can fail unless the
+		// catalog changed under the lock.
+		if err := tx.SetSegmentGeneration(ctx, Main, p.Segment, gen, rev); err != nil {
 			return err
 		}
-		if !ok {
-			return Corruptf(SourceCompaction, "main segment %d stopped being sealed mid-publish", p.Segment)
-		}
-		if ok, err = tx.DeleteGeneration(ctx, p.Source); err != nil {
+		if err := tx.DeleteGeneration(ctx, p.Source); err != nil {
 			return err
-		}
-		if !ok {
-			return Corruptf(SourceCompaction, "generation %d vanished mid-publish", p.Source)
 		}
 		out.GenerationID, out.FooterObjectID = gen, footerID
 		return nil

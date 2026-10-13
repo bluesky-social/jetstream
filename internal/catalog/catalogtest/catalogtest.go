@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"testing"
@@ -56,6 +57,7 @@ func Run(t *testing.T, newBackend func(t *testing.T) Backend) {
 		{"ActiveBlockConstraints", testActiveBlockConstraints},
 		{"GenerationConstraints", testGenerationConstraints},
 		{"ReplaceGeneration", testReplaceGeneration},
+		{"GuardedWrites", testGuardedWrites},
 		{"GC", testGC},
 		{"DeleteNamespace", testDeleteNamespace},
 		{"ReaderSnapshot", testReaderSnapshot},
@@ -382,7 +384,8 @@ func testFenceReads(t *testing.T, b Backend) {
 	require.NoError(t, err)
 	defer func() { _ = stale.Rollback(context.Background()) }()
 	meta = &catalog.MetaRead{Key: []byte("k")}
-	_, ok, err = stale.FenceBump(ctx, epoch+1, meta, &catalog.ObjectsRead{IDs: []uint64{obj}}, &catalog.ActiveSegmentRead{Namespace: catalog.Main})
+	_, ok, err = stale.FenceBump(ctx, epoch+1, meta, &catalog.ObjectsRead{IDs: []uint64{obj}}, &catalog.ActiveSegmentRead{Namespace: catalog.Main},
+		&catalog.SegmentRead{Namespace: catalog.Main, Index: 0})
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.False(t, meta.Found, "the read did not run")
@@ -390,7 +393,8 @@ func testFenceReads(t *testing.T, b Backend) {
 	defer cancel()
 	tx, err = b.DB.Begin(quick, catalog.TxMetadata)
 	require.NoError(t, err)
-	_, ok, err = tx.FenceBump(quick, epoch, &catalog.MetaRead{Key: []byte("k")}, &catalog.ObjectsRead{IDs: []uint64{obj}}, &catalog.ActiveSegmentRead{Namespace: catalog.Main})
+	_, ok, err = tx.FenceBump(quick, epoch, &catalog.MetaRead{Key: []byte("k")}, &catalog.ObjectsRead{IDs: []uint64{obj}}, &catalog.ActiveSegmentRead{Namespace: catalog.Main},
+		&catalog.SegmentRead{Namespace: catalog.Main, Index: 0})
 	require.NoError(t, err, "the leader waited on the stale transaction's row locks")
 	require.True(t, ok)
 	require.NoError(t, tx.ClearUnreferenced(quick, []uint64{obj}))
@@ -984,64 +988,163 @@ func testReplaceGeneration(t *testing.T, b Backend) {
 	b1 := availableObject(t, b, epoch, []byte("b1"))
 	b2 := availableObject(t, b, epoch, []byte("b2"))
 	src := sealedMain(t, b, epoch, f1, b1, b2)
-	var gen uint64
-	r := write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
-		seg, found, err := tx.SegmentForUpdate(ctx, catalog.Main, 0)
-		require.NoError(t, err)
-		require.True(t, found)
-		require.Equal(t, catalog.Sealed, seg.State)
-		require.Equal(t, src, seg.GenerationID)
-		_, found, err = tx.SegmentForUpdate(ctx, catalog.Main, 1)
-		require.NoError(t, err)
-		require.False(t, found)
 
-		g, found, err := tx.Generation(ctx, src)
-		require.NoError(t, err)
-		require.True(t, found)
-		require.Equal(t, f1, g.FooterObjectID)
-		require.Equal(t, header(), g.Header)
-		_, found, err = tx.Generation(ctx, 1<<40)
-		require.NoError(t, err)
-		require.False(t, found)
-		gbs, err := tx.BlocksOfGeneration(ctx, src)
-		require.NoError(t, err)
-		require.Equal(t, []catalog.GenerationBlockRow{
-			{GenerationID: src, Ordinal: 0, ObjectID: b1, CompressedLength: 10},
-			{GenerationID: src, Ordinal: 1, ObjectID: b2, CompressedLength: 11},
-		}, gbs)
-
-		gen, err = tx.InsertGeneration(ctx, catalog.GenerationRow{Namespace: catalog.Main, Header: header(), FooterObjectID: f2, Revision: rev})
-		require.NoError(t, err)
-		require.NoError(t, tx.InsertGenerationBlocks(ctx, []catalog.GenerationBlockRow{
-			{GenerationID: gen, Ordinal: 0, ObjectID: b1, CompressedLength: 10},
-		}))
-		ok, err := tx.SetSegmentGeneration(ctx, catalog.Main, 0, gen, rev)
-		require.NoError(t, err)
-		require.True(t, ok)
-		ok, err = tx.DeleteGeneration(ctx, src)
-		require.NoError(t, err)
-		require.True(t, ok)
-		ok, err = tx.DeleteGeneration(ctx, src)
-		require.NoError(t, err)
-		require.False(t, ok)
-		gbs, err = tx.BlocksOfGeneration(ctx, src)
-		require.NoError(t, err)
-		require.Empty(t, gbs, "deleting a generation deletes its blocks")
-	})
-	segs, err := read(t, b).SegmentsSince(ctxT(t), 0)
+	// Everything a publish reads rides with the fence, and everything it
+	// writes is queued.
+	ctx := ctxT(t)
+	tx, err := b.DB.Begin(ctx, catalog.TxCompaction)
 	require.NoError(t, err)
-	require.Equal(t, []catalog.SegmentRow{{Namespace: catalog.Main, Index: 0, State: catalog.Sealed, GenerationID: gen, Revision: r}}, segs)
+	seg, other := &catalog.SegmentRead{Namespace: catalog.Main, Index: 0}, &catalog.SegmentRead{Namespace: catalog.Main, Index: 1}
+	g, missing := &catalog.GenerationRead{ID: src}, &catalog.GenerationRead{ID: 1 << 40}
+	gbs, none := &catalog.GenerationBlocksRead{ID: src}, &catalog.GenerationBlocksRead{ID: 1 << 40}
+	id1, id2 := &catalog.NewGenerationIDRead{}, &catalog.NewGenerationIDRead{}
+	rev, ok, err := tx.FenceBump(ctx, epoch, seg, other, g, missing, gbs, none, id1, id2)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, seg.Found)
+	require.Equal(t, catalog.SegmentRow{Namespace: catalog.Main, Index: 0, State: catalog.Sealed, GenerationID: src, Revision: seg.Row.Revision}, seg.Row)
+	require.False(t, other.Found)
+	require.True(t, g.Found)
+	require.Equal(t, src, g.Row.ID)
+	require.Equal(t, f1, g.Row.FooterObjectID)
+	require.Equal(t, header(), g.Row.Header)
+	require.False(t, missing.Found)
+	require.Equal(t, []catalog.GenerationBlockRow{
+		{GenerationID: src, Ordinal: 0, ObjectID: b1, CompressedLength: 10},
+		{GenerationID: src, Ordinal: 1, ObjectID: b2, CompressedLength: 11},
+	}, gbs.Rows)
+	require.Empty(t, none.Rows)
+	require.Greater(t, id1.ID, src, "a reserved ID follows every inserted one")
+	require.Greater(t, id2.ID, id1.ID, "each reservation is a new ID")
 
-	// Only a sealed segment changes generation.
+	gen := id2.ID
+	require.NoError(t, tx.InsertGenerationAt(ctx, catalog.GenerationRow{ID: gen, Namespace: catalog.Main, Header: header(), FooterObjectID: f2, Revision: rev}))
+	require.NoError(t, tx.InsertGenerationBlocks(ctx, []catalog.GenerationBlockRow{
+		{GenerationID: gen, Ordinal: 0, ObjectID: b1, CompressedLength: 10},
+	}))
+	require.NoError(t, tx.SetSegmentGeneration(ctx, catalog.Main, 0, gen, rev))
+	require.NoError(t, tx.DeleteGeneration(ctx, src))
+	after := &catalog.GenerationBlocksRead{ID: src}
+	require.NoError(t, tx.Read(ctx, after))
+	require.Empty(t, after.Rows, "deleting a generation deletes its blocks")
+	require.NoError(t, tx.Notify(ctx, rev))
+	require.NoError(t, tx.Commit(ctx))
+
+	snap := snapshot(t, b)
+	require.Equal(t, []catalog.SegmentRow{{Namespace: catalog.Main, Index: 0, State: catalog.Sealed, GenerationID: gen, Revision: rev}}, snap.Segments)
+	require.Equal(t, []uint64{gen}, slices.Sorted(maps.Keys(snap.Generations)))
+	require.Equal(t, f2, snap.Generations[gen].FooterObjectID)
+	require.Equal(t, rev, snap.Generations[gen].Revision)
+	require.Len(t, snap.GenerationBlocks[gen], 1)
+
+	// A reservation is not transactional: one a rolled-back transaction
+	// took is never handed out again, and InsertGeneration draws from the
+	// same sequence.
+	tx, _ = begin(t, b, epoch)
+	lost := &catalog.NewGenerationIDRead{}
+	require.NoError(t, tx.Read(ctx, lost))
+	require.NoError(t, tx.Rollback(ctx))
+	var inserted uint64
+	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
+		next := &catalog.NewGenerationIDRead{}
+		require.NoError(t, tx.Read(ctx, next))
+		require.Greater(t, next.ID, lost.ID)
+		inserted, err = tx.InsertGeneration(ctx, catalog.GenerationRow{Namespace: catalog.Main, Header: header(), FooterObjectID: f1, Revision: rev})
+		require.NoError(t, err)
+		require.Greater(t, inserted, next.ID)
+		require.NoError(t, tx.DeleteGeneration(ctx, inserted))
+	})
+
+	t.Run("reserved ID taken", func(t *testing.T) {
+		failing(t, b, epoch, func(ctx context.Context, tx catalog.Tx) error {
+			return tx.InsertGenerationAt(ctx, catalog.GenerationRow{ID: gen, Namespace: catalog.Main, Header: header(), FooterObjectID: f2})
+		})
+	})
+	t.Run("reserved row checks", func(t *testing.T) {
+		for name, row := range map[string]catalog.GenerationRow{
+			"short header":    {Namespace: catalog.Main, Header: make([]byte, 255), FooterObjectID: f2},
+			"missing footer":  {Namespace: catalog.Main, Header: header(), FooterObjectID: 1 << 40},
+			"missing segment": {Namespace: catalog.Main, Segment: 3, Header: header(), FooterObjectID: f2},
+			"bigint ID":       {ID: math.MaxInt64 + 1, Namespace: catalog.Main, Header: header(), FooterObjectID: f2},
+		} {
+			t.Run(name, func(t *testing.T) {
+				failing(t, b, epoch, func(ctx context.Context, tx catalog.Tx) error {
+					if row.ID == 0 {
+						id := &catalog.NewGenerationIDRead{}
+						if err := tx.Read(ctx, id); err != nil {
+							return errors.Join(errors.New("unexpected"), err)
+						}
+						row.ID = id.ID
+					}
+					return tx.InsertGenerationAt(ctx, row)
+				})
+			})
+		}
+	})
+}
+
+// testGuardedWrites pins the guarded writes (catalog.Tx): one that changes
+// no row aborts the transaction, and Commit, or whichever call reports it
+// first, returns ErrPrecondition. Nothing queued around it commits, the
+// revision does not move, and the archive row lock is released.
+func testGuardedWrites(t *testing.T, b Backend) {
+	_, epoch := acquire(t, b)
+	f := availableObject(t, b, epoch, []byte("f"))
+	src := sealedMain(t, b, epoch, f)
 	write(t, b, epoch, func(ctx context.Context, tx catalog.Tx, rev uint64) {
 		require.NoError(t, tx.InsertSegment(ctx, catalog.SegmentRow{Namespace: catalog.Main, Index: 1, State: catalog.Active, Revision: rev}))
-		ok, err := tx.SetSegmentGeneration(ctx, catalog.Main, 1, gen, rev)
-		require.NoError(t, err)
-		require.False(t, ok)
-		ok, err = tx.SetSegmentGeneration(ctx, catalog.Main, 2, gen, rev)
-		require.NoError(t, err)
-		require.False(t, ok)
 	})
+	before := snapshot(t, b)
+
+	guards := map[string]func(ctx context.Context, tx catalog.Tx, rev uint64) error{
+		"active segment": func(ctx context.Context, tx catalog.Tx, rev uint64) error {
+			return tx.SetSegmentGeneration(ctx, catalog.Main, 1, src, rev)
+		},
+		"missing segment": func(ctx context.Context, tx catalog.Tx, rev uint64) error {
+			return tx.SetSegmentGeneration(ctx, catalog.Main, 2, src, rev)
+		},
+		"other namespace": func(ctx context.Context, tx catalog.Tx, rev uint64) error {
+			return tx.SetSegmentGeneration(ctx, catalog.BootstrapLive, 0, src, rev)
+		},
+		"missing generation": func(ctx context.Context, tx catalog.Tx, _ uint64) error {
+			return tx.DeleteGeneration(ctx, src+1000)
+		},
+		"generation deleted twice": func(ctx context.Context, tx catalog.Tx, rev uint64) error {
+			if err := tx.DeleteGeneration(ctx, src); err != nil {
+				return err
+			}
+			return tx.DeleteGeneration(ctx, src)
+		},
+	}
+	reporters := map[string]func(ctx context.Context, tx catalog.Tx) error{
+		"commit": func(ctx context.Context, tx catalog.Tx) error { return tx.Commit(ctx) },
+		"read": func(ctx context.Context, tx catalog.Tx) error {
+			return tx.Read(ctx, &catalog.SegmentRead{Namespace: catalog.Main, Index: 0})
+		},
+	}
+	for name, guard := range guards {
+		for via, report := range reporters {
+			t.Run(name+"/reported by "+via, func(t *testing.T) {
+				ctx := ctxT(t)
+				tx, rev := begin(t, b, epoch)
+				require.NoError(t, tx.ApplyMeta(ctx, []metastore.Op{{Kind: metastore.OpSet, Key: []byte("guarded"), Value: []byte("v")}}))
+				require.NoError(t, guard(ctx, tx, rev), "a guarded write is queued")
+				require.NoError(t, tx.Notify(ctx, rev))
+				err := report(ctx, tx)
+				require.ErrorIs(t, err, catalog.ErrPrecondition)
+				require.Error(t, tx.Commit(ctx), "an aborted transaction does not commit")
+				require.NoError(t, tx.Rollback(ctx))
+
+				after := snapshot(t, b)
+				require.Equal(t, before.Archive.CatalogRevision, after.Archive.CatalogRevision, "the revision did not move")
+				require.Equal(t, before.Segments, after.Segments)
+				require.Equal(t, before.Generations, after.Generations)
+				require.NotContains(t, after.Meta, "guarded", "writes queued around the guard did not commit")
+			})
+		}
+	}
+	// The archive row lock went with every aborted transaction.
+	write(t, b, epoch, func(context.Context, catalog.Tx, uint64) {})
 }
 
 func testGC(t *testing.T, b Backend) {

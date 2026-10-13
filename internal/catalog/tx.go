@@ -72,11 +72,19 @@ type MetaCheck struct {
 //
 // A method that returns only an error and writes (ApplyMeta, InsertObjects,
 // SetObjectsAvailable, ClearUnreferenced, InsertHotBatch, InsertActiveBlock,
-// InsertGenerationBlocks, InsertSegment, DeleteNamespace, Notify) may be
-// queued and sent with a later statement, to save a round trip. Its failure
-// is then reported by the first later call, at the latest Commit, and the
+// InsertGenerationAt, InsertGenerationBlocks, InsertSegment, DeleteNamespace,
+// SetSegmentGeneration, DeleteGeneration, Notify) may be queued and sent
+// with a later statement, to save a round trip. Its failure is then
+// reported by the first later call, at the latest Commit, and the
 // transaction aborts as it would have anyway. Scripts treat every error
 // alike, so none depends on which call reports it.
+//
+// A guarded write is a queued write of one row, by its key, that must find
+// the row. A script that needed to know whether it did would have to wait a
+// round trip for the answer, so instead a write that changes no row aborts
+// the transaction as a failed FenceBumpAt precondition does. A script reads
+// and checks the row, under its row lock, before queuing the write, so a
+// guard that fails means the catalog changed under a lock: corruption.
 //
 // Reads are batched the same way: FenceBump carries a script's reads in the
 // fence's round trip, and Read sends several in one. Over a WAN link the
@@ -144,18 +152,18 @@ type Tx interface {
 	// and active block row of ns.
 	DeleteNamespace(ctx context.Context, ns Namespace) error
 
-	// SegmentForUpdate returns one segments row, row-locked.
-	SegmentForUpdate(ctx context.Context, ns Namespace, idx uint64) (SegmentRow, bool, error)
-	// Generation returns one segment_generations row.
-	Generation(ctx context.Context, id uint64) (GenerationRow, bool, error)
-	// BlocksOfGeneration returns a generation's blocks in ordinal order.
-	BlocksOfGeneration(ctx context.Context, id uint64) ([]GenerationBlockRow, error)
-	// SetSegmentGeneration points a sealed segment at generation gen.
-	// ok=false when the segment is not sealed.
-	SetSegmentGeneration(ctx context.Context, ns Namespace, idx, gen, revision uint64) (ok bool, err error)
+	// InsertGenerationAt is InsertGeneration for a row whose ID a
+	// NewGenerationIDRead reserved. It is queued.
+	InsertGenerationAt(ctx context.Context, row GenerationRow) error
+	// SetSegmentGeneration points a sealed segment at generation gen. It is
+	// a guarded write: queued, and if the segment is not sealed the
+	// transaction aborts with nothing applied, and the call that reports it,
+	// at the latest Commit, returns ErrPrecondition.
+	SetSegmentGeneration(ctx context.Context, ns Namespace, idx, gen, revision uint64) error
 	// DeleteGeneration deletes a segment_generations row and, by cascade,
-	// its generation_blocks. ok=false when no row has that ID.
-	DeleteGeneration(ctx context.Context, id uint64) (ok bool, err error)
+	// its generation_blocks. It is a guarded write, failing as
+	// SetSegmentGeneration does when no row has that ID.
+	DeleteGeneration(ctx context.Context, id uint64) error
 
 	// MarkUnreferenced is one page of the §13 mark: of the available
 	// objects with unreferenced_at NULL and object_id > after, it takes the
