@@ -341,3 +341,81 @@ func TestScripts_GCClaimReferenced(t *testing.T) {
 		require.Zero(t, h.objectStates()[catalog.ObjectDeleting], "the failed claim rolled back")
 	})
 }
+
+// misdirectDB aims every SetSegmentGeneration or DeleteGeneration at a row
+// that does not exist, standing in for a catalog that changed under the
+// publish's locks.
+type misdirectDB struct {
+	catalog.DB
+	segment, generation bool
+}
+
+func (d *misdirectDB) Begin(ctx context.Context, kind catalog.TxKind) (catalog.Tx, error) {
+	tx, err := d.DB.Begin(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+	return &misdirectTx{Tx: tx, db: d}, nil
+}
+
+type misdirectTx struct {
+	catalog.Tx
+	db *misdirectDB
+}
+
+func (tx *misdirectTx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) error {
+	if tx.db.segment {
+		idx += 1000
+	}
+	return tx.Tx.SetSegmentGeneration(ctx, ns, idx, gen, revision)
+}
+
+func (tx *misdirectTx) DeleteGeneration(ctx context.Context, id uint64) error {
+	if tx.db.generation {
+		id += 1000
+	}
+	return tx.Tx.DeleteGeneration(ctx, id)
+}
+
+// A publish checks the segment and source generation under the segment's
+// row lock before it queues the writes that depend on them, so a guarded
+// write that changes no row can only mean the catalog changed under the
+// lock: corruption, with nothing committed.
+func TestScripts_PublishGenerationGuardIsCorruption(t *testing.T) {
+	t.Parallel()
+	eachBackend(t, func(t *testing.T, be backend) {
+		for name, db := range map[string]*misdirectDB{
+			"segment":    {segment: true},
+			"generation": {generation: true},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				h := newHarness(t, be)
+				sg := h.sealed()
+				p, _, _ := h.rewrite(sg.commit.GenerationID, sg.seal.Header, sg.footer, sg.frames, sg.seal.Blocks, 5)
+				before, err := h.snapshot()
+				require.NoError(t, err)
+
+				db.DB = h.db
+				s := catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: h.lock.Epoch()})
+				_, err = s.PublishGeneration(t.Context(), p)
+				requireCorruption(t, err, catalog.SourceInvariant)
+				require.ErrorIs(t, s.Err(), err, "the session ended")
+
+				after, err := h.snapshot()
+				require.NoError(t, err)
+				require.Equal(t, before.Archive.CatalogRevision, after.Archive.CatalogRevision, "nothing committed")
+				require.Equal(t, before.Segments, after.Segments)
+				require.Equal(t, before.Generations, after.Generations)
+				require.Equal(t, before.GenerationBlocks, after.GenerationBlocks)
+				require.Equal(t, before.Objects, after.Objects, "the new objects stayed uploading")
+
+				// The lock went with the rolled-back transaction, and the
+				// same publish through a correct backend still succeeds.
+				h.newSession()
+				_, err = h.s.PublishGeneration(t.Context(), p)
+				require.NoError(t, err)
+			})
+		}
+	})
+}

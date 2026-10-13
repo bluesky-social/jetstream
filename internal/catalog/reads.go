@@ -54,8 +54,45 @@ type ObjectsRead struct {
 	Rows map[uint64]ObjectRow
 }
 
+// SegmentRead reads one segments row, row-locked.
+type SegmentRead struct {
+	Namespace Namespace
+	Index     uint64
+
+	Row   SegmentRow
+	Found bool
+}
+
+// GenerationRead reads one segment_generations row.
+type GenerationRead struct {
+	ID uint64
+
+	Row   GenerationRow
+	Found bool
+}
+
+// GenerationBlocksRead reads a generation's blocks in ordinal order.
+type GenerationBlocksRead struct {
+	ID uint64
+
+	Rows []GenerationBlockRow
+}
+
+// NewGenerationIDRead reserves a segment_generations ID for
+// Tx.InsertGenerationAt, so a script that inserts a generation needs no
+// round trip under the archive row lock to learn the ID. The reservation is
+// not transactional: an ID a transaction that rolled back reserved is never
+// used.
+type NewGenerationIDRead struct {
+	ID uint64
+}
+
 func (*MetaRead) read()             {}
 func (*ActiveSegmentRead) read()    {}
 func (*LastActiveBlockRead) read()  {}
 func (*AvailableObjectsRead) read() {}
 func (*ObjectsRead) read()          {}
+func (*SegmentRead) read()          {}
+func (*GenerationRead) read()       {}
+func (*GenerationBlocksRead) read() {}
+func (*NewGenerationIDRead) read()  {}

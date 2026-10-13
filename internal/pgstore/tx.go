@@ -92,13 +92,19 @@ func (e *queuedError) Error() string { return e.stmt + ": " + e.err.Error() }
 func (e *queuedError) Unwrap() error { return e.err }
 
 // fail marks the transaction failed and wraps err as session-ending. A
-// queued statement's failure is named for that statement.
+// queued statement's failure is named for that statement. A precondition
+// that a call other than Commit reports also stays ErrPrecondition, so a
+// script knows a guarded write failed whichever call reported it.
 func (t *tx) fail(stmt string, err error) error {
 	t.failed = true
 	t.span.RecordError(err)
+	pre := precondition(err)
 	if q, ok := errors.AsType[*queuedError](err); ok {
 		stmt = q.stmt + " (sent with " + stmt + ")"
 		err = q.err
+	}
+	if pre {
+		err = fmt.Errorf("%w: %w", catalog.ErrPrecondition, err)
 	}
 	return fmt.Errorf("%w: pgstore %s/%s: %w", catalog.ErrSessionEnded, t.kind, stmt, err)
 }
@@ -281,10 +287,13 @@ const fenceAtSQL = `WITH f AS (
 // no row lock: every writer of metadata_kv holds the fence.
 const metaCheckSQL = `SELECT 1 / count(*) FROM metadata_kv WHERE key = $1 AND value = $2`
 
-// The statement names whose division_by_zero is ErrPrecondition.
+// The statement names whose division_by_zero is ErrPrecondition: the
+// FenceBumpAt statements and the guarded writes (catalog.Tx).
 const (
-	stmtFenceAt   = "fence_at"
-	stmtMetaCheck = "meta_check"
+	stmtFenceAt              = "fence_at"
+	stmtMetaCheck            = "meta_check"
+	stmtSetSegmentGeneration = "set_segment_generation"
+	stmtDeleteGeneration     = "delete_generation"
 )
 
 func (t *tx) FenceBumpAt(_ context.Context, epoch, rev uint64, checks ...catalog.MetaCheck) error {
@@ -296,10 +305,16 @@ func (t *tx) FenceBumpAt(_ context.Context, epoch, rev uint64, checks ...catalog
 	return nil
 }
 
-// precondition reports whether err is a FenceBumpAt fence or check failing.
+// precondition reports whether err is a FenceBumpAt fence or check, or a
+// guarded write, failing.
 func precondition(err error) bool {
 	q, ok := errors.AsType[*queuedError](err)
-	if !ok || (q.stmt != stmtFenceAt && q.stmt != stmtMetaCheck) {
+	if !ok {
+		return false
+	}
+	switch q.stmt {
+	case stmtFenceAt, stmtMetaCheck, stmtSetSegmentGeneration, stmtDeleteGeneration:
+	default:
 		return false
 	}
 	pgErr, ok := errors.AsType[*pgconn.PgError](q.err)
@@ -467,6 +482,57 @@ func readStmtOf(r catalog.Read) (readStmt, error) {
 					r.Rows[o.ID] = o
 				}
 				return err
+			},
+		}, nil
+	case *catalog.SegmentRead:
+		return readStmt{
+			name: "segment_for_update",
+			sql:  `SELECT ` + segmentCols + ` FROM segments WHERE namespace = $1 AND segment_index = $2 FOR UPDATE`,
+			args: []any{string(r.Namespace), clampSeq(r.Index)},
+			scan: func(br pgx.BatchResults) error {
+				row, err := scanSegment(br.QueryRow())
+				r.Row, r.Found = row, err == nil
+				if errors.Is(err, pgx.ErrNoRows) {
+					r.Row, err = catalog.SegmentRow{}, nil
+				}
+				return err
+			},
+		}, nil
+	case *catalog.GenerationRead:
+		return readStmt{
+			name: "generation",
+			sql:  `SELECT ` + generationCols + ` FROM segment_generations WHERE generation_id = $1`,
+			args: []any{int64s([]uint64{r.ID})[0]},
+			scan: func(br pgx.BatchResults) error {
+				row, err := scanGeneration(br.QueryRow())
+				r.Row, r.Found = row, err == nil
+				if errors.Is(err, pgx.ErrNoRows) {
+					r.Row, err = catalog.GenerationRow{}, nil
+				}
+				return err
+			},
+		}, nil
+	case *catalog.GenerationBlocksRead:
+		return readStmt{
+			name: "generation_blocks",
+			sql: `SELECT generation_id, ordinal, object_id, compressed_length FROM generation_blocks
+			 WHERE generation_id = $1 ORDER BY ordinal`,
+			args: []any{int64s([]uint64{r.ID})[0]},
+			scan: func(br pgx.BatchResults) error {
+				rows, err := br.Query()
+				if err != nil {
+					return err
+				}
+				r.Rows, err = pgx.CollectRows(rows, scanGenerationBlock)
+				return err
+			},
+		}, nil
+	case *catalog.NewGenerationIDRead:
+		return readStmt{
+			name: "new_generation_id",
+			sql:  `SELECT nextval(pg_get_serial_sequence('segment_generations', 'generation_id'))`,
+			scan: func(br pgx.BatchResults) error {
+				return br.QueryRow().Scan(&r.ID)
 			},
 		}, nil
 	}
@@ -809,6 +875,14 @@ func (t *tx) InsertGeneration(ctx context.Context, r catalog.GenerationRow) (uin
 	return id, nil
 }
 
+func (t *tx) InsertGenerationAt(_ context.Context, r catalog.GenerationRow) error {
+	t.enqueue("insert_generation_at",
+		`INSERT INTO segment_generations (generation_id, namespace, segment_index, header, footer_object_id, revision)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		r.ID, string(r.Namespace), r.Segment, nonNil(r.Header), r.FooterObjectID, r.Revision)
+	return nil
+}
+
 func (t *tx) InsertGenerationBlocks(_ context.Context, rows []catalog.GenerationBlockRow) error {
 	gens := make([]uint64, len(rows))
 	ords := make([]int64, len(rows))
@@ -851,19 +925,6 @@ func (t *tx) DeleteNamespace(_ context.Context, ns catalog.Namespace) error {
 	return nil
 }
 
-func (t *tx) SegmentForUpdate(ctx context.Context, ns catalog.Namespace, idx uint64) (catalog.SegmentRow, bool, error) {
-	r, err := scanSegment(t.queryRow(ctx,
-		`SELECT `+segmentCols+` FROM segments WHERE namespace = $1 AND segment_index = $2 FOR UPDATE`,
-		string(ns), clampSeq(idx)))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return catalog.SegmentRow{}, false, nil
-	}
-	if err != nil {
-		return catalog.SegmentRow{}, false, t.fail("segment_for_update", err)
-	}
-	return r, true, nil
-}
-
 const generationCols = `generation_id, namespace, segment_index, header, footer_object_id, created_at, revision`
 
 func scanGeneration(row pgx.Row) (catalog.GenerationRow, error) {
@@ -876,56 +937,32 @@ func scanGeneration(row pgx.Row) (catalog.GenerationRow, error) {
 	return g, err
 }
 
-func (t *tx) Generation(ctx context.Context, id uint64) (catalog.GenerationRow, bool, error) {
-	g, err := scanGeneration(t.queryRow(ctx,
-		`SELECT `+generationCols+` FROM segment_generations WHERE generation_id = $1`, int64s([]uint64{id})[0]))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return catalog.GenerationRow{}, false, nil
-	}
-	if err != nil {
-		return catalog.GenerationRow{}, false, t.fail("generation", err)
-	}
-	return g, true, nil
-}
-
 func scanGenerationBlock(row pgx.CollectableRow) (catalog.GenerationBlockRow, error) {
 	var b catalog.GenerationBlockRow
 	err := row.Scan(&b.GenerationID, &b.Ordinal, &b.ObjectID, &b.CompressedLength)
 	return b, err
 }
 
-func (t *tx) BlocksOfGeneration(ctx context.Context, id uint64) ([]catalog.GenerationBlockRow, error) {
-	rows, err := t.query(ctx,
-		`SELECT generation_id, ordinal, object_id, compressed_length FROM generation_blocks
-		 WHERE generation_id = $1 ORDER BY ordinal`, int64s([]uint64{id})[0])
-	if err != nil {
-		return nil, t.fail("blocks_of_generation", err)
-	}
-	out, err := pgx.CollectRows(rows, scanGenerationBlock)
-	if err != nil {
-		return nil, t.fail("blocks_of_generation", err)
-	}
-	return out, nil
+// guardSQL wraps a write so it fails with division_by_zero, which makes
+// PostgreSQL skip the rest of the pipeline, unless it changed a row: the
+// fence's trick. The guarded writes are queued, so nothing waits on their
+// command tags.
+func guardSQL(write string) string {
+	return `WITH w AS (` + write + ` RETURNING 1) SELECT 1 / count(*) FROM w`
 }
 
-func (t *tx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) (bool, error) {
-	tag, err := t.exec(ctx,
+func (t *tx) SetSegmentGeneration(_ context.Context, ns catalog.Namespace, idx, gen, revision uint64) error {
+	t.enqueue(stmtSetSegmentGeneration, guardSQL(
 		`UPDATE segments SET current_generation_id = $3, revision = $4
-		 WHERE namespace = $1 AND segment_index = $2 AND state = 'sealed'`,
+		 WHERE namespace = $1 AND segment_index = $2 AND state = 'sealed'`),
 		string(ns), clampSeq(idx), nullID(gen), revision)
-	if err != nil {
-		return false, t.fail("set_segment_generation", err)
-	}
-	return tag.RowsAffected() == 1, nil
+	return nil
 }
 
-func (t *tx) DeleteGeneration(ctx context.Context, id uint64) (bool, error) {
+func (t *tx) DeleteGeneration(_ context.Context, id uint64) error {
 	// generation_blocks go with it (ON DELETE CASCADE).
-	tag, err := t.exec(ctx, `DELETE FROM segment_generations WHERE generation_id = $1`, int64s([]uint64{id})[0])
-	if err != nil {
-		return false, t.fail("delete_generation", err)
-	}
-	return tag.RowsAffected() == 1, nil
+	t.enqueue(stmtDeleteGeneration, guardSQL(`DELETE FROM segment_generations WHERE generation_id = $1`), int64s([]uint64{id})[0])
+	return nil
 }
 
 // unreferencedSQL is the four §13 NOT EXISTS checks for the object o.

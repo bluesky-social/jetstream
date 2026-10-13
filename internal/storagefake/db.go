@@ -218,6 +218,16 @@ func genBlockPrefix(gen uint64) string {
 
 func (db *DB) now() time.Time { return db.cfg.Now() }
 
+// newGenerationID is nextval on segment_generations_generation_id_seq:
+// outside any transaction, so an ID a rolled-back transaction took is gone.
+func (db *DB) newGenerationID() uint64 {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	id := db.nextGen
+	db.nextGen++
+	return id
+}
+
 func (db *DB) current() *state {
 	db.mu.Lock()
 	defer db.mu.Unlock()

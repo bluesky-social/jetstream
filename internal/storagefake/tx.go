@@ -248,6 +248,27 @@ func (t *tx) read(ctx context.Context, r catalog.Read) error {
 				r.Rows[id] = row
 			}
 		}
+	case *catalog.SegmentRead:
+		if err := t.stmt(ctx, "segment_for_update", true); err != nil {
+			return err
+		}
+		r.Row, r.Found = t.s.segments.get(segKey(r.Namespace, r.Index))
+	case *catalog.GenerationRead:
+		if err := t.stmt(ctx, "generation", false); err != nil {
+			return err
+		}
+		r.Row, r.Found = t.view().generations.get(r.ID)
+		r.Row.Header = bytes.Clone(r.Row.Header)
+	case *catalog.GenerationBlocksRead:
+		if err := t.stmt(ctx, "generation_blocks", false); err != nil {
+			return err
+		}
+		r.Rows = genBlocksOf(t.view(), r.ID)
+	case *catalog.NewGenerationIDRead:
+		if err := t.stmt(ctx, "new_generation_id", false); err != nil {
+			return err
+		}
+		r.ID = t.db.newGenerationID()
 	default:
 		return t.abort(fmt.Errorf("storagefake: unknown read %T", r))
 	}
@@ -503,27 +524,47 @@ func (t *tx) InsertGeneration(ctx context.Context, row catalog.GenerationRow) (u
 	if err := t.stmt(ctx, "insert_generation", true); err != nil {
 		return 0, err
 	}
-	if err := t.bigints("segment_generations", row.Segment, row.FooterObjectID, row.Revision); err != nil {
+	row.ID = t.db.newGenerationID()
+	if err := t.insertGeneration(row); err != nil {
 		return 0, err
 	}
-	t.db.mu.Lock()
-	id := t.db.nextGen
-	t.db.nextGen++
-	t.db.mu.Unlock()
+	return row.ID, nil
+}
+
+func (t *tx) InsertGenerationAt(ctx context.Context, row catalog.GenerationRow) error {
+	return t.queue(func() error {
+		if err := t.stmt(ctx, "insert_generation_at", true); err != nil {
+			return err
+		}
+		if err := t.bigints("segment_generations", row.ID); err != nil {
+			return err
+		}
+		if _, dup := t.s.generations.get(row.ID); dup {
+			return t.abort(violation("segment_generations_pkey", "generation %d exists", row.ID))
+		}
+		return t.insertGeneration(row)
+	})
+}
+
+// insertGeneration checks and inserts a segment_generations row whose ID is
+// set.
+func (t *tx) insertGeneration(row catalog.GenerationRow) error {
+	if err := t.bigints("segment_generations", row.Segment, row.FooterObjectID, row.Revision); err != nil {
+		return err
+	}
 	if len(row.Header) != 256 {
-		return 0, t.abort(violation("segment_generations_header_check", "header is %d bytes", len(row.Header)))
+		return t.abort(violation("segment_generations_header_check", "header is %d bytes", len(row.Header)))
 	}
 	if err := t.objectFK("segment_generations_footer", row.FooterObjectID); err != nil {
-		return 0, err
+		return err
 	}
 	if err := t.segmentFK("segment_generations", row.Namespace, row.Segment); err != nil {
-		return 0, err
+		return err
 	}
-	row.ID = id
 	row.Header = bytes.Clone(row.Header)
 	row.CreatedAt = t.now()
-	t.s.generations.set(id, row)
-	return id, nil
+	t.s.generations.set(row.ID, row)
+	return nil
 }
 
 func (t *tx) InsertGenerationBlocks(ctx context.Context, rows []catalog.GenerationBlockRow) error {
@@ -639,23 +680,6 @@ func (t *tx) deleteNamespace(ctx context.Context, ns catalog.Namespace) error {
 	return nil
 }
 
-func (t *tx) SegmentForUpdate(ctx context.Context, ns catalog.Namespace, idx uint64) (catalog.SegmentRow, bool, error) {
-	if err := t.stmt(ctx, "segment_for_update", true); err != nil {
-		return catalog.SegmentRow{}, false, err
-	}
-	row, ok := t.s.segments.get(segKey(ns, idx))
-	return row, ok, nil
-}
-
-func (t *tx) Generation(ctx context.Context, id uint64) (catalog.GenerationRow, bool, error) {
-	if err := t.stmt(ctx, "generation", false); err != nil {
-		return catalog.GenerationRow{}, false, err
-	}
-	g, ok := t.view().generations.get(id)
-	g.Header = bytes.Clone(g.Header)
-	return g, ok, nil
-}
-
 // genBlocksOf returns a generation's blocks in ordinal order.
 func genBlocksOf(s *state, gen uint64) []catalog.GenerationBlockRow {
 	prefix := genBlockPrefix(gen)
@@ -672,45 +696,47 @@ func genBlocksOf(s *state, gen uint64) []catalog.GenerationBlockRow {
 	return out
 }
 
-func (t *tx) BlocksOfGeneration(ctx context.Context, id uint64) ([]catalog.GenerationBlockRow, error) {
-	if err := t.stmt(ctx, "blocks_of_generation", false); err != nil {
-		return nil, err
-	}
-	return genBlocksOf(t.view(), id), nil
+// errGuard is a guarded write that changed no row (catalog.Tx).
+func errGuard(stmt, format string, args ...any) error {
+	return fmt.Errorf("storagefake: %s: %s: %w", stmt, fmt.Sprintf(format, args...), catalog.ErrPrecondition)
 }
 
-func (t *tx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) (bool, error) {
-	if err := t.stmt(ctx, "set_segment_generation", true); err != nil {
-		return false, err
-	}
-	if err := t.bigints("segments", gen, revision); err != nil {
-		return false, err
-	}
-	if gen == 0 {
-		return false, t.abort(violation("segments_check", "sealed segment needs a generation"))
-	}
-	k := segKey(ns, idx)
-	row, ok := t.s.segments.get(k)
-	if !ok || row.State != catalog.Sealed {
-		return false, nil
-	}
-	row.GenerationID, row.Revision = gen, revision
-	t.s.segments.set(k, row)
-	return true, nil
+func (t *tx) SetSegmentGeneration(ctx context.Context, ns catalog.Namespace, idx, gen, revision uint64) error {
+	return t.queue(func() error {
+		if err := t.stmt(ctx, "set_segment_generation", true); err != nil {
+			return err
+		}
+		if err := t.bigints("segments", gen, revision); err != nil {
+			return err
+		}
+		if gen == 0 {
+			return t.abort(violation("segments_check", "sealed segment needs a generation"))
+		}
+		k := segKey(ns, idx)
+		row, ok := t.s.segments.get(k)
+		if !ok || row.State != catalog.Sealed {
+			return errGuard("set_segment_generation", "%s segment %d is not sealed", ns, idx)
+		}
+		row.GenerationID, row.Revision = gen, revision
+		t.s.segments.set(k, row)
+		return nil
+	})
 }
 
-func (t *tx) DeleteGeneration(ctx context.Context, id uint64) (bool, error) {
-	if err := t.stmt(ctx, "delete_generation", true); err != nil {
-		return false, err
-	}
-	if _, ok := t.s.generations.get(id); !ok {
-		return false, nil
-	}
-	for _, gb := range genBlocksOf(t.s, id) {
-		t.s.genBlocks.del(genBlockKey(id, gb.Ordinal))
-	}
-	t.s.generations.del(id)
-	return true, nil
+func (t *tx) DeleteGeneration(ctx context.Context, id uint64) error {
+	return t.queue(func() error {
+		if err := t.stmt(ctx, "delete_generation", true); err != nil {
+			return err
+		}
+		if _, ok := t.s.generations.get(id); !ok {
+			return errGuard("delete_generation", "no generation %d", id)
+		}
+		for _, gb := range genBlocksOf(t.s, id) {
+			t.s.genBlocks.del(genBlockKey(id, gb.Ordinal))
+		}
+		t.s.generations.del(id)
+		return nil
+	})
 }
 
 // referenced returns every object ID some row references: the four §13
