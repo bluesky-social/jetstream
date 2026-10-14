@@ -92,7 +92,8 @@ func (f *Follower) GenerationParts(ctx context.Context, idx uint64) (catalog.Gen
 			return catalog.GenerationParts{}, false, nil
 		}
 	}
-	if err := f.Refresh(ctx); err != nil {
+	// Only the mirror: getSegment reads none of the log.
+	if err := f.refreshMirror(ctx); err != nil {
 		return catalog.GenerationParts{}, false, err
 	}
 	p, ok := f.generationParts(idx)

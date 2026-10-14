@@ -17,7 +17,6 @@ import (
 	"github.com/bluesky-social/jetstream/internal/objstore"
 	"github.com/bluesky-social/jetstream/internal/objstore/objcache"
 	"github.com/bluesky-social/jetstream/internal/objstore/protocol"
-	"github.com/bluesky-social/jetstream/segment"
 )
 
 const (
@@ -48,7 +47,10 @@ type Config struct {
 	Manifest *manifest.Manifest
 
 	PollInterval time.Duration
-	MaxViewAge   time.Duration
+	// MaxViewAge marks the pod not ready once its mirror is older, or once
+	// its readable log has trailed the mirror for as long without progress.
+	// It also bounds the view age GC allows for (xrpcapi.CheckGCDelay).
+	MaxViewAge time.Duration
 	// ReadConcurrency bounds concurrent footer fetches
 	// (JETSTREAM_S3_READ_CONCURRENCY).
 	ReadConcurrency int
@@ -66,7 +68,9 @@ type Config struct {
 
 // Follower keeps this pod's catalog mirror current (design §11.1) and feeds
 // the pod's readable log from it. Readers take the current mirror with one
-// atomic load; the follower's single tick loop is the only writer.
+// atomic load; the follower's single tick loop is the only writer. The log
+// is fed after each swap, by a separate feeder, so a tick's cost does not
+// grow with the number of events a revision brings.
 //
 // It implements catalog.Catalog, catalog.Fetcher (through Fetcher),
 // protocol.RowSource, and lifecycle.Readiness.
@@ -87,6 +91,17 @@ type Follower struct {
 	started  atomic.Uint64
 	last     atomic.Pointer[tickResult]
 	doorbell chan struct{}
+	// tickStart is when the in-flight tick started (UnixNano), or 0.
+	tickStart atomic.Int64
+
+	// feedMu serializes feed passes, feedBell wakes the feeder, and fedAt
+	// is when the log last caught up with the mirror or gained events
+	// (UnixNano): Ready's measure of a stalled feed.
+	feedMu   chan struct{}
+	feedBell chan struct{}
+	fedAt    atomic.Int64
+	// feedFailing is whether the last feed pass failed; feedMu guards it.
+	feedFailing bool
 
 	failOnce sync.Once
 	failed   chan struct{}
@@ -147,6 +162,8 @@ func New(cfg Config) (*Follower, error) {
 		log:      cfg.Logger.With(slog.String("component", "catalog_follower")),
 		tickMu:   make(chan struct{}, 1),
 		doorbell: make(chan struct{}, 1),
+		feedMu:   make(chan struct{}, 1),
+		feedBell: make(chan struct{}, 1),
 		failed:   make(chan struct{}),
 	}
 	rd, err := f.reader(f, cfg.ServeBlob)
@@ -154,12 +171,28 @@ func New(cfg Config) (*Follower, error) {
 		return nil, err
 	}
 	f.rd = rd
-	cfg.Metrics.setLagSource(func() float64 {
+	cfg.Metrics.setSources(func() float64 {
 		m := f.cur.Load()
 		if m == nil {
 			return 0
 		}
 		return f.cfg.Now().Sub(m.refreshed).Seconds()
+	}, func() float64 {
+		start := f.tickStart.Load()
+		if start == 0 {
+			return 0
+		}
+		return f.cfg.Now().Sub(time.Unix(0, start)).Seconds()
+	}, func() float64 {
+		m, flog := f.cur.Load(), f.flog.Load()
+		if m == nil || flog == nil {
+			return 0
+		}
+		tip, logTip := m.view.TipSeq(catalog.Main), flog.Log().TipSeq()
+		if tip <= logTip {
+			return 0
+		}
+		return float64(tip - logTip)
 	})
 	return f, nil
 }
@@ -175,10 +208,19 @@ func (f *Follower) reader(rows protocol.RowSource, blob objstore.Blob) (*protoco
 	})
 }
 
-// Run ticks until ctx ends or a tick finds corruption or a foreign archive,
-// which it returns. Transient failures keep the previous mirror and retry
-// on the next wakeup; readiness reports a mirror that stays stale.
+// Run ticks, and feeds the readable log after each tick, until ctx ends or
+// either finds corruption or a foreign archive, which it returns. Transient
+// failures keep the previous mirror, or the log's tip, and retry on the
+// next wakeup; readiness reports one that stays stale.
 func (f *Follower) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var feeder sync.WaitGroup
+	feeder.Go(func() { f.runFeeder(ctx) })
+	defer func() {
+		cancel()
+		feeder.Wait()
+	}()
+
 	poll := time.NewTicker(f.cfg.PollInterval)
 	defer poll.Stop()
 
@@ -245,9 +287,19 @@ func (f *Follower) Doorbell() {
 	}
 }
 
-// Refresh runs, or waits for, a tick that started after the call, and
-// returns its error (design §11.6). It implements catalog.Catalog.
+// Refresh runs, or waits for, a tick that started after the call, then
+// feeds the readable log up to that tick's mirror, and returns the first
+// error (design §11.6). It implements catalog.Catalog.
 func (f *Follower) Refresh(ctx context.Context) error {
+	if err := f.refreshMirror(ctx); err != nil {
+		return err
+	}
+	return f.feedLocked(ctx)
+}
+
+// refreshMirror is Refresh without the feed, for a reader that needs only
+// the mirror.
+func (f *Follower) refreshMirror(ctx context.Context) error {
 	want := f.started.Load() + 1
 	select {
 	case f.tickMu <- struct{}{}:
@@ -277,39 +329,53 @@ func (f *Follower) tickLocked(ctx context.Context) error {
 func (f *Follower) tick(ctx context.Context) error {
 	n := f.started.Add(1)
 	start := f.cfg.Now()
-	end := f.cfg.Metrics.beginRefresh()
-	defer end()
+	f.tickStart.Store(start.UnixNano())
+	defer f.tickStart.Store(0)
+	old := f.cur.Load()
 	err := f.runTick(ctx)
 	f.last.Store(&tickResult{n: n, err: err})
 	switch {
-	case err == nil || ctx.Err() != nil:
+	case err == nil:
+		// Every tick rings, not only one that changed the mirror, so a
+		// failed feed pass is retried at the poll interval.
+		f.ringFeeder()
+	case ctx.Err() != nil:
 	case isFatal(err):
-		f.cfg.CatalogMetrics.ObserveCorruption(err)
-		f.log.Error("catalog follower stopping", slog.Any("error", err))
-		f.failOnce.Do(func() {
-			f.failErr = err
-			close(f.failed)
-		})
+		f.fail(err)
 	default:
 		f.cfg.Metrics.refreshFailed()
 		f.log.Warn("catalog refresh failed; keeping the previous mirror", slog.Any("error", err))
 	}
-	if duration := f.cfg.Now().Sub(start); duration > slowRefreshDuration {
-		f.log.Warn("catalog refresh exceeded slow threshold", slog.Duration("duration", duration), slog.Any("error", err))
+	if d := f.cfg.Now().Sub(start); d > slowRefreshDuration {
+		var from, to uint64
+		if old != nil {
+			from = old.rev
+		}
+		if m := f.cur.Load(); m != nil {
+			to = m.rev
+		}
+		f.log.Warn("slow catalog refresh", slog.Duration("duration", d),
+			slog.Uint64("from_revision", from), slog.Uint64("to_revision", to), slog.Any("error", err))
 	}
 	return err
+}
+
+// fail stops the follower with err, which a tick or a feed pass found to be
+// corruption or a foreign archive.
+func (f *Follower) fail(err error) {
+	f.cfg.CatalogMetrics.ObserveCorruption(err)
+	f.log.Error("catalog follower stopping", slog.Any("error", err))
+	f.failOnce.Do(func() {
+		f.failErr = err
+		close(f.failed)
+	})
 }
 
 func (f *Follower) runTick(ctx context.Context) error {
 	start := f.cfg.Now()
 	old := f.cur.Load()
-	previousRevision := uint64(0)
-	if old != nil {
-		previousRevision = old.rev
-	}
-	phaseStart := f.cfg.Now()
 	c, err := f.read(ctx, old)
-	f.cfg.Metrics.observeRefreshPhase("postgres", f.cfg.Now().Sub(phaseStart).Seconds())
+	f.cfg.Metrics.observeRefreshPhase("read", f.cfg.Now().Sub(start).Seconds())
 	if err != nil {
 		return err
 	}
@@ -320,12 +386,6 @@ func (f *Follower) runTick(ctx context.Context) error {
 		return nil
 	}
 
-	f.log.Info("catalog refresh started",
-		slog.Uint64("previous_revision", previousRevision),
-		slog.Uint64("target_revision", c.archive.CatalogRevision),
-		slog.Int("changed_segments", len(c.segments)),
-		slog.Int("new_generations", len(c.gens)))
-
 	var objects objIndex
 	if old != nil {
 		objects = old.objects
@@ -335,92 +395,50 @@ func (f *Follower) runTick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	phaseStart = f.cfg.Now()
+	phase := f.cfg.Now()
 	next, loaded, err := f.build(ctx, old, c, rd, objects)
-	f.cfg.Metrics.observeRefreshPhase("footer_load_and_build", f.cfg.Now().Sub(phaseStart).Seconds())
+	f.cfg.Metrics.observeRefreshPhase("build", f.cfg.Now().Sub(phase).Seconds())
 	if err != nil {
 		return err
 	}
 	next.refreshed = start
 
 	steady := next.phase == lifecycle.PhaseSteadyState
-	flog := f.flog.Load()
-	var events []segment.Event
-	var logTip uint64
-	phaseStart = f.cfg.Now()
-	if flog != nil && steady {
-		// Reading (and verifying) every block the log still lacks,
-		// pointer batches included, happens before anything is published,
-		// so a failed fetch leaves the whole tick to retry.
-		if events, logTip, err = f.feed(ctx, next, flog.Log().TipSeq(), rd); err != nil {
-			return err
-		}
-	}
-	f.cfg.Metrics.observeRefreshPhase("log_catchup", f.cfg.Now().Sub(phaseStart).Seconds())
 	var initial []manifest.RemoteSegment
-	phaseStart = f.cfg.Now()
 	if steady && !f.footersLoaded.Load() && f.cfg.Manifest != nil {
+		phase = f.cfg.Now()
 		if initial, err = f.remoteSegments(ctx, next, loaded, rd); err != nil {
 			return err
 		}
+		f.cfg.Metrics.observeRefreshPhase("manifest_prepare", f.cfg.Now().Sub(phase).Seconds())
 	}
-	f.cfg.Metrics.observeRefreshPhase("manifest_prepare", f.cfg.Now().Sub(phaseStart).Seconds())
 
-	// The log gets the events before the swap, so a subscriber never sees
-	// a mirror tip above the log's; durable advances only after the swap,
-	// because advancing lets the log evict, and a reader that saw the new
-	// floor must find the evicted seqs in the mirror it loads next.
-	for i := range events {
-		// A seq feed passed over was compacted away; it stays vacant.
-		if err := flog.Skip(events[i].Seq); err != nil {
-			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
-		}
-		if err := flog.Append(&events[i]); err != nil {
-			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
-		}
-	}
-	if flog != nil && steady {
-		if err := flog.Skip(logTip); err != nil {
-			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
-		}
-	}
-	phaseStart = f.cfg.Now()
+	// The swap comes before the log gets this revision's events: the feeder
+	// reads them out of a published mirror, so a reader that sees the log
+	// evict a seq finds it in the mirror. Until the feeder catches up,
+	// readers at the log's tip wait there, as they would for the next
+	// commit.
+	flog := f.flog.Load()
+	caughtUp := flog != nil && old != nil && flog.Log().TipSeq() >= old.view.TipSeq(catalog.Main)
 	f.cur.Store(next)
 	f.cfg.Metrics.setRevision(next.rev)
-	f.cfg.Metrics.observeRefreshPhase("mirror_publish", f.cfg.Now().Sub(phaseStart).Seconds())
-	if flog != nil && steady {
-		if err := flog.AdvanceDurable(flog.Log().TipSeq()); err != nil {
-			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
-		}
-	}
-	if flog == nil && steady {
+	switch {
+	case flog == nil && steady:
 		// At pod start the log begins at the tip: older seqs are the cold
 		// reader's. Seqs start at 1, so an empty archive's log starts there.
 		f.flog.Store(ingest.NewFollowerLog(max(next.view.TipSeq(catalog.Main), 1), f.cfg.ReadLogBytes, f.cfg.IngestMetrics))
-	}
-	now := f.cfg.Now()
-	for i := range events {
-		f.cfg.Metrics.observeVisibility(now.Sub(time.UnixMicro(events[i].WitnessedAt)).Seconds())
+		f.fedAt.Store(f.cfg.Now().UnixNano())
+	case caughtUp:
+		// The log falls behind only now, so a stall counts from here.
+		f.fedAt.Store(f.cfg.Now().UnixNano())
 	}
 
-	phaseStart = f.cfg.Now()
+	phase = f.cfg.Now()
 	if err := f.publish(ctx, next, loaded, initial); err != nil {
 		return err
 	}
-	f.cfg.Metrics.observeRefreshPhase("manifest_publish", f.cfg.Now().Sub(phaseStart).Seconds())
-	duration := f.cfg.Now().Sub(start)
-	f.cfg.Metrics.observeRefresh(duration.Seconds())
-	level := slog.LevelInfo
-	if duration > slowRefreshDuration {
-		level = slog.LevelWarn
-	}
-	f.log.Log(ctx, level, "catalog refresh completed",
-		slog.Uint64("previous_revision", previousRevision),
-		slog.Uint64("target_revision", next.rev),
-		slog.Duration("duration", duration),
-		slog.Int("changed_segments", len(c.segments)),
-		slog.Int("new_generations", len(loaded)),
-		slog.Int("caught_up_events", len(events)))
+	f.cfg.Metrics.observeRefreshPhase("manifest_publish", f.cfg.Now().Sub(phase).Seconds())
+	f.cfg.Metrics.observeRefresh(f.cfg.Now().Sub(start).Seconds())
 	return nil
 }
 

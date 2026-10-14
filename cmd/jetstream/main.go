@@ -584,7 +584,7 @@ func storageFlags() []cli.Flag {
 			Sources: cli.EnvVars("JETSTREAM_CATALOG_POLL_INTERVAL"), Value: def.CatalogPollInterval,
 		},
 		&cli.DurationFlag{
-			Name: "max-view-age", Category: cat, Usage: "Report not ready when the catalog mirror is older than this",
+			Name: "max-view-age", Category: cat, Usage: "Report not ready when the catalog mirror is older than this, or the readable log has trailed it this long without progress",
 			Sources: cli.EnvVars("JETSTREAM_MAX_VIEW_AGE"), Value: def.MaxViewAge,
 		},
 		&cli.DurationFlag{

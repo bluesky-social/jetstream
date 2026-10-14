@@ -79,3 +79,59 @@ func TestFollowerLog_VacantFloorEvicts(t *testing.T) {
 	require.False(t, ok)
 	require.True(t, atTip)
 }
+
+// AppendRun leaves the same log as Skip and Append one event at a time, and
+// wakes a parked reader once.
+func TestFollowerLog_AppendRunMatchesAppend(t *testing.T) {
+	t.Parallel()
+	run := NewFollowerLog(5, 1<<20, nil)
+	one := NewFollowerLog(5, 1<<20, nil)
+	_, notify, _, atTip := run.Log().ReadFrom(5, 10)
+	require.True(t, atTip)
+
+	evs := []segment.Event{{Seq: 5}, {Seq: 6}, {Seq: 9}, {Seq: 12}}
+	require.NoError(t, run.AppendRun(evs, 15))
+	for i := range evs {
+		require.NoError(t, one.Skip(evs[i].Seq))
+		require.NoError(t, one.Append(&evs[i]))
+	}
+	require.NoError(t, one.Skip(15))
+	select {
+	case <-notify:
+	default:
+		t.Fatal("a run must wake a reader parked at the old tip")
+	}
+
+	for _, l := range []*FollowerLog{run, one} {
+		require.Equal(t, uint64(15), l.Log().TipSeq())
+		es, _, ok, _ := l.Log().ReadFrom(5, 10)
+		require.True(t, ok)
+		var got []uint64
+		for _, e := range es {
+			got = append(got, e.Event().Seq)
+		}
+		require.Equal(t, []uint64{5, 6, 9, 12}, got)
+	}
+
+	// An empty run only moves the tip and wakes nobody.
+	_, notify, _, _ = run.Log().ReadFrom(15, 10)
+	require.NoError(t, run.AppendRun(nil, 17))
+	require.Equal(t, uint64(17), run.Log().TipSeq())
+	select {
+	case <-notify:
+		t.Fatal("a run of vacancies must not wake readers")
+	default:
+	}
+}
+
+// AppendRun rejects a run that is out of order, starts below the tip, or
+// ends before its last event, and leaves the log as it was.
+func TestFollowerLog_AppendRunRejectsDisorder(t *testing.T) {
+	t.Parallel()
+	l := NewFollowerLog(5, 1<<20, nil)
+	require.Error(t, l.AppendRun([]segment.Event{{Seq: 4}}, 6), "below the tip")
+	require.Error(t, l.AppendRun([]segment.Event{{Seq: 6}, {Seq: 6}}, 8), "repeated seq")
+	require.Error(t, l.AppendRun([]segment.Event{{Seq: 7}, {Seq: 6}}, 8), "descending")
+	require.Error(t, l.AppendRun([]segment.Event{{Seq: 6}}, 6), "ends before its last event")
+	require.Equal(t, uint64(5), l.Log().TipSeq())
+}

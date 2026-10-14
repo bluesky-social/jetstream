@@ -249,6 +249,8 @@ type ColdReaderConfig struct {
 	Fetcher catalog.Fetcher
 	// Ready, when non-nil, gates reads on the catalog's initial load: a view
 	// taken before it would be missing sealed segments. Read blocks on it.
+	// It must not check freshness: a stream already open keeps reading
+	// through a stale view (design §11.6), and failing here disconnects it.
 	Ready     func(context.Context) error
 	WriterRef *atomic.Pointer[ingest.Writer]
 	// Floor, used when WriterRef is nil, returns the readable log's floor,

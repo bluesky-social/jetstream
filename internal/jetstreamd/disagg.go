@@ -420,7 +420,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
 		Catalog:         f,
 		Fetcher:         f,
-		Ready:           f.Ready,
+		Ready:           f.Loaded,
 		Floor:           f.LogFloor,
 		Gaps:            f.SeqGaps,
 		Keyer:           f,

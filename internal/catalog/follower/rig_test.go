@@ -1,10 +1,12 @@
 package follower_test
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,6 +55,9 @@ type rig struct {
 	s    *catalog.Session
 	up   *protocol.Uploader
 	blob *memblob.Blob
+	// blobDown fails the follower's object reads while set; the rig's own
+	// writes and checks bypass it.
+	blobDown *blobSwitch
 
 	// events[i] has seq i+1.
 	events []segment.Event
@@ -86,12 +91,13 @@ func newRig(t *testing.T) *rig {
 	db := storagefake.New(storagefake.Config{ArchiveID: testArchiveID})
 	lease := db.NewLease()
 	require.NoError(t, lease.Acquire(t.Context(), time.Hour))
-	r := &rig{t: t, db: db, blob: memblob.New()}
+	down := &blobSwitch{}
+	r := &rig{t: t, db: db, blob: memblob.New(memblob.WithFaultInjector(down)), blobDown: down}
 	r.s = catalog.NewSession(catalog.SessionConfig{DB: db, Epoch: lease.Epoch()})
 	_, err := r.s.InitNamespace(t.Context(), catalog.Main, nil)
 	require.NoError(t, err)
 	r.up, err = protocol.NewUploader(protocol.UploaderConfig{
-		Blob: r.blob, ArchiveID: testArchiveID, GCDelay: 6 * time.Hour, OrphanAge: time.Hour,
+		Blob: r.blob.Unfaulted(), ArchiveID: testArchiveID, GCDelay: 6 * time.Hour, OrphanAge: time.Hour,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -100,6 +106,16 @@ func newRig(t *testing.T) *rig {
 		}
 	})
 	return r
+}
+
+// blobSwitch fails every object read while it is on.
+type blobSwitch struct{ on atomic.Bool }
+
+func (b *blobSwitch) BeforeBlobOp(op memblob.Op, _ string) (memblob.FaultKind, error) {
+	if op != memblob.OpPut && b.on.Load() {
+		return memblob.FaultError, errors.New("blob down")
+	}
+	return memblob.FaultNone, nil
 }
 
 func (r *rig) setPhase(p lifecycle.Phase) {
@@ -229,15 +245,11 @@ func (r *rig) compact(seg uint64, seqs ...uint64) {
 type followerOpts struct {
 	listen   bool
 	manifest bool
-	logger   *slog.Logger
 }
 
 func (r *rig) follower(o followerOpts) (*follower.Follower, *follower.Metrics, *manifest.Manifest) {
 	r.t.Helper()
-	logger := o.logger
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	metrics := follower.NewMetrics(prometheus.NewRegistry())
 	cfg := follower.Config{
 		DB: r.db, Blob: r.blob, ArchiveID: testArchiveID,
