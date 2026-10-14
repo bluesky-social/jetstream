@@ -1,8 +1,10 @@
 package follower_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"math/rand/v2"
 	"testing"
 	"testing/synctest"
@@ -177,9 +179,8 @@ func TestFollower_LostNotifyCoveredByPoll(t *testing.T) {
 	})
 }
 
-// A follower whose reads stall longer than MaxViewAge reports not ready, and
-// recovers once a tick completes.
-func TestFollower_SlowFollowerLosesReadiness(t *testing.T) {
+// A slow refresh keeps serving the previous mirror while lag reports the delay.
+func TestFollower_SlowFollowerKeepsServing(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		r := newRig(t)
@@ -193,17 +194,35 @@ func TestFollower_SlowFollowerLosesReadiness(t *testing.T) {
 
 		r.db.InjectFaults(&storagefake.Fault{Kind: storagefake.FaultSlowRead, Ordinal: 1, Delay: 2 * follower.DefaultMaxViewAge})
 		time.Sleep(follower.DefaultMaxViewAge + time.Second)
-		require.ErrorIs(t, f.Ready(ctx), follower.ErrStale)
+		require.NoError(t, f.Ready(ctx))
 		require.Greater(t, testutil.ToFloat64(metrics.Lag), follower.DefaultMaxViewAge.Seconds())
+		require.Equal(t, float64(1), testutil.ToFloat64(metrics.RefreshInProgress))
 
 		time.Sleep(follower.DefaultMaxViewAge)
 		synctest.Wait()
 		require.NoError(t, f.Ready(ctx))
 		require.Empty(t, r.db.Unfired())
+		require.Zero(t, testutil.ToFloat64(metrics.RefreshInProgress))
 
 		cancel()
 		require.ErrorIs(t, <-done, context.Canceled)
 	})
+}
+
+func TestFollower_RefreshLogsRevisions(t *testing.T) {
+	t.Parallel()
+	r := newRig(t)
+	r.setPhase(lifecycle.PhaseSteadyState)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	f, _, _ := r.follower(followerOpts{logger: logger})
+	require.NoError(t, f.Refresh(t.Context()))
+
+	output := logs.String()
+	require.Contains(t, output, "catalog refresh started")
+	require.Contains(t, output, "previous_revision=0")
+	require.Contains(t, output, "target_revision=")
+	require.Contains(t, output, "catalog refresh completed")
 }
 
 // Readiness needs steady state; the log and the manifest start there.

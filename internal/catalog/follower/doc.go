@@ -13,5 +13,5 @@
 // catalog.Fetcher over the object store, the protocol.RowSource of that
 // store's reads, and its lifecycle.Readiness. Corruption it finds in shared
 // storage stops Run with a catalog.CorruptionError; transient failures keep
-// the previous mirror, which readiness reports once it outlives MaxViewAge.
+// serving the previous immutable mirror while lag reports its age.
 package follower

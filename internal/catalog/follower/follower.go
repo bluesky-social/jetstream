@@ -25,8 +25,9 @@ const (
 	DefaultMaxViewAge      = 30 * time.Second
 	DefaultReadConcurrency = 32
 
-	listenBackoffMin = 250 * time.Millisecond
-	listenBackoffMax = 5 * time.Second
+	listenBackoffMin    = 250 * time.Millisecond
+	listenBackoffMax    = 5 * time.Second
+	slowRefreshDuration = 5 * time.Second
 )
 
 // Config configures a Follower.
@@ -275,6 +276,9 @@ func (f *Follower) tickLocked(ctx context.Context) error {
 // tick runs one tick; the caller holds tickMu.
 func (f *Follower) tick(ctx context.Context) error {
 	n := f.started.Add(1)
+	start := f.cfg.Now()
+	end := f.cfg.Metrics.beginRefresh()
+	defer end()
 	err := f.runTick(ctx)
 	f.last.Store(&tickResult{n: n, err: err})
 	switch {
@@ -290,13 +294,22 @@ func (f *Follower) tick(ctx context.Context) error {
 		f.cfg.Metrics.refreshFailed()
 		f.log.Warn("catalog refresh failed; keeping the previous mirror", slog.Any("error", err))
 	}
+	if duration := f.cfg.Now().Sub(start); duration > slowRefreshDuration {
+		f.log.Warn("catalog refresh exceeded slow threshold", slog.Duration("duration", duration), slog.Any("error", err))
+	}
 	return err
 }
 
 func (f *Follower) runTick(ctx context.Context) error {
 	start := f.cfg.Now()
 	old := f.cur.Load()
+	previousRevision := uint64(0)
+	if old != nil {
+		previousRevision = old.rev
+	}
+	phaseStart := f.cfg.Now()
 	c, err := f.read(ctx, old)
+	f.cfg.Metrics.observeRefreshPhase("postgres", f.cfg.Now().Sub(phaseStart).Seconds())
 	if err != nil {
 		return err
 	}
@@ -307,6 +320,12 @@ func (f *Follower) runTick(ctx context.Context) error {
 		return nil
 	}
 
+	f.log.Info("catalog refresh started",
+		slog.Uint64("previous_revision", previousRevision),
+		slog.Uint64("target_revision", c.archive.CatalogRevision),
+		slog.Int("changed_segments", len(c.segments)),
+		slog.Int("new_generations", len(c.gens)))
+
 	var objects objIndex
 	if old != nil {
 		objects = old.objects
@@ -316,7 +335,9 @@ func (f *Follower) runTick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	phaseStart = f.cfg.Now()
 	next, loaded, err := f.build(ctx, old, c, rd, objects)
+	f.cfg.Metrics.observeRefreshPhase("footer_load_and_build", f.cfg.Now().Sub(phaseStart).Seconds())
 	if err != nil {
 		return err
 	}
@@ -326,6 +347,7 @@ func (f *Follower) runTick(ctx context.Context) error {
 	flog := f.flog.Load()
 	var events []segment.Event
 	var logTip uint64
+	phaseStart = f.cfg.Now()
 	if flog != nil && steady {
 		// Reading (and verifying) every block the log still lacks,
 		// pointer batches included, happens before anything is published,
@@ -334,12 +356,15 @@ func (f *Follower) runTick(ctx context.Context) error {
 			return err
 		}
 	}
+	f.cfg.Metrics.observeRefreshPhase("log_catchup", f.cfg.Now().Sub(phaseStart).Seconds())
 	var initial []manifest.RemoteSegment
+	phaseStart = f.cfg.Now()
 	if steady && !f.footersLoaded.Load() && f.cfg.Manifest != nil {
 		if initial, err = f.remoteSegments(ctx, next, loaded, rd); err != nil {
 			return err
 		}
 	}
+	f.cfg.Metrics.observeRefreshPhase("manifest_prepare", f.cfg.Now().Sub(phaseStart).Seconds())
 
 	// The log gets the events before the swap, so a subscriber never sees
 	// a mirror tip above the log's; durable advances only after the swap,
@@ -359,8 +384,10 @@ func (f *Follower) runTick(ctx context.Context) error {
 			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
 		}
 	}
+	phaseStart = f.cfg.Now()
 	f.cur.Store(next)
 	f.cfg.Metrics.setRevision(next.rev)
+	f.cfg.Metrics.observeRefreshPhase("mirror_publish", f.cfg.Now().Sub(phaseStart).Seconds())
 	if flog != nil && steady {
 		if err := flog.AdvanceDurable(flog.Log().TipSeq()); err != nil {
 			return catalog.Corruptf(catalog.SourceInvariant, "%v", err)
@@ -376,10 +403,24 @@ func (f *Follower) runTick(ctx context.Context) error {
 		f.cfg.Metrics.observeVisibility(now.Sub(time.UnixMicro(events[i].WitnessedAt)).Seconds())
 	}
 
+	phaseStart = f.cfg.Now()
 	if err := f.publish(ctx, next, loaded, initial); err != nil {
 		return err
 	}
-	f.cfg.Metrics.observeRefresh(f.cfg.Now().Sub(start).Seconds())
+	f.cfg.Metrics.observeRefreshPhase("manifest_publish", f.cfg.Now().Sub(phaseStart).Seconds())
+	duration := f.cfg.Now().Sub(start)
+	f.cfg.Metrics.observeRefresh(duration.Seconds())
+	level := slog.LevelInfo
+	if duration > slowRefreshDuration {
+		level = slog.LevelWarn
+	}
+	f.log.Log(ctx, level, "catalog refresh completed",
+		slog.Uint64("previous_revision", previousRevision),
+		slog.Uint64("target_revision", next.rev),
+		slog.Duration("duration", duration),
+		slog.Int("changed_segments", len(c.segments)),
+		slog.Int("new_generations", len(loaded)),
+		slog.Int("caught_up_events", len(events)))
 	return nil
 }
 

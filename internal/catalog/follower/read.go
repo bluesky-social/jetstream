@@ -18,8 +18,6 @@ var (
 	// ErrLoading is Ready's error until the first steady-state mirror and
 	// its footers are loaded.
 	ErrLoading = errors.New("catalog: mirror loading")
-	// ErrStale is Ready's error while the mirror is older than MaxViewAge.
-	ErrStale = errors.New("catalog: mirror stale")
 )
 
 // Object implements protocol.RowSource. A plain lookup answers from the
@@ -57,15 +55,13 @@ func (f *Follower) Log() *ingest.ReadableLog {
 	return nil
 }
 
-// Ready implements lifecycle.Readiness (design §11.6): a mirror refreshed
-// within MaxViewAge, in steady state, with the manifest loaded.
+// Ready implements lifecycle.Readiness (design §11.6): a steady-state mirror
+// with its manifest loaded. Refresh lag is observable but does not invalidate
+// an immutable mirror that remains safe to serve.
 func (f *Follower) Ready(context.Context) error {
 	m := f.cur.Load()
 	if m == nil {
 		return ErrLoading
-	}
-	if age := f.cfg.Now().Sub(m.refreshed); age > f.cfg.MaxViewAge {
-		return fmt.Errorf("%w: last refresh %s ago", ErrStale, age.Round(time.Millisecond))
 	}
 	if m.phase != lifecycle.PhaseSteadyState {
 		return lifecycle.ErrBootstrapInProgress
