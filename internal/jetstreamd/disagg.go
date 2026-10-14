@@ -455,10 +455,11 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 	rt.orchMetrics = orchestrator.NewMetrics(reg)
 	rt.leaderMetrics = leader.NewMetrics(reg)
 	rt.sessions = &sessionFactory{
-		directory:       directory,
-		syncClient:      atmossync.NewClient(atmossync.Options{Client: xrpcClient}),
-		verifierMetrics: verifierMetrics,
-		logger:          processLogger,
+		directory:        directory,
+		syncClient:       atmossync.NewClient(atmossync.Options{Client: xrpcClient}),
+		verifierMetrics:  verifierMetrics,
+		logger:           processLogger,
+		unlimitedResyncs: opts.UnlimitedResyncs,
 		orch: orchestrator.Config{
 			RelayURL:      opts.RelayURL,
 			HTTPClient:    xrpcClient.HTTPClient.Val(),

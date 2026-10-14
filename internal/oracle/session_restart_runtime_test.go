@@ -150,6 +150,8 @@ func runSessionRestartCase(t *testing.T, tc sessionRestartCase, seedIdx int) {
 	}
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
+		// Oracle traffic resyncs a DID many times within seconds.
+		UnlimitedResyncs:               true,
 		Headless:                       true,
 		DataDir:                        dataDir,
 		StorageFS:                      fs,

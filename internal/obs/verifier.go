@@ -11,6 +11,10 @@ import (
 // no-op so tests can skip metric registration entirely.
 type VerifierMetrics struct {
 	Failures *prometheus.CounterVec
+	// ResyncsThrottled counts resyncs the per-DID budget refused. A DID
+	// that keeps failing verification draws one per failure until its
+	// budget refills.
+	ResyncsThrottled prometheus.Counter
 }
 
 // NewVerifierMetrics registers verifier counters against reg.
@@ -22,8 +26,14 @@ func NewVerifierMetrics(reg prometheus.Registerer) *VerifierMetrics {
 			Name:      "failures_total",
 			Help:      "Number of verifier rejections, by error class. kind=other is the catch-all and should be near-zero in steady state; sustained kind=other is a signal that a new error class needs categorizing.",
 		}, []string{"kind"}),
+		ResyncsThrottled: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "verifier",
+			Name:      "resyncs_throttled_total",
+			Help:      "Full-repo resyncs refused by the per-DID resync budget; the DID's commits stay pending until a resync is allowed.",
+		}),
 	}
-	reg.MustRegister(m.Failures)
+	reg.MustRegister(m.Failures, m.ResyncsThrottled)
 	return m
 }
 
@@ -31,6 +41,13 @@ func NewVerifierMetrics(reg prometheus.Registerer) *VerifierMetrics {
 func (m *VerifierMetrics) IncFailure(kind string) {
 	if m != nil {
 		m.Failures.WithLabelValues(kind).Inc()
+	}
+}
+
+// IncResyncThrottled counts one refused resync. nil-safe.
+func (m *VerifierMetrics) IncResyncThrottled() {
+	if m != nil {
+		m.ResyncsThrottled.Inc()
 	}
 }
 

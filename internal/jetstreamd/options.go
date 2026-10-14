@@ -187,6 +187,10 @@ type Options struct {
 	// OnSessionStart, if non-nil, is a test hook that fires as each writer
 	// session starts, before its orchestrator runs.
 	OnSessionStart func(epoch uint64)
+	// UnlimitedResyncs lifts the verifier's per-DID resync budget
+	// (resyncInterval). Production leaves it false; oracle traffic resyncs
+	// one DID many times within seconds and expects every resync to run.
+	UnlimitedResyncs bool
 }
 
 func (o Options) effectiveBackfillGlobalDownloads() int {

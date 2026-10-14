@@ -166,6 +166,8 @@ func (r *migrationRig) waitArchived() {
 
 func (r *migrationRig) baseOptions(name string) jetstreamd.Options {
 	return jetstreamd.Options{
+		// Oracle traffic resyncs a DID many times within seconds.
+		UnlimitedResyncs:               true,
 		PublicAddr:                     "127.0.0.1:0",
 		RelayURL:                       r.relay,
 		PLCURL:                         r.relay,

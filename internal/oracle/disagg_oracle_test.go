@@ -1157,6 +1157,8 @@ func disaggPodOptions(backend *jetstreamd.StorageBackend, ln *pipeListener, simC
 	storage.Hot.BatchMaxAge = 5 * time.Millisecond
 	storage.CatalogPollInterval = 10 * time.Millisecond
 	return jetstreamd.Options{
+		// Oracle traffic resyncs a DID many times within seconds.
+		UnlimitedResyncs:               true,
 		Storage:                        storage,
 		StorageBackend:                 backend,
 		MemoryLimit:                    8 << 30,

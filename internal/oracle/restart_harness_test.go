@@ -351,6 +351,8 @@ func TestOracleRestartChild(t *testing.T) {
 	cutoverGate := newCutoverDeliveryGate(relayURL, 30*time.Second)
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
+		// Oracle traffic resyncs a DID many times within seconds.
+		UnlimitedResyncs:               true,
 		PublicAddr:                     "127.0.0.1:0",
 		DebugAddr:                      "127.0.0.1:0",
 		DataDir:                        dataDir,

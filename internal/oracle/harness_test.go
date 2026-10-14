@@ -232,6 +232,8 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	debugClient := runtimeDebugLn.httpClient()
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
+		// Oracle traffic resyncs a DID many times within seconds.
+		UnlimitedResyncs:   true,
 		DataDir:            dataDir,
 		StorageFS:          storageFS,
 		RelayURL:           simURL,
