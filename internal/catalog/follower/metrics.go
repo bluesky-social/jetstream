@@ -16,7 +16,9 @@ const (
 type Metrics struct {
 	Revision          prometheus.Gauge
 	Lag               prometheus.GaugeFunc
+	RefreshInProgress prometheus.Gauge
 	RefreshDuration   prometheus.Histogram
+	RefreshPhase      *prometheus.HistogramVec
 	RefreshErrors     prometheus.Counter
 	NotifyReceived    prometheus.Counter
 	ListenErrors      prometheus.Counter
@@ -36,12 +38,23 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "revision",
 			Help: "catalog_revision of this pod's mirror.",
 		}),
+		RefreshInProgress: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "refresh_in_progress",
+			Help: "Whether this pod is refreshing its catalog mirror.",
+		}),
 		RefreshDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name:    "refresh_duration_seconds",
 			Help:    "Duration of follower ticks that changed the mirror, including footer and pointer-batch fetches.",
-			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16),
+			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 19),
 		}),
+		RefreshPhase: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name:    "refresh_phase_duration_seconds",
+			Help:    "Duration of each catalog refresh phase.",
+			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 19),
+		}, []string{"phase"}),
 		RefreshErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "refresh_errors_total",
@@ -74,8 +87,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}
 		return 0
 	})
-	reg.MustRegister(m.Revision, m.Lag, m.RefreshDuration, m.RefreshErrors,
-		m.NotifyReceived, m.ListenErrors, m.VisibilityLatency)
+	reg.MustRegister(m.Revision, m.Lag, m.RefreshInProgress, m.RefreshDuration,
+		m.RefreshPhase, m.RefreshErrors, m.NotifyReceived, m.ListenErrors,
+		m.VisibilityLatency)
 	return m
 }
 
@@ -91,9 +105,23 @@ func (m *Metrics) setRevision(rev uint64) {
 	}
 }
 
+func (m *Metrics) beginRefresh() func() {
+	if m == nil {
+		return func() {}
+	}
+	m.RefreshInProgress.Set(1)
+	return func() { m.RefreshInProgress.Set(0) }
+}
+
 func (m *Metrics) observeRefresh(seconds float64) {
 	if m != nil {
 		m.RefreshDuration.Observe(seconds)
+	}
+}
+
+func (m *Metrics) observeRefreshPhase(phase string, seconds float64) {
+	if m != nil {
+		m.RefreshPhase.WithLabelValues(phase).Observe(seconds)
 	}
 }
 

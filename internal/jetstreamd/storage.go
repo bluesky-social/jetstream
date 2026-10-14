@@ -63,7 +63,7 @@ type StorageConfig struct {
 	// CatalogPollInterval is the follower's poll period; it covers a lost
 	// NOTIFY.
 	CatalogPollInterval time.Duration
-	// MaxViewAge marks a pod not ready once its catalog mirror is older.
+	// MaxViewAge bounds catalog lag tolerated by object GC.
 	MaxViewAge time.Duration
 	// MaxArchiveResponseDuration cuts off one archive response.
 	MaxArchiveResponseDuration time.Duration

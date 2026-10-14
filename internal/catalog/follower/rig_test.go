@@ -229,11 +229,15 @@ func (r *rig) compact(seg uint64, seqs ...uint64) {
 type followerOpts struct {
 	listen   bool
 	manifest bool
+	logger   *slog.Logger
 }
 
 func (r *rig) follower(o followerOpts) (*follower.Follower, *follower.Metrics, *manifest.Manifest) {
 	r.t.Helper()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := o.logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	metrics := follower.NewMetrics(prometheus.NewRegistry())
 	cfg := follower.Config{
 		DB: r.db, Blob: r.blob, ArchiveID: testArchiveID,
