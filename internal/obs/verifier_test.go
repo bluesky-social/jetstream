@@ -71,6 +71,7 @@ func TestVerifierMetrics_NilSafeAndIncrement(t *testing.T) {
 	// nil receiver must be a no-op (matches the codebase convention).
 	var m *obs.VerifierMetrics
 	m.IncFailure("signature")
+	m.IncResyncThrottled()
 
 	reg := prometheus.NewRegistry()
 	m = obs.NewVerifierMetrics(reg)
@@ -78,7 +79,9 @@ func TestVerifierMetrics_NilSafeAndIncrement(t *testing.T) {
 	m.IncFailure("signature")
 	m.IncFailure("signature")
 	m.IncFailure("chain")
+	m.IncResyncThrottled()
 
 	require.Equal(t, float64(2), testutil.ToFloat64(m.Failures.WithLabelValues("signature")))
 	require.Equal(t, float64(1), testutil.ToFloat64(m.Failures.WithLabelValues("chain")))
+	require.Equal(t, float64(1), testutil.ToFloat64(m.ResyncsThrottled))
 }

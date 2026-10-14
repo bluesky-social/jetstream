@@ -76,9 +76,9 @@ directory instead.
 | Row | What it answers |
 |---|---|
 | Overview | storage mode, phase, leader, build, event rates, upstream freshness, visibility latency, catalog lag, integrity, memory and disk headroom |
-| Live firehose | relay intake, seq gaps (upstream loss), reconnects, verifier |
+| Live firehose | relay intake, seq gaps (upstream loss), reconnects, verifier failures and throttled resyncs |
 | Ingest writer & segments | append/drop rates, blocks and segments, seal latency, per-pod readable log (both modes) |
-| Leadership & catalog · disaggregated | who leads, why sessions ended, lease/fence errors, event visibility latency, follower lag and refresh |
+| Leadership & catalog · disaggregated | who leads, why sessions ended, lease/fence errors, event visibility latency, follower lag and refresh phases, readable-log feed lag and throughput |
 | Hot path & maintainer · disaggregated | hot batch commits, admission backpressure, unfolded backlog, folds/seals, bootstrap direct writer |
 | PostgreSQL · disaggregated | transactions by kind (rate, p99, time, errors), connection pool use and waits |
 | Object store & GC · disaggregated | S3 requests, latency, bytes, errors and corruption; object states, GC, object cache |

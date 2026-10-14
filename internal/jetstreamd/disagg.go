@@ -420,7 +420,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 	coldRd := subscribe.NewColdReader(subscribe.ColdReaderConfig{
 		Catalog:         f,
 		Fetcher:         f,
-		Ready:           f.Ready,
+		Ready:           f.Loaded,
 		Floor:           f.LogFloor,
 		Gaps:            f.SeqGaps,
 		Keyer:           f,
@@ -455,10 +455,12 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 	rt.orchMetrics = orchestrator.NewMetrics(reg)
 	rt.leaderMetrics = leader.NewMetrics(reg)
 	rt.sessions = &sessionFactory{
-		directory:       directory,
-		syncClient:      atmossync.NewClient(atmossync.Options{Client: xrpcClient}),
-		verifierMetrics: verifierMetrics,
-		logger:          processLogger,
+		directory:        directory,
+		syncClient:       atmossync.NewClient(atmossync.Options{Client: xrpcClient}),
+		verifierMetrics:  verifierMetrics,
+		logger:           processLogger,
+		resyncInterval:   opts.effectiveResyncInterval(),
+		unlimitedResyncs: opts.UnlimitedResyncs,
 		orch: orchestrator.Config{
 			RelayURL:      opts.RelayURL,
 			HTTPClient:    xrpcClient.HTTPClient.Val(),

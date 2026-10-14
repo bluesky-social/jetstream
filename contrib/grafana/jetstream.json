@@ -1820,7 +1820,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Verifier failures",
-      "description": "Verifier rejections by error class. A sustained 'other' rate means a new class needs categorizing.",
+      "description": "Verifier rejections by error class, and full-repo resyncs the per-DID budget (JETSTREAM_RESYNC_INTERVAL) refused. A sustained 'other' rate means a new class needs categorizing; sustained throttling means some repo keeps failing verification.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1905,6 +1905,17 @@
           "expr": "sum by (kind) (rate(jetstream_verifier_failures_total{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"}[$__rate_interval]))",
           "legendFormat": "{{kind}}/s",
           "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(jetstream_verifier_resyncs_throttled_total{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "resyncs throttled/s",
+          "refId": "B",
           "range": true,
           "instant": false
         }
@@ -3793,6 +3804,455 @@
       ]
     },
     {
+      "id": 1047,
+      "type": "timeseries",
+      "title": "Readable log feed lag",
+      "description": "Per pod: seqs the readable log trails the published mirror by. A bulk burst (a large repo resyncing) raises it and the feeder drains it; readiness fails only when it stops draining for JETSTREAM_MAX_VIEW_AGE.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 4,
+            "spanNulls": true,
+            "insertNulls": false,
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (pod) (jetstream_catalog_feed_lag_events{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 1048,
+      "type": "timeseries",
+      "title": "Readable log feed",
+      "description": "Per pod: events appended to the readable log, and failed feed passes (the next catalog tick retries).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 4,
+            "spanNulls": true,
+            "insertNulls": false,
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "cps",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* errors/s"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "cps"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pod) (rate(jetstream_catalog_feed_events_total{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} events/s",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pod) (rate(jetstream_catalog_feed_errors_total{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} errors/s",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 1049,
+      "type": "timeseries",
+      "title": "Feed window latency",
+      "description": "Per feed window, across pods: fetch_decode is the concurrent block fetch, verify and decode; append is the one-lock readable-log append.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 4,
+            "spanNulls": true,
+            "insertNulls": false,
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* p50"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (phase, le) (rate(jetstream_catalog_feed_phase_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{phase}} p50",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (phase, le) (rate(jetstream_catalog_feed_phase_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{phase}} p99",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 1050,
+      "type": "timeseries",
+      "title": "Catalog refresh phases",
+      "description": "p99 of each follower refresh phase across pods (read on every tick; build and manifest_publish on ticks that changed the mirror), and per pod how long the in-flight refresh has run. A climbing running line is a hung refresh.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "pointSize": 4,
+            "spanNulls": true,
+            "insertNulls": false,
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (phase, le) (rate(jetstream_catalog_refresh_phase_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{phase}} p99",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (pod) (jetstream_catalog_refresh_running_seconds{job=~\"$job\",instance=~\"$instance\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} running",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
       "id": 1044,
       "type": "row",
       "title": "Hot path & maintainer · disaggregated",
@@ -3802,7 +4262,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 76
       }
     },
     {
@@ -3818,7 +4278,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 69
+        "y": 77
       },
       "fieldConfig": {
         "defaults": {
@@ -3946,7 +4406,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 69
+        "y": 77
       },
       "fieldConfig": {
         "defaults": {
@@ -4064,7 +4524,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 69
+        "y": 77
       },
       "fieldConfig": {
         "defaults": {
@@ -4192,7 +4652,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 77
+        "y": 85
       },
       "fieldConfig": {
         "defaults": {
@@ -4310,7 +4770,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 77
+        "y": 85
       },
       "fieldConfig": {
         "defaults": {
@@ -4463,7 +4923,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 77
+        "y": 85
       },
       "fieldConfig": {
         "defaults": {
@@ -4581,7 +5041,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 85
+        "y": 93
       },
       "fieldConfig": {
         "defaults": {
@@ -4731,7 +5191,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 85
+        "y": 93
       },
       "fieldConfig": {
         "defaults": {
@@ -4864,7 +5324,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 85
+        "y": 93
       },
       "fieldConfig": {
         "defaults": {
@@ -4979,7 +5439,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 93
+        "y": 101
       }
     },
     {
@@ -4995,7 +5455,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 94
+        "y": 102
       },
       "fieldConfig": {
         "defaults": {
@@ -5089,7 +5549,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 94
+        "y": 102
       },
       "fieldConfig": {
         "defaults": {
@@ -5183,7 +5643,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 94
+        "y": 102
       },
       "fieldConfig": {
         "defaults": {
@@ -5277,7 +5737,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 102
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -5371,7 +5831,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 102
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -5525,7 +5985,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 102
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -5644,7 +6104,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 110
+        "y": 118
       }
     },
     {
@@ -5660,7 +6120,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 111
+        "y": 119
       },
       "fieldConfig": {
         "defaults": {
@@ -5754,7 +6214,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 111
+        "y": 119
       },
       "fieldConfig": {
         "defaults": {
@@ -5882,7 +6342,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 111
+        "y": 119
       },
       "fieldConfig": {
         "defaults": {
@@ -5976,7 +6436,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 119
+        "y": 127
       },
       "fieldConfig": {
         "defaults": {
@@ -6092,7 +6552,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 119
+        "y": 127
       },
       "fieldConfig": {
         "defaults": {
@@ -6186,7 +6646,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 119
+        "y": 127
       },
       "fieldConfig": {
         "defaults": {
@@ -6330,7 +6790,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 127
+        "y": 135
       },
       "fieldConfig": {
         "defaults": {
@@ -6473,7 +6933,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 127
+        "y": 135
       },
       "fieldConfig": {
         "defaults": {
@@ -6563,7 +7023,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 135
+        "y": 143
       },
       "panels": []
     },
@@ -6580,7 +7040,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -6646,7 +7106,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -6711,7 +7171,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -6780,7 +7240,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 136
+        "y": 144
       },
       "fieldConfig": {
         "defaults": {
@@ -6853,7 +7313,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 140
+        "y": 148
       },
       "fieldConfig": {
         "defaults": {
@@ -7015,7 +7475,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 140
+        "y": 148
       },
       "fieldConfig": {
         "defaults": {
@@ -7131,7 +7591,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 148
+        "y": 156
       },
       "fieldConfig": {
         "defaults": {
@@ -7236,7 +7696,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 148
+        "y": 156
       },
       "fieldConfig": {
         "defaults": {
@@ -7409,7 +7869,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 156
+        "y": 164
       },
       "fieldConfig": {
         "defaults": {
@@ -7538,7 +7998,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 156
+        "y": 164
       },
       "fieldConfig": {
         "defaults": {
@@ -7667,7 +8127,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 164
+        "y": 172
       },
       "panels": []
     },
@@ -7684,7 +8144,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 165
+        "y": 173
       },
       "fieldConfig": {
         "defaults": {
@@ -7778,7 +8238,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 165
+        "y": 173
       },
       "fieldConfig": {
         "defaults": {
@@ -7900,7 +8360,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 165
+        "y": 173
       },
       "fieldConfig": {
         "defaults": {
@@ -8016,7 +8476,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 173
+        "y": 181
       },
       "fieldConfig": {
         "defaults": {
@@ -8196,7 +8656,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 173
+        "y": 181
       },
       "fieldConfig": {
         "defaults": {
@@ -8290,7 +8750,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 173
+        "y": 181
       },
       "fieldConfig": {
         "defaults": {
@@ -8437,7 +8897,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 181
+        "y": 189
       },
       "fieldConfig": {
         "defaults": {
@@ -8531,7 +8991,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 181
+        "y": 189
       },
       "fieldConfig": {
         "defaults": {
@@ -8647,7 +9107,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 181
+        "y": 189
       },
       "fieldConfig": {
         "defaults": {
@@ -8768,7 +9228,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 189
+        "y": 197
       },
       "panels": []
     },
@@ -8785,7 +9245,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 190
+        "y": 198
       },
       "fieldConfig": {
         "defaults": {
@@ -8936,7 +9396,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 190
+        "y": 198
       },
       "fieldConfig": {
         "defaults": {
@@ -9041,7 +9501,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 190
+        "y": 198
       },
       "fieldConfig": {
         "defaults": {
@@ -9146,7 +9606,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 198
+        "y": 206
       },
       "fieldConfig": {
         "defaults": {
@@ -9240,7 +9700,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 198
+        "y": 206
       },
       "fieldConfig": {
         "defaults": {
@@ -9334,7 +9794,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 198
+        "y": 206
       },
       "fieldConfig": {
         "defaults": {
@@ -9428,7 +9888,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 198
+        "y": 206
       },
       "fieldConfig": {
         "defaults": {
@@ -9522,7 +9982,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 206
+        "y": 214
       },
       "fieldConfig": {
         "defaults": {
@@ -9638,7 +10098,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 206
+        "y": 214
       },
       "fieldConfig": {
         "defaults": {
@@ -9729,7 +10189,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 214
+        "y": 222
       },
       "panels": []
     },
@@ -9746,7 +10206,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 215
+        "y": 223
       },
       "fieldConfig": {
         "defaults": {
@@ -9840,7 +10300,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 215
+        "y": 223
       },
       "fieldConfig": {
         "defaults": {
@@ -9934,7 +10394,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 215
+        "y": 223
       },
       "fieldConfig": {
         "defaults": {
@@ -10128,7 +10588,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 223
+        "y": 231
       },
       "panels": [
         {
@@ -10144,7 +10604,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 224
+            "y": 232
           },
           "fieldConfig": {
             "defaults": {
@@ -10254,7 +10714,7 @@
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 224
+            "y": 232
           },
           "fieldConfig": {
             "defaults": {
@@ -10390,7 +10850,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 224
+            "y": 232
           },
           "fieldConfig": {
             "defaults": {
@@ -10517,7 +10977,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 232
+            "y": 240
           },
           "fieldConfig": {
             "defaults": {
@@ -10588,7 +11048,7 @@
             "h": 8,
             "w": 16,
             "x": 8,
-            "y": 232
+            "y": 240
           },
           "fieldConfig": {
             "defaults": {
@@ -10680,7 +11140,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 240
+        "y": 248
       },
       "panels": []
     },
@@ -10697,7 +11157,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 241
+        "y": 249
       },
       "fieldConfig": {
         "defaults": {
@@ -10802,7 +11262,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 241
+        "y": 249
       },
       "fieldConfig": {
         "defaults": {
@@ -10929,7 +11389,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 241
+        "y": 249
       },
       "fieldConfig": {
         "defaults": {
@@ -11034,7 +11494,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 249
+        "y": 257
       },
       "fieldConfig": {
         "defaults": {
@@ -11139,7 +11599,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 249
+        "y": 257
       },
       "fieldConfig": {
         "defaults": {
@@ -11244,7 +11704,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 249
+        "y": 257
       },
       "fieldConfig": {
         "defaults": {

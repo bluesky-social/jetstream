@@ -18,6 +18,10 @@ var (
 	// ErrLoading is Ready's error until the first steady-state mirror and
 	// its footers are loaded.
 	ErrLoading = errors.New("catalog: mirror loading")
+	// ErrStale is Ready's error while the follower is stuck: its mirror is
+	// older than MaxViewAge, or its readable log has trailed the mirror
+	// for MaxViewAge without progress.
+	ErrStale = errors.New("catalog: mirror stale")
 )
 
 // Object implements protocol.RowSource. A plain lookup answers from the
@@ -55,10 +59,36 @@ func (f *Follower) Log() *ingest.ReadableLog {
 	return nil
 }
 
-// Ready implements lifecycle.Readiness (design §11.6): a steady-state mirror
-// with its manifest loaded. Refresh lag is observable but does not invalidate
-// an immutable mirror that remains safe to serve.
-func (f *Follower) Ready(context.Context) error {
+// Ready implements lifecycle.Readiness (design §11.6): a loaded mirror whose
+// follower is not stuck. A tick costs about one catalog read whatever a
+// revision holds, so a mirror older than MaxViewAge means the catalog is
+// unreachable or the tick hangs. The feed is allowed to trail the mirror by
+// any amount while it makes progress; a feed that stops (its object reads
+// fail or hang) leaves subscribers waiting at the log's tip, so it counts
+// too. Readiness gates new requests only; see Loaded.
+func (f *Follower) Ready(ctx context.Context) error {
+	if err := f.Loaded(ctx); err != nil {
+		return err
+	}
+	m := f.cur.Load()
+	now := f.cfg.Now()
+	if age := now.Sub(m.refreshed); age > f.cfg.MaxViewAge {
+		return fmt.Errorf("%w: last refresh %s ago", ErrStale, age.Round(time.Millisecond))
+	}
+	if flog := f.flog.Load(); flog != nil {
+		tip, logTip := m.view.TipSeq(catalog.Main), flog.Log().TipSeq()
+		if since := now.Sub(time.Unix(0, f.fedAt.Load())); tip > logTip && since > f.cfg.MaxViewAge {
+			return fmt.Errorf("%w: readable log %d seqs behind, no progress for %s", ErrStale, tip-logTip, since.Round(time.Millisecond))
+		}
+	}
+	return nil
+}
+
+// Loaded reports whether the pod holds a steady-state mirror with its
+// manifest loaded, however old. Streams already open keep reading through a
+// stale mirror (design §11.6): it is immutable, and every seq below the
+// readable log's floor is in it.
+func (f *Follower) Loaded(context.Context) error {
 	m := f.cur.Load()
 	if m == nil {
 		return ErrLoading

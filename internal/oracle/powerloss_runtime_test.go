@@ -264,6 +264,8 @@ func runStrictPowerLossRuntime(t *testing.T, opts strictPowerLossRunOptions) str
 	}
 
 	rt, err := jetstreamd.Build(ctx, jetstreamd.Options{
+		// Oracle traffic resyncs a DID many times within seconds.
+		UnlimitedResyncs:               true,
 		Headless:                       true,
 		DataDir:                        opts.dataDir,
 		StorageFS:                      opts.fs,

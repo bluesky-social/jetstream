@@ -3,6 +3,7 @@ package ingest
 import (
 	"fmt"
 
+	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/segment"
 )
 
@@ -36,6 +37,27 @@ func (f *FollowerLog) Append(ev *segment.Event) error {
 		return fmt.Errorf("ingest: follower log append seq %d, want %d", ev.Seq, tip)
 	}
 	f.log.append(ev)
+	return nil
+}
+
+// AppendRun appends evs, which must carry ascending seqs at or above the
+// log's tip, and then advances the tip to next. Seqs between them stay
+// vacant, as Skip leaves them. Readers are woken once for the whole run.
+// The log copies each event.
+func (f *FollowerLog) AppendRun(evs []segment.Event, next uint64) error {
+	want := f.log.TipSeq()
+	entries := make([]*ReadLogEntry, len(evs))
+	for i := range evs {
+		if evs[i].Seq < want {
+			return fmt.Errorf("ingest: follower log append seq %d, want at least %d", evs[i].Seq, want)
+		}
+		want = evs[i].Seq + 1
+		entries[i] = catalog.NewLogEntry(&evs[i])
+	}
+	if next < want {
+		return fmt.Errorf("ingest: follower log run ends at %d, before seq %d", next, want-1)
+	}
+	f.log.appendRun(entries, next)
 	return nil
 }
 

@@ -3,7 +3,6 @@ package follower
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -73,6 +72,16 @@ func (f *Follower) read(ctx context.Context, old *mirror) (*changes, error) {
 	return c, nil
 }
 
+// readChangesTimeout bounds one ReadChanges. statement_timeout ends a slow
+// statement on the server, but not a connection that stopped answering:
+// on 2026-10-14 one tick's read on each of two pods hung for about a
+// minute while RDS sat idle. Cancelling closes the connection, and the next
+// tick reads on a fresh one. It exceeds statement_timeout so that a slow
+// query still fails with the server's error. Full reads (readTx) are left
+// to statement_timeout: a first load reads every segment row and can take
+// longer than this.
+const readChangesTimeout = 15 * time.Second
+
 // readChanges is an incremental tick's read as one DB.ReadChanges, which
 // costs one round trip to the catalog where readTx costs about eight: every
 // live event waits for a tick to see it, so this is most of a follower's
@@ -80,6 +89,8 @@ func (f *Follower) read(ctx context.Context, old *mirror) (*changes, error) {
 // readTx after all: on a phase change, which reloads every segment, or
 // when more changed than ReadChanges reads.
 func (f *Follower) readChanges(ctx context.Context, old *mirror) (*changes, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, readChangesTimeout)
+	defer cancel()
 	rc, err := f.cfg.DB.ReadChanges(ctx, catalog.ChangesQuery{
 		Since: old.rev,
 		// Every hot batch not in old was committed at or above old's
@@ -655,82 +666,6 @@ func (m *mirror) tails(objects objIndex) (map[catalog.Namespace]catalog.SegmentV
 		tails[catalog.Main] = v
 	}
 	return tails, nil
-}
-
-// feed returns the events [log tip, next's Main tip) in seq order, and the
-// seq the log's tip moves to: blocks folded (or sealed) since the last tick
-// first, read through RefsFrom, then the hot batches (design §11.1). Every
-// seq appears at most once and in order. Hot batches and active blocks are
-// dense; a sealed block may lack seqs inside its envelope, because a
-// compaction pass that ran since the last tick dropped them (design §12).
-// Two blocks may also sit either side of a vacancy a migrated local archive
-// registered. The caller leaves all those seqs vacant in the log.
-func (f *Follower) feed(ctx context.Context, next *mirror, from uint64, rd *protocol.Reader) ([]segment.Event, uint64, error) {
-	tip := next.view.TipSeq(catalog.Main)
-	if tip <= from {
-		if tip != 0 && tip < from {
-			return nil, 0, catalog.Corruptf(catalog.SourceInvariant, "main tip %d is below the readable log tip %d", tip, from)
-		}
-		return nil, from, nil
-	}
-	fetch := tickFetcher{rd: rd}
-	var out []segment.Event
-	want := from
-	for ref := range next.view.RefsFrom(catalog.Main, from) {
-		events, err := catalog.DecodeRef(ctx, fetch, ref)
-		if err != nil {
-			if _, ok := catalog.IsCorruption(err); ok {
-				return nil, 0, err
-			}
-			if _, inline := ref.Loc.(catalog.InlineBlock); inline || errors.Is(err, segment.ErrCorruptSegment) {
-				return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "decode main block [%d,%d]: %v", ref.MinSeq, ref.MaxSeq, err)
-			}
-			return nil, 0, fmt.Errorf("follower: read main block [%d,%d]: %w", ref.MinSeq, ref.MaxSeq, err)
-		}
-		if want < ref.MinSeq {
-			if !catalog.Bridges(next.gaps, want, ref.MinSeq) {
-				return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] starts after seq %d", ref.MinSeq, ref.MaxSeq, want)
-			}
-			want = ref.MinSeq
-		}
-		// Only a sealed generation can have been compacted.
-		sealed := ref.Generation != 0
-		for i := range events {
-			ev := &events[i]
-			if ev.Seq < want {
-				continue
-			}
-			if ev.Seq > ref.MaxSeq || (ev.Seq != want && !sealed) {
-				return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] holds seq %d where %d was due", ref.MinSeq, ref.MaxSeq, ev.Seq, want)
-			}
-			out = append(out, *ev)
-			want = ev.Seq + 1
-		}
-		if sealed {
-			want = ref.MaxSeq + 1
-		}
-		if want != ref.MaxSeq+1 {
-			return nil, 0, catalog.Corruptf(catalog.SourceHotBatch, "main block [%d,%d] ends at seq %d", ref.MinSeq, ref.MaxSeq, want)
-		}
-	}
-	if want != tip {
-		return nil, 0, catalog.Corruptf(catalog.SourceInvariant, "main refs from %d end at %d, before tip %d", from, want, tip)
-	}
-	return out, tip, nil
-}
-
-// tickFetcher reads a not-yet-published mirror's blocks.
-type tickFetcher struct{ rd *protocol.Reader }
-
-func (t tickFetcher) Fetch(ctx context.Context, ref catalog.BlockRef) ([]byte, error) {
-	switch loc := ref.Loc.(type) {
-	case catalog.InlineBlock:
-		return loc.Frame, nil
-	case catalog.ObjectBlock:
-		return t.rd.Get(ctx, loc.ObjectID)
-	default:
-		return nil, fmt.Errorf("follower: unsupported locator %T", ref.Loc)
-	}
 }
 
 // remoteSegments lists Main's sealed segments for the manifest's initial

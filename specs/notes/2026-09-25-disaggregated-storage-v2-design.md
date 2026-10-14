@@ -1294,6 +1294,31 @@ stopped advancing.
 batch boundaries. At pod start it is set to the `main` tip plus one, so the
 readable log starts empty. Older seqs are served by the cold reader.
 
+As built (2026-10-14), the swap comes first and the readable log is fed after
+it, outside the tick. On 2026-10-14 pop2's leader committed bulk resyncs of
+300k-800k events within seconds. Feeding them inside the tick took 25-90s,
+so every pod's mirror passed `JETSTREAM_MAX_VIEW_AGE` at once and every pod
+answered 503. Most of that time went to appending one event at a time: each
+append woke all ~300 subscribers parked on the log, which capped the feed at
+about 17k events/s. Now:
+
+- A tick reads, builds, swaps the mirror, and publishes to the manifest.
+  Its cost does not grow with the number of events a revision brings.
+- A feeder goroutine, rung after every tick, reads the current mirror's
+  blocks from the log's tip. It fetches and decodes them concurrently, a
+  window of `2 × JETSTREAM_S3_READ_CONCURRENCY` blocks at a time. It appends
+  each window in one run (one lock, one wake-up) and advances the durable
+  watermark past it.
+- Every seq the log holds is in a published mirror, so a reader that sees the
+  log evict a seq finds it in the mirror it loads next. Until the feeder
+  catches up, a reader at the log's tip waits there, as it would for the next
+  commit.
+- `Refresh` runs a tick and then a feed pass, so callers still see the log
+  current. `GenerationParts` refreshes the mirror alone.
+- One `ReadChanges` is cut off after 15s
+  (`follower.readChangesTimeout`, above `statement_timeout`): a connection
+  that stopped answering otherwise hangs the tick until TCP gives up.
+
 ### 11.2 Mirror contents
 
 - Archive: `archive_id`, `catalog_revision`, and the time of the last successful
@@ -1415,6 +1440,13 @@ requested time.
   `JETSTREAM_MAX_VIEW_AGE` (default 30s), the pod reports not ready and returns
   503 on archive and subscribe endpoints. Existing websocket streams stay open
   and wait.
+
+  As built (2026-10-14), the pod is also not ready when the readable log
+  trails the mirror and has made no progress for `JETSTREAM_MAX_VIEW_AGE`. A
+  feed that is behind but progressing does not count. Existing streams use
+  `Follower.Loaded`, which checks only that a steady-state mirror is loaded,
+  so they keep reading a stale mirror. Before this, the cold reader re-checked
+  readiness on every batch and disconnected them.
 - A request that names a seq, segment name, block, or `beforeSeq` above what
   the mirror knows triggers one synchronous follower tick before answering. If
   the value is still unknown after the tick, answer as today (for example,

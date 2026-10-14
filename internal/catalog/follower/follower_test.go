@@ -1,10 +1,8 @@
 package follower_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log/slog"
 	"math/rand/v2"
 	"testing"
 	"testing/synctest"
@@ -179,8 +177,43 @@ func TestFollower_LostNotifyCoveredByPoll(t *testing.T) {
 	})
 }
 
-// A slow refresh keeps serving the previous mirror while lag reports the delay.
-func TestFollower_SlowFollowerKeepsServing(t *testing.T) {
+// A catalog read that hangs is cut off, and the next tick reads again; one
+// hung read costs no readiness.
+func TestFollower_HungReadTimesOut(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		r := newRig(t)
+		r.setPhase(lifecycle.PhaseSteadyState)
+		f, metrics, _ := r.follower(followerOpts{})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- f.Run(ctx) }()
+		synctest.Wait()
+
+		r.db.InjectFaults(&storagefake.Fault{Kind: storagefake.FaultSlowRead, Ordinal: 1, Delay: time.Hour})
+		time.Sleep(10 * time.Second)
+		require.Greater(t, testutil.ToFloat64(metrics.RefreshRunning), 9.0, "the hung tick shows as running")
+		require.NoError(t, f.Ready(ctx))
+
+		r.commitHot(2, false)
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		require.Empty(t, r.db.Unfired())
+		require.Equal(t, float64(1), testutil.ToFloat64(metrics.RefreshErrors))
+		require.Zero(t, testutil.ToFloat64(metrics.RefreshRunning))
+		require.Less(t, testutil.ToFloat64(metrics.Lag), 1.0)
+		require.Equal(t, uint64(3), f.Log().TipSeq())
+		require.NoError(t, f.Ready(ctx))
+
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+}
+
+// A follower whose catalog reads keep hanging reports not ready once its
+// mirror outlives MaxViewAge; open streams may still read it (Loaded), and
+// readiness returns with the next good tick.
+func TestFollower_StuckRefreshLosesReadiness(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		r := newRig(t)
@@ -192,37 +225,90 @@ func TestFollower_SlowFollowerKeepsServing(t *testing.T) {
 		synctest.Wait()
 		require.NoError(t, f.Ready(ctx))
 
-		r.db.InjectFaults(&storagefake.Fault{Kind: storagefake.FaultSlowRead, Ordinal: 1, Delay: 2 * follower.DefaultMaxViewAge})
+		for i := 1; i <= 3; i++ {
+			r.db.InjectFaults(&storagefake.Fault{Kind: storagefake.FaultSlowRead, Ordinal: i, Delay: time.Hour})
+		}
 		time.Sleep(follower.DefaultMaxViewAge + time.Second)
-		require.NoError(t, f.Ready(ctx))
+		require.ErrorIs(t, f.Ready(ctx), follower.ErrStale)
+		require.NoError(t, f.Loaded(ctx), "open streams keep reading the stale mirror")
 		require.Greater(t, testutil.ToFloat64(metrics.Lag), follower.DefaultMaxViewAge.Seconds())
-		require.Equal(t, float64(1), testutil.ToFloat64(metrics.RefreshInProgress))
 
 		time.Sleep(follower.DefaultMaxViewAge)
 		synctest.Wait()
-		require.NoError(t, f.Ready(ctx))
 		require.Empty(t, r.db.Unfired())
-		require.Zero(t, testutil.ToFloat64(metrics.RefreshInProgress))
+		require.NoError(t, f.Ready(ctx))
 
 		cancel()
 		require.ErrorIs(t, <-done, context.Canceled)
 	})
 }
 
-func TestFollower_RefreshLogsRevisions(t *testing.T) {
+// The mirror does not wait for the readable log: while the log's object
+// reads fail, ticks keep the mirror fresh and the pod stays ready until the
+// feed has made no progress for MaxViewAge. The feed then catches up.
+func TestFollower_FeedStallLosesReadiness(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		r := newRig(t)
+		r.setPhase(lifecycle.PhaseSteadyState)
+		f, metrics, _ := r.follower(followerOpts{listen: true})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- f.Run(ctx) }()
+		synctest.Wait()
+
+		r.blobDown.on.Store(true)
+		r.commitHot(3, true) // 1-3
+		r.commitHot(2, true) // 4-5
+		synctest.Wait()
+		require.Equal(t, uint64(6), f.Snapshot().TipSeq(catalog.Main), "the mirror moved on")
+		require.Equal(t, uint64(1), f.Log().TipSeq(), "the log did not")
+		require.Equal(t, float64(5), testutil.ToFloat64(metrics.FeedLag))
+		require.Positive(t, testutil.ToFloat64(metrics.FeedErrors))
+		require.NoError(t, f.Ready(ctx), "a feed may trail for a while")
+
+		time.Sleep(follower.DefaultMaxViewAge + time.Second)
+		synctest.Wait()
+		require.Less(t, testutil.ToFloat64(metrics.Lag), 1.0, "ticks kept the mirror fresh")
+		err := f.Ready(ctx)
+		require.ErrorIs(t, err, follower.ErrStale)
+		require.ErrorContains(t, err, "readable log")
+
+		r.blobDown.on.Store(false)
+		time.Sleep(follower.DefaultPollInterval)
+		synctest.Wait()
+		require.NoError(t, f.Ready(ctx))
+		require.Zero(t, testutil.ToFloat64(metrics.FeedLag))
+		require.Equal(t, float64(5), testutil.ToFloat64(metrics.FeedEvents))
+		r.requireStream(logEvents(t, f, 1), 1)
+
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+}
+
+// A revision that brings many blocks is fed in several windows, in order,
+// and the log is durable through all of them.
+func TestFollower_FeedWindows(t *testing.T) {
 	t.Parallel()
 	r := newRig(t)
 	r.setPhase(lifecycle.PhaseSteadyState)
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	f, _, _ := r.follower(followerOpts{logger: logger})
-	require.NoError(t, f.Refresh(t.Context()))
+	f, metrics, _ := r.follower(followerOpts{})
+	ctx := t.Context()
+	require.NoError(t, f.Refresh(ctx))
 
-	output := logs.String()
-	require.Contains(t, output, "catalog refresh started")
-	require.Contains(t, output, "previous_revision=0")
-	require.Contains(t, output, "target_revision=")
-	require.Contains(t, output, "catalog refresh completed")
+	// ReadConcurrency 4 feeds 8 blocks a window; 30 spans four.
+	for i := range 30 {
+		r.commitHot(1+i%3, i%2 == 0)
+		if i%7 == 6 {
+			r.fold(2)
+		}
+	}
+	require.NoError(t, f.Refresh(ctx))
+	r.requireStream(logEvents(t, f, 1), 1)
+	require.Equal(t, f.Log().TipSeq(), f.Log().DurableSeq())
+	require.Equal(t, float64(len(r.events)), testutil.ToFloat64(metrics.FeedEvents))
+	require.Zero(t, testutil.ToFloat64(metrics.FeedLag))
 }
 
 // Readiness needs steady state; the log and the manifest start there.

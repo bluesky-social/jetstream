@@ -2,6 +2,7 @@ package jetstreamd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/gt"
+	"golang.org/x/time/rate"
 )
 
 // A writer session is one run of the ingest lifecycle under the writer lock
@@ -26,6 +28,16 @@ import (
 // writes, is built per session so a new session starts from durable state
 // alone. Everything that serves reads is built once per process and survives
 // session changes through writerSlot and compactionDeadline.
+
+// Each full-repo resync re-archives every record in the repo, so a repo that
+// keeps failing verification costs its whole size per resync. On 2026-10-14 a
+// bot whose every commit repeated an op path drew atmos's default budget
+// (burst 5, refilling 5 a minute) in 13s: five resyncs of its ~82k-record
+// repo, 410k bulk events, and every follower fell behind. One resync per DID
+// per Options.ResyncInterval bounds such a repo to its size every interval. A
+// DID throttled meanwhile keeps its commits pending in the verifier until a
+// resync is allowed again.
+const resyncBurst = 1
 
 // writerSession holds one session's write-side state.
 type writerSession struct {
@@ -45,6 +57,10 @@ type sessionFactory struct {
 	syncClient      *atmossync.Client
 	verifierMetrics *obs.VerifierMetrics
 	logger          *slog.Logger
+	// resyncInterval and unlimitedResyncs set the verifier's per-DID resync
+	// budget (Options.ResyncInterval, Options.UnlimitedResyncs).
+	resyncInterval   time.Duration
+	unlimitedResyncs bool
 
 	// orch is the orchestrator config with every process-lifetime field set.
 	// build fills in the per-session ones.
@@ -65,21 +81,9 @@ func (f *sessionFactory) buildWith(store metastore.Store, disagg *orchestrator.D
 	// cached until its compactor has scheduled a pass.
 	schedule := orchestrator.NewCompactionScheduleState()
 
-	verifierLogger := f.logger.With(slog.String("component", "verifier"))
-	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
-		Directory:  f.directory,
-		StateStore: stateStore,
-		SyncClient: gt.Some(f.syncClient),
-		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			f.verifierMetrics.IncFailure(obs.Classify(vErr))
-			verifierLogger.Warn("verification failure",
-				"did", did,
-				"err", vErr,
-			)
-		}),
-	})
+	verifier, err := f.newVerifier(stateStore)
 	if err != nil {
-		return nil, fmt.Errorf("serve: build verifier: %w", err)
+		return nil, err
 	}
 
 	cfg := f.orch
@@ -100,6 +104,33 @@ func (f *sessionFactory) buildWith(store metastore.Store, disagg *orchestrator.D
 		tombstones: tombstones,
 		schedule:   schedule,
 	}, nil
+}
+
+// newVerifier builds a session's firehose verifier over stateStore.
+func (f *sessionFactory) newVerifier(stateStore atmossync.StateStore) (*atmossync.Verifier, error) {
+	resyncLimit := rate.Every(f.resyncInterval)
+	if f.unlimitedResyncs {
+		resyncLimit = rate.Inf
+	}
+	verifierLogger := f.logger.With(slog.String("component", "verifier"))
+	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
+		Directory:   f.directory,
+		StateStore:  stateStore,
+		SyncClient:  gt.Some(f.syncClient),
+		ResyncLimit: gt.Some(resyncLimit),
+		ResyncBurst: gt.Some(resyncBurst),
+		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
+			f.verifierMetrics.IncFailure(obs.Classify(vErr))
+			verifierLogger.Warn("verification failure",
+				"did", did,
+				"err", vErr,
+			)
+		}),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("serve: build verifier: %w", err)
+	}
+	return verifier, nil
 }
 
 // runSession is the leader.SessionFunc. It returns only after the
@@ -157,6 +188,13 @@ func (r *Runtime) runWriterSession(ctx context.Context, epoch uint64, s *writerS
 				case err, ok := <-s.verifier.AsyncErrors():
 					if !ok {
 						return nil
+					}
+					// The budget refuses every failure a throttled DID
+					// keeps raising; the verification failure itself
+					// was already logged.
+					if _, ok := errors.AsType[*atmossync.ResyncRateLimitedError](err); ok {
+						r.sessions.verifierMetrics.IncResyncThrottled()
+						continue
 					}
 					verifierLogger.Warn("async error", "err", err)
 				}

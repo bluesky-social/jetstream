@@ -31,6 +31,9 @@ const (
 	DefaultPendingRepoPassWorkers     = backfill.DefaultPendingRepoPassWorkers
 	DefaultFailedRepoRetryHostWorkers = backfill.DefaultFailedRepoRetryHostWorkers
 	DefaultFailedRepoRetryMaxDelay    = backfill.DefaultFailedRepoRetryMaxDelay
+	// DefaultResyncInterval is how often the verifier may full-repo resync
+	// any one DID; see resyncBurst.
+	DefaultResyncInterval = 10 * time.Minute
 	// DefaultCompactionCacheGrace is a bounded freshness cushion for archive
 	// responses already in a CDN while a scheduled rewrite pass runs.
 	DefaultCompactionCacheGrace = 5 * time.Minute
@@ -88,6 +91,9 @@ type Options struct {
 	PendingRepoPassWorkers         int
 	FailedRepoRetryHostWorkers     int
 	FailedRepoRetryMaxDelay        time.Duration
+	// ResyncInterval is how often the verifier may full-repo resync any one
+	// DID. Zero is DefaultResyncInterval.
+	ResyncInterval time.Duration
 
 	// GCDelayMargin is test-only: the clock-skew allowance JETSTREAM_GC_DELAY
 	// must leave (xrpcapi.CheckGCDelay). Zero is the default. Only pods that
@@ -187,6 +193,17 @@ type Options struct {
 	// OnSessionStart, if non-nil, is a test hook that fires as each writer
 	// session starts, before its orchestrator runs.
 	OnSessionStart func(epoch uint64)
+	// UnlimitedResyncs lifts the verifier's per-DID resync budget
+	// (ResyncInterval). Production leaves it false; oracle traffic resyncs
+	// one DID many times within seconds and expects every resync to run.
+	UnlimitedResyncs bool
+}
+
+func (o Options) effectiveResyncInterval() time.Duration {
+	if o.ResyncInterval > 0 {
+		return o.ResyncInterval
+	}
+	return DefaultResyncInterval
 }
 
 func (o Options) effectiveBackfillGlobalDownloads() int {

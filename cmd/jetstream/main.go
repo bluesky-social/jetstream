@@ -287,6 +287,12 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_FAILED_REPO_RETRY_INTERVAL"),
 				Value:   jetstreamd.DefaultFailedRepoRetryInterval,
 			},
+			&cli.DurationFlag{
+				Name:    "resync-interval",
+				Usage:   "Minimum time between full-repo resyncs of any one DID. Each resync re-archives the whole repo, so this bounds what a repo that keeps failing verification costs. 0 uses the production default.",
+				Sources: cli.EnvVars("JETSTREAM_RESYNC_INTERVAL"),
+				Value:   jetstreamd.DefaultResyncInterval,
+			},
 			&cli.IntFlag{
 				Name:    "failed-repo-retry-workers",
 				Usage:   "Global worker count for steady-state failed-repo retry. 0 uses the production default.",
@@ -584,7 +590,7 @@ func storageFlags() []cli.Flag {
 			Sources: cli.EnvVars("JETSTREAM_CATALOG_POLL_INTERVAL"), Value: def.CatalogPollInterval,
 		},
 		&cli.DurationFlag{
-			Name: "max-view-age", Category: cat, Usage: "Report not ready when the catalog mirror is older than this",
+			Name: "max-view-age", Category: cat, Usage: "Report not ready when the catalog mirror is older than this, or the readable log has trailed it this long without progress",
 			Sources: cli.EnvVars("JETSTREAM_MAX_VIEW_AGE"), Value: def.MaxViewAge,
 		},
 		&cli.DurationFlag{
@@ -717,6 +723,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		BackfillRepos:                  backfillRepos,
 		SkipMergeDiscovery:             skipMergeDiscovery,
 		FailedRepoRetryInterval:        cmd.Duration("failed-repo-retry-interval"),
+		ResyncInterval:                 cmd.Duration("resync-interval"),
 		FailedRepoRetryWorkers:         cmd.Int("failed-repo-retry-workers"),
 		PendingRepoPassWorkers:         cmd.Int("pending-repo-pass-workers"),
 		FailedRepoRetryHostWorkers:     cmd.Int("failed-repo-retry-host-workers"),
