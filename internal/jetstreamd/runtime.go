@@ -143,6 +143,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.FailedRepoRetryHostWorkers < 0 {
 		return nil, fmt.Errorf("serve: --failed-repo-retry-host-workers must be >= 0 (FailedRepoRetryHostWorkers must be >= 0), got %d", opts.FailedRepoRetryHostWorkers)
 	}
+	if opts.ResyncInterval < 0 {
+		return nil, fmt.Errorf("serve: --resync-interval must be >= 0 (ResyncInterval must be >= 0), got %s", opts.ResyncInterval)
+	}
 	if opts.FailedRepoRetryMaxDelay < 0 {
 		return nil, fmt.Errorf("serve: --failed-repo-retry-max-delay must be >= 0 (FailedRepoRetryMaxDelay must be >= 0), got %s", opts.FailedRepoRetryMaxDelay)
 	}
@@ -406,6 +409,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		syncClient:       syncClient,
 		verifierMetrics:  verifierMetrics,
 		logger:           processLogger,
+		resyncInterval:   opts.effectiveResyncInterval(),
 		unlimitedResyncs: opts.UnlimitedResyncs,
 		orch: orchestrator.Config{
 			DataDir:    opts.DataDir,

@@ -81,6 +81,7 @@ func TestServeOptionsFromCLI_Defaults(t *testing.T) {
 	require.Empty(t, opts.BackfillRepos)
 	require.False(t, opts.SkipMergeDiscovery)
 	require.Equal(t, backfill.DefaultFailedRepoRetryInterval, opts.FailedRepoRetryInterval)
+	require.Equal(t, jetstreamd.DefaultResyncInterval, opts.ResyncInterval)
 	require.Equal(t, backfill.DefaultFailedRepoRetryWorkers, opts.FailedRepoRetryWorkers)
 	require.Equal(t, backfill.DefaultFailedRepoRetryHostWorkers, opts.FailedRepoRetryHostWorkers)
 	require.Equal(t, backfill.DefaultFailedRepoRetryMaxDelay, opts.FailedRepoRetryMaxDelay)
@@ -213,6 +214,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 		"--backfill-repos=did:plc:aaa, did:plc:bbb",
 		"--skip-merge-discovery",
 		"--failed-repo-retry-interval=2h",
+		"--resync-interval=25m",
 		"--failed-repo-retry-workers=9",
 		"--failed-repo-retry-host-workers=3",
 		"--failed-repo-retry-max-delay=48h",
@@ -255,6 +257,7 @@ func TestServeOptionsFromCLI_Overrides(t *testing.T) {
 	require.Equal(t, []atmos.DID{"did:plc:aaa", "did:plc:bbb"}, opts.BackfillRepos)
 	require.True(t, opts.SkipMergeDiscovery)
 	require.Equal(t, 2*time.Hour, opts.FailedRepoRetryInterval)
+	require.Equal(t, 25*time.Minute, opts.ResyncInterval)
 	require.Equal(t, 9, opts.FailedRepoRetryWorkers)
 	require.Equal(t, 3, opts.FailedRepoRetryHostWorkers)
 	require.Equal(t, 48*time.Hour, opts.FailedRepoRetryMaxDelay)
@@ -304,6 +307,7 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 	t.Setenv("JETSTREAM_BACKFILL_BATCH_SIZE", "76543")
 	t.Setenv("JETSTREAM_BACKFILL_ASYNC_FLUSH_WORKERS", "5")
 	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_INTERVAL", "3h")
+	t.Setenv("JETSTREAM_RESYNC_INTERVAL", "1h")
 	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_WORKERS", "11")
 	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_HOST_WORKERS", "2")
 	t.Setenv("JETSTREAM_FAILED_REPO_RETRY_MAX_DELAY", "72h")
@@ -317,6 +321,7 @@ func TestServeOptionsFromCLI_BackfillSchedulerEnv(t *testing.T) {
 	require.Equal(t, 76543, opts.BackfillBatchSize)
 	require.Equal(t, 5, opts.BackfillAsyncFlushWorkers)
 	require.Equal(t, 3*time.Hour, opts.FailedRepoRetryInterval)
+	require.Equal(t, time.Hour, opts.ResyncInterval)
 	require.Equal(t, 11, opts.FailedRepoRetryWorkers)
 	require.Equal(t, 2, opts.FailedRepoRetryHostWorkers)
 	require.Equal(t, 72*time.Hour, opts.FailedRepoRetryMaxDelay)

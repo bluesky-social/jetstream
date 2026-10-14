@@ -19,7 +19,7 @@ import (
 )
 
 // A repo that keeps failing verification must not draw a full resync per
-// failure: the second resync of one DID within resyncInterval is refused
+// failure: the second resync of one DID within the resync interval is refused
 // before it reaches the network.
 func TestSessionVerifier_ResyncBudget(t *testing.T) {
 	t.Parallel()
@@ -47,6 +47,7 @@ func TestSessionVerifier_ResyncBudget(t *testing.T) {
 				directory:        &identity.Directory{SkipHandleVerification: true},
 				syncClient:       atmossync.NewClient(atmossync.Options{Client: xc}),
 				logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+				resyncInterval:   DefaultResyncInterval,
 				unlimitedResyncs: tc.unlimited,
 			}
 			v, err := f.newVerifier(atmossync.NewMemStateStore())

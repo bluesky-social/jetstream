@@ -459,6 +459,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		syncClient:       atmossync.NewClient(atmossync.Options{Client: xrpcClient}),
 		verifierMetrics:  verifierMetrics,
 		logger:           processLogger,
+		resyncInterval:   opts.effectiveResyncInterval(),
 		unlimitedResyncs: opts.UnlimitedResyncs,
 		orch: orchestrator.Config{
 			RelayURL:      opts.RelayURL,

@@ -34,13 +34,10 @@ import (
 // bot whose every commit repeated an op path drew atmos's default budget
 // (burst 5, refilling 5 a minute) in 13s: five resyncs of its ~82k-record
 // repo, 410k bulk events, and every follower fell behind. One resync per DID
-// per resyncInterval bounds such a repo to its size every interval. A DID
-// throttled meanwhile keeps its commits pending in the verifier until a
+// per Options.ResyncInterval bounds such a repo to its size every interval. A
+// DID throttled meanwhile keeps its commits pending in the verifier until a
 // resync is allowed again.
-const (
-	resyncInterval = 10 * time.Minute
-	resyncBurst    = 1
-)
+const resyncBurst = 1
 
 // writerSession holds one session's write-side state.
 type writerSession struct {
@@ -60,7 +57,9 @@ type sessionFactory struct {
 	syncClient      *atmossync.Client
 	verifierMetrics *obs.VerifierMetrics
 	logger          *slog.Logger
-	// unlimitedResyncs is Options.UnlimitedResyncs.
+	// resyncInterval and unlimitedResyncs set the verifier's per-DID resync
+	// budget (Options.ResyncInterval, Options.UnlimitedResyncs).
+	resyncInterval   time.Duration
 	unlimitedResyncs bool
 
 	// orch is the orchestrator config with every process-lifetime field set.
@@ -109,7 +108,7 @@ func (f *sessionFactory) buildWith(store metastore.Store, disagg *orchestrator.D
 
 // newVerifier builds a session's firehose verifier over stateStore.
 func (f *sessionFactory) newVerifier(stateStore atmossync.StateStore) (*atmossync.Verifier, error) {
-	resyncLimit := rate.Every(resyncInterval)
+	resyncLimit := rate.Every(f.resyncInterval)
 	if f.unlimitedResyncs {
 		resyncLimit = rate.Inf
 	}
