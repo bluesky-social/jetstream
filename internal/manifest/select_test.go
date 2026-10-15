@@ -48,7 +48,7 @@ func TestSelectBlocksForDID_PrunesAcrossSegments(t *testing.T) {
 
 	m := openManifestDir(t, dir)
 
-	sel, err := m.SelectBlocksForDID(target)
+	sel, err := m.SelectBlocksForDID(t.Context(), target)
 	require.NoError(t, err)
 
 	// Segment 0 must not appear at all (segment-level bloom miss).
@@ -80,7 +80,7 @@ func TestSelectBlocksForDID_AbsentDIDSelectsNothing(t *testing.T) {
 	})
 	m := openManifestDir(t, dir)
 
-	sel, err := m.SelectBlocksForDID("did:plc:not-present-anywhere")
+	sel, err := m.SelectBlocksForDID(t.Context(), "did:plc:not-present-anywhere")
 	require.NoError(t, err)
 	require.Empty(t, sel)
 }
@@ -89,7 +89,7 @@ func TestSelectBlocksForDID_EmptyManifest(t *testing.T) {
 	t.Parallel()
 
 	m := openManifestDir(t, t.TempDir())
-	sel, err := m.SelectBlocksForDID("did:plc:anything")
+	sel, err := m.SelectBlocksForDID(t.Context(), "did:plc:anything")
 	require.NoError(t, err)
 	require.Empty(t, sel)
 }

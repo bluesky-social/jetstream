@@ -35,12 +35,11 @@ type Selection map[uint64][]int
 // using DID blooms. The interface keeps reconstruction independent of the
 // manifest implementation.
 type Selector interface {
-	// SelectBlocksForDID returns the candidate blocks of the segments in ns
-	// the selector can check. One-sided contract: no false negatives,
-	// possible false positives. Block indices stay valid across compaction,
-	// which preserves block topology and only drops rows, so a selection
-	// read from any generation of a segment prunes every other generation.
-	SelectBlocksForDID(ns catalog.Namespace, did string) (Selection, error)
+	// SelectBlocksForDID returns candidate blocks, honors ctx while scanning,
+	// and preserves the one-sided bloom contract: no false negatives, possible
+	// false positives. Indices stay valid across compaction, which preserves
+	// block topology and only drops rows.
+	SelectBlocksForDID(ctx context.Context, ns catalog.Namespace, did string) (Selection, error)
 }
 
 // Archive is where reconstruction reads segment data: a catalog snapshot per
@@ -144,7 +143,7 @@ func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("%w: %s", ErrNoLocalRepo, cfg.DID)
 	}
 
-	root, blocks, err := buildSnapshotBlocks(state.records)
+	root, blocks, err := buildSnapshotBlocks(ctx, state.records)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -165,11 +164,14 @@ func Reconstruct(ctx context.Context, cfg Config) (Snapshot, error) {
 func replayNamespace(ctx context.Context, a Archive, ns catalog.Namespace, watermark string, state *replayState) error {
 	var next uint64
 	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Snapshot before selecting: a segment that seals in between is
 		// active in the view and still covered, by its selection if the
 		// selector saw it sealed or by a full decode if not.
 		view := a.Catalog.Snapshot()
-		sel, err := a.Selector.SelectBlocksForDID(ns, state.did)
+		sel, err := a.Selector.SelectBlocksForDID(ctx, ns, state.did)
 		if err != nil {
 			return fmt.Errorf("repoexport: select %s blocks: %w", ns, err)
 		}
@@ -187,12 +189,18 @@ func replayNamespace(ctx context.Context, a Archive, ns catalog.Namespace, water
 // past each block it replays or prunes.
 func replayView(ctx context.Context, view catalog.CatalogView, f catalog.Fetcher, ns catalog.Namespace, sel Selection, watermark string, state *replayState, next *uint64) error {
 	for _, v := range view.Segments(ns) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if len(v.Blocks) == 0 || v.MaxSeq() < *next {
 			continue
 		}
 		blocks, checked := sel[v.Index]
 		if !checked {
 			for ref := range view.RefsFrom(ns, max(*next, v.MinSeq())) {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if ref.Segment != v.Index {
 					break
 				}
@@ -241,6 +249,9 @@ func replayRef(ctx context.Context, f catalog.Fetcher, ref catalog.BlockRef, wat
 	if err != nil {
 		return fmt.Errorf("repoexport: decode %s segment %d block %d: %w", ref.Namespace, ref.Segment, ref.Block, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return replayEvents(ctx, events, watermark, state)
 }
 
@@ -258,10 +269,10 @@ type FooterSelector struct {
 }
 
 // SelectBlocksForDID implements Selector.
-func (s FooterSelector) SelectBlocksForDID(ns catalog.Namespace, did string) (Selection, error) {
+func (s FooterSelector) SelectBlocksForDID(ctx context.Context, ns catalog.Namespace, did string) (Selection, error) {
 	sel := Selection{}
 	if s.Primary != nil {
-		primary, err := s.Primary.SelectBlocksForDID(ns, did)
+		primary, err := s.Primary.SelectBlocksForDID(ctx, ns, did)
 		if err != nil {
 			return nil, err
 		}
@@ -270,6 +281,9 @@ func (s FooterSelector) SelectBlocksForDID(ns catalog.Namespace, did string) (Se
 		}
 	}
 	for _, v := range s.Source.Snapshot().Segments(ns) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if _, ok := sel[v.Index]; ok || v.State != catalog.Sealed {
 			continue
 		}
@@ -348,17 +362,45 @@ func replayEvent(ev segment.Event, watermark string, state *replayState) error {
 	return nil
 }
 
-func buildSnapshotBlocks(records map[string][]byte) (cbor.CID, *mst.MemBlockStore, error) {
+type cancellableMSTBlockStore struct {
+	ctx   context.Context
+	store *mst.MemBlockStore
+}
+
+func (s cancellableMSTBlockStore) GetBlock(cid cbor.CID) ([]byte, error) {
+	if err := s.ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.store.GetBlock(cid)
+}
+
+func (s cancellableMSTBlockStore) PutBlock(cid cbor.CID, data []byte) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	return s.store.PutBlock(cid, data)
+}
+
+func buildSnapshotBlocks(ctx context.Context, records map[string][]byte) (cbor.CID, *mst.MemBlockStore, error) {
 	blocks := mst.NewMemBlockStore()
 	tree := mst.NewTree(blocks)
 
 	keys := make([]string, 0, len(records))
 	for key := range records {
+		if err := ctx.Err(); err != nil {
+			return cbor.CID{}, nil, err
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	if err := ctx.Err(); err != nil {
+		return cbor.CID{}, nil, err
+	}
 
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return cbor.CID{}, nil, err
+		}
 		payload := records[key]
 		cid := cbor.ComputeCID(cbor.CodecDagCBOR, payload)
 		if err := blocks.PutBlock(cid, append([]byte(nil), payload...)); err != nil {
@@ -369,9 +411,15 @@ func buildSnapshotBlocks(records map[string][]byte) (cbor.CID, *mst.MemBlockStor
 		}
 	}
 
-	root, err := tree.WriteBlocks(blocks)
+	if err := ctx.Err(); err != nil {
+		return cbor.CID{}, nil, err
+	}
+	root, err := tree.WriteBlocks(cancellableMSTBlockStore{ctx: ctx, store: blocks})
 	if err != nil {
 		return cbor.CID{}, nil, fmt.Errorf("repoexport: write MST blocks: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return cbor.CID{}, nil, err
 	}
 	return root, blocks, nil
 }
