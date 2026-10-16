@@ -3,11 +3,13 @@ package repoexport
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
@@ -213,6 +215,105 @@ func TestVerify_HTTPFailureReturnsError(t *testing.T) {
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
 	})
 	require.Error(t, err)
+}
+
+func TestVerify_CancelsBlockedAuthoritativeCARRead(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "caller cancellation interrupts a partial CAR block"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := cbor.ComputeCID(cbor.CodecDagCBOR, []byte("root"))
+			commitCID, commitCAR := authoritativeCommitCAR(t, testDID, testAuthoritativeRev, root)
+			headerLen, headerPrefixLen := binary.Uvarint(commitCAR)
+			require.Greater(t, headerPrefixLen, 0)
+			blockLengthOffset := headerPrefixLen + int(headerLen)
+			_, blockLengthPrefixLen := binary.Uvarint(commitCAR[blockLengthOffset:])
+			require.Greater(t, blockLengthPrefixLen, 0)
+			partialEnd := blockLengthOffset + blockLengthPrefixLen + 1
+			require.Less(t, partialEnd, len(commitCAR))
+
+			blockReadStarted := make(chan struct{})
+			relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/xrpc/com.atproto.sync.getLatestCommit":
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]string{"rev": testAuthoritativeRev, "cid": commitCID.String()})
+				case "/xrpc/com.atproto.sync.getBlocks":
+					w.Header().Set("Content-Type", "application/vnd.ipld.car")
+					_, _ = w.Write(commitCAR[:partialEnd])
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						http.Error(w, "flush failed", http.StatusInternalServerError)
+						return
+					}
+					close(blockReadStarted)
+					<-r.Context().Done()
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer relay.Close()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			archive := openArchive(t, t.TempDir())
+			result := make(chan error, 1)
+			go func() {
+				_, err := Verify(ctx, VerifyConfig{
+					Archive:          archive,
+					DID:              testDID,
+					IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+				})
+				result <- err
+			}()
+
+			select {
+			case <-blockReadStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("verification did not reach the blocked CAR response")
+			}
+			cancel()
+			select {
+			case err := <-result:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(5 * time.Second):
+				t.Fatal("verification did not stop after request cancellation")
+			}
+		})
+	}
+}
+
+func FuzzReadAuthoritativeCommitCAR(f *testing.F) {
+	cid, validCAR := fuzzAuthoritativeCARSeed()
+	f.Add(validCAR)
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 8<<20 {
+			t.Skip()
+		}
+		_, _ = readAuthoritativeCommitBlock(t.Context(), bytes.NewReader(data), cid)
+	})
+}
+
+func fuzzAuthoritativeCARSeed() (cbor.CID, []byte) {
+	data := []byte{0xa0}
+	cid := cbor.ComputeCID(cbor.CodecDagCBOR, data)
+	header := cbor.AppendMapHeader(nil, 2)
+	header = cbor.AppendText(header, "roots")
+	header = cbor.AppendArrayHeader(header, 0)
+	header = cbor.AppendText(header, "version")
+	header = cbor.AppendUint(header, 1)
+
+	carData := cbor.AppendUvarint(nil, uint64(len(header)))
+	carData = append(carData, header...)
+	block := cid.AppendBytes(nil)
+	block = append(block, data...)
+	carData = append(carData, cbor.AppendUvarint(nil, uint64(len(block)))...)
+	carData = append(carData, block...)
+	return cid, carData
 }
 
 func TestVerify_ValidatesConfig(t *testing.T) {

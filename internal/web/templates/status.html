@@ -237,6 +237,41 @@ document.addEventListener("input", function (event) {
     }
   });
 });
+{{if .RepoVerificationDID}}
+var verificationBox = document.getElementById("repo-verification");
+if (verificationBox) {
+  if (typeof window.fetch !== "function" || typeof window.AbortController !== "function") {
+    verificationBox.textContent = "Repository verification is unavailable. Please try again later.";
+  } else {
+    var verificationController = new AbortController();
+    var verificationTimeout = window.setTimeout(function () {
+      verificationController.abort();
+    }, 25000);
+    var verificationURL = new URL("/status/verify_repo", window.location.origin);
+    verificationURL.searchParams.set("did", verificationBox.dataset.did);
+    window.fetch(verificationURL, {
+      headers: {"Accept": "text/html"},
+      signal: verificationController.signal
+    }).then(function (response) {
+      var contentType = response.headers.get("Content-Type") || "";
+      var fragmentMarker = response.headers.get("X-Jetstream-Status-Fragment") || "";
+      if (fragmentMarker !== "repo-verification" || !contentType.toLowerCase().startsWith("text/html")) {
+        throw new Error("verification response was not a marked HTML fragment");
+      }
+      return response.text();
+    }).then(function (fragment) {
+      if (!fragment.trim()) throw new Error("verification response was empty");
+      verificationBox.innerHTML = fragment;
+    }).catch(function () {
+      verificationBox.textContent = verificationController.signal.aborted
+        ? "Repository verification timed out. Please try again later."
+        : "Repository verification is unavailable. Please try again later.";
+    }).finally(function () {
+      window.clearTimeout(verificationTimeout);
+    });
+  }
+}
+{{end}}
 </script>
 </body>
 </html>
@@ -473,22 +508,11 @@ document.addEventListener("input", function (event) {
   {{if .Account.LastError}}
   <div class="latest"><h3>Last error</h3><div class="error-text">{{.Account.LastError}}</div></div>
   {{end}}
-  {{with .RepoVerification}}
-  <div class="latest">
+  {{if .RepoVerificationDID}}
+  <div class="latest" id="repo-verification" data-did="{{.RepoVerificationDID}}" aria-live="polite">
     <h3>Repo verification</h3>
-    <dl>
-      <dt>Result</dt><dd>{{if .Match}}<span class="match-state match-ok">Match</span>{{else}}<span class="match-state match-fail">Match failure</span>{{end}}</dd>
-      <dt>authoritative rev</dt><dd>{{if .AuthoritativeRev}}<code>{{.AuthoritativeRev}}</code>{{else}}unknown{{end}}</dd>
-      <dt>authoritative root</dt><dd>{{if .AuthoritativeRoot}}<code>{{.AuthoritativeRoot}}</code>{{else}}unknown{{end}}</dd>
-      <dt>local rev</dt><dd>{{if .LocalLatestRev}}<code>{{.LocalLatestRev}}</code>{{else}}unknown{{end}}</dd>
-      <dt>local root</dt><dd>{{if .LocalRoot}}<code>{{.LocalRoot}}</code>{{else}}unknown{{end}}</dd>
-      <dt>local records</dt><dd>{{humanInt64Cast .LocalRecordCount}}</dd>
-      {{if .Message}}<dt>Message</dt><dd class="error-text">{{.Message}}</dd>{{end}}
-    </dl>
+    <p>Loading…</p>
   </div>
-  {{end}}
-  {{if .RepoVerificationError}}
-  <div class="latest"><h3>Repo verification</h3><div class="error-text">{{.RepoVerificationError}}</div></div>
   {{end}}
   {{else if .Account.Error}}
   <p class="error-text">{{.Account.Error}}</p>
@@ -498,6 +522,25 @@ document.addEventListener("input", function (event) {
   <p class="sub">Lookup accepts a DID or handle.</p>
   {{end}}
 </section>
+{{end}}
+{{define "repoVerification"}}
+{{with .RepoVerification}}
+<div class="latest">
+  <h3>Repo verification</h3>
+  <dl>
+    <dt>Result</dt><dd>{{if .Match}}<span class="match-state match-ok">Match</span>{{else}}<span class="match-state match-fail">Match failure</span>{{end}}</dd>
+    <dt>authoritative rev</dt><dd>{{if .AuthoritativeRev}}<code>{{.AuthoritativeRev}}</code>{{else}}unknown{{end}}</dd>
+    <dt>authoritative root</dt><dd>{{if .AuthoritativeRoot}}<code>{{.AuthoritativeRoot}}</code>{{else}}unknown{{end}}</dd>
+    <dt>local rev</dt><dd>{{if .LocalLatestRev}}<code>{{.LocalLatestRev}}</code>{{else}}unknown{{end}}</dd>
+    <dt>local root</dt><dd>{{if .LocalRoot}}<code>{{.LocalRoot}}</code>{{else}}unknown{{end}}</dd>
+    <dt>local records</dt><dd>{{humanInt64Cast .LocalRecordCount}}</dd>
+    {{if .Message}}<dt>Message</dt><dd class="error-text">{{.Message}}</dd>{{end}}
+  </dl>
+</div>
+{{end}}
+{{if .RepoVerificationError}}
+<div class="latest"><h3>Repo verification</h3><div class="error-text">{{.RepoVerificationError}}</div></div>
+{{end}}
 {{end}}
 
 {{define "collections"}}

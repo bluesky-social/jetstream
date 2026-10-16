@@ -44,8 +44,8 @@ type Config struct {
 	ShutdownTimeout time.Duration
 
 	// StatusHandler, if non-nil, is mounted at GET /status and HEAD
-	// /status on the public listener. cmd/jetstream constructs this via
-	// the web package; tests can pass any http.Handler.
+	// /status, plus GET /status/verify_repo on the public listener.
+	// cmd/jetstream constructs it via web; tests may pass any http.Handler.
 	StatusHandler http.Handler
 
 	// PublicListener and DebugListener, when non-nil, are served instead of
@@ -325,6 +325,8 @@ func (s *Server) publicMux() http.Handler {
 		instrumented := s.metrics.Middleware("status", s.statusHandler)
 		mux.Handle("GET /status", instrumented)
 		mux.Handle("HEAD /status", instrumented)
+		verification := s.metrics.Middleware("status_verify_repo", s.statusHandler)
+		mux.Handle("GET /status/verify_repo", verification)
 	}
 	for _, r := range s.extraPublicRoutes {
 		// Wrap each registered route in the same prom + OTEL middleware
