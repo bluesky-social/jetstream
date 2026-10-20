@@ -27,19 +27,29 @@ const testDID = "did:plc:repoexport"
 // real resident blooms -> real segment decode -> real MST root.
 type manifestSelector struct{ m *manifest.Manifest }
 
-func (s manifestSelector) SelectBlocksForDID(ns catalog.Namespace, did string) (Selection, error) {
+func (s manifestSelector) SelectBlocksForDID(ctx context.Context, ns catalog.Namespace, did string) (Selection, error) {
 	if ns != catalog.Main {
 		return nil, nil
 	}
+	checked, err := s.m.SegmentChecksumsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	sel := Selection{}
-	for idx := range s.m.SegmentChecksums() {
+	for idx := range checked {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sel[idx] = nil
 	}
-	picks, err := s.m.SelectBlocksForDID(did)
+	picks, err := s.m.SelectBlocksForDID(ctx, did)
 	if err != nil {
 		return nil, err
 	}
 	for _, p := range picks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sel[p.Idx] = p.Blocks
 	}
 	return sel, nil

@@ -21,14 +21,17 @@ import (
 //go:embed templates/status.html
 var templateFS embed.FS
 
+// Keep verification below Headwind's 30-second response-header deadline.
+const repoVerificationTimeout = 20 * time.Second
+
 // Snapshotter is what the handler needs from a status collector. The
 // concrete *status.Collector satisfies it; tests pass a fake.
 type Snapshotter interface {
 	SnapshotForRequest(ctx context.Context, req status.Request) (*status.Snapshot, error)
 }
 
-// RepoActions provides the expensive, operator-triggered repo actions exposed
-// from the status UI. Tests pass a fake; production uses repoexport.
+// RepoActions provides the expensive repository verification action exposed
+// by a separate status-page request. Tests pass a fake; production uses repoexport.
 type RepoActions interface {
 	VerifyRepo(ctx context.Context, did string) (repoexport.VerifyReport, error)
 }
@@ -47,7 +50,7 @@ type Handler struct {
 type Options struct {
 	Snapshotter Snapshotter
 	RepoActions RepoActions
-	// RepoActionRateLimit bounds expensive explicit repo actions by source IP.
+	// RepoActionRateLimit bounds expensive verification requests by source IP.
 	// A zero value uses the production default when RepoActions is configured.
 	RepoActionRateLimit RateLimit
 	// DisableRepoActionRateLimit bypasses RepoActionRateLimit. It is intended
@@ -150,6 +153,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/status", "":
 		h.serveStatus(w, r)
+	case "/status/verify_repo":
+		h.serveRepoVerification(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -178,22 +183,6 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var verification *repoexport.VerifyReport
-	var verificationErr string
-	verifyDID := h.autoVerifyDID(r, snap)
-	if verifyDID != "" {
-		if !h.allowRepoAction(r) {
-			verificationErr = "repo action rate limit exceeded"
-		} else {
-			report, err := h.repoActions.VerifyRepo(r.Context(), verifyDID)
-			if err != nil {
-				verificationErr = err.Error()
-			} else {
-				verification = &report
-			}
-		}
-	}
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Status-Generated-At", snap.GeneratedAt.UTC().Format(time.RFC3339Nano))
@@ -205,14 +194,12 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 
 	data := struct {
 		*status.Snapshot
-		Now                   time.Time
-		RepoVerification      *repoexport.VerifyReport
-		RepoVerificationError string
+		Now                 time.Time
+		RepoVerificationDID string
 	}{
-		Snapshot:              snap,
-		Now:                   h.now(),
-		RepoVerification:      verification,
-		RepoVerificationError: verificationErr,
+		Snapshot:            snap,
+		Now:                 h.now(),
+		RepoVerificationDID: h.verificationDID(r, snap),
 	}
 	if err := h.tpl.Execute(w, data); err != nil {
 		// Headers already written; we can't change the status now.
@@ -222,7 +209,7 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) autoVerifyDID(r *http.Request, snap *status.Snapshot) string {
+func (h *Handler) verificationDID(r *http.Request, snap *status.Snapshot) string {
 	if r.Method != http.MethodGet || h.repoActions == nil || snap == nil {
 		return ""
 	}
@@ -234,6 +221,97 @@ func (h *Handler) autoVerifyDID(r *http.Request, snap *status.Snapshot) string {
 		return ""
 	}
 	return did
+}
+
+func (h *Handler) serveRepoVerification(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.repoActions == nil {
+		h.writeRepoVerification(w, http.StatusServiceUnavailable, nil, "Repository verification is unavailable.")
+		return
+	}
+	values, ok := r.URL.Query()["did"]
+	if !ok || len(values) != 1 {
+		h.writeRepoVerification(w, http.StatusBadRequest, nil, "A single repository DID is required.")
+		return
+	}
+	did, err := validateRepoDID(values[0])
+	if err != nil {
+		h.writeRepoVerification(w, http.StatusBadRequest, nil, err.Error())
+		return
+	}
+
+	if !h.allowRepoAction(r) {
+		h.logger.WarnContext(r.Context(), "status: repository verification rate limited")
+		h.writeRepoVerification(w, http.StatusTooManyRequests, nil, "Repository verification is rate-limited. Please wait before trying again.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), repoVerificationTimeout)
+	defer cancel()
+	snap, err := h.src.SnapshotForRequest(ctx, status.Request{Tab: "accounts", Account: did, DID: did})
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		h.logRepoVerificationError(ctx, err)
+		statusCode, message := verificationFailure(ctx, err, http.StatusServiceUnavailable)
+		if statusCode == http.StatusServiceUnavailable {
+			message = "Repository status is temporarily unavailable. Please try again later."
+		}
+		h.writeRepoVerification(w, statusCode, nil, message)
+		return
+	}
+	if snap == nil || !snap.Account.Found || snap.Account.DID != did {
+		h.writeRepoVerification(w, http.StatusNotFound, nil, "No local repository is available for verification.")
+		return
+	}
+
+	report, err := h.repoActions.VerifyRepo(ctx, did)
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		h.logRepoVerificationError(ctx, err)
+		statusCode, message := verificationFailure(ctx, err, http.StatusBadGateway)
+		h.writeRepoVerification(w, statusCode, nil, message)
+		return
+	}
+	h.writeRepoVerification(w, http.StatusOK, &report, "")
+}
+
+func verificationFailure(ctx context.Context, err error, fallbackStatus int) (int, string) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout, "Repository verification timed out. Please try again later."
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return http.StatusServiceUnavailable, "Repository verification was canceled. Please try again later."
+	}
+	return fallbackStatus, err.Error()
+}
+
+func (h *Handler) logRepoVerificationError(ctx context.Context, err error) {
+	message := err.Error()
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	h.logger.WarnContext(ctx, "status: repository verification failed", "error", message)
+}
+
+func (h *Handler) writeRepoVerification(w http.ResponseWriter, statusCode int, report *repoexport.VerifyReport, errorMessage string) {
+	w.Header().Set("X-Jetstream-Status-Fragment", "repo-verification")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(statusCode)
+	data := struct {
+		RepoVerification      *repoexport.VerifyReport
+		RepoVerificationError string
+	}{RepoVerification: report, RepoVerificationError: errorMessage}
+	if err := h.tpl.ExecuteTemplate(w, "repoVerification", data); err != nil {
+		h.logger.Warn("status: repo verification fragment render failed", "err", err)
+	}
 }
 
 func (h *Handler) allowRepoAction(r *http.Request) bool {
