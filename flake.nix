@@ -16,14 +16,14 @@
         let
           pkgs = import nixpkgs { inherit system; };
           goPkgs = import nixpkgs-go { inherit system; };
-          goVersion = "1.26.6";
+          goVersion = "1.26.10";
           # The pinned Nix channel can lag Go security patch releases.
           go = let
             patchedGo = goPkgs.go_1_26.overrideAttrs {
               version = goVersion;
               src = goPkgs.fetchurl {
                 url = "https://dl.google.com/go/go${goVersion}.src.tar.gz";
-                hash = "sha256-oHIcVMaIkBRI13rZs+x+p8R0cwdV/4kTgukuy5P/LLE=";
+                hash = "sha256-/WPog7ovK/ypPBZGsx6+9j4rHk0rMXyXidl2po2B828=";
               };
             };
           in
