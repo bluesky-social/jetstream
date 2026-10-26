@@ -258,6 +258,26 @@ test-long *ARGS="./...":
 test *ARGS="./...":
     gotestsum --format-hide-empty-pkg --format-icons hivis --hide-summary=skipped -- -count=1 -short {{ARGS}}
 
+# Exercise GC session semantics and capture the actual PostgreSQL query plans.
+test-gc-plans ROWS="20000":
+    JETSTREAM_TEST_STORAGE_REQUIRED=1 JETSTREAM_TEST_GC_PLAN_ROWS={{ROWS}} gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -v ./internal/pgstore -run '^TestGC(QueryPlans(MixedMark)?|SessionPlanModes|PlanStatementCapture|ClaimPreservesRowLock)$'
+
+# Check GC scan work across catalog sizes; retain actual PostgreSQL plans.
+test-gc-scans ROWS="100000,1000000":
+    JETSTREAM_TEST_STORAGE_REQUIRED=1 JETSTREAM_TEST_GC_SCAN_ROWS={{ROWS}} gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -v ./internal/pgstore -run '^TestGC(ScanWork|PlanWork.*)$'
+
+# Benchmark GC SQL and scratch-index variants against captured production SQL.
+bench-gc-queries ROWS="100000,1000000":
+    JETSTREAM_TEST_STORAGE_REQUIRED=1 JETSTREAM_TEST_GC_VARIANT_ROWS={{ROWS}} gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -v ./internal/pgstore -run '^TestGCQueryVariants$'
+
+# Benchmark compaction publication and captured query variants on real PostgreSQL.
+bench-compaction-queries ROWS="100000,1000000":
+    JETSTREAM_TEST_STORAGE_REQUIRED=1 JETSTREAM_TEST_COMPACTION_QUERY_ROWS={{ROWS}} gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -v ./internal/pgstore -run '^TestCompactionQueryVariants$'
+
+# Measure a full indexed GC sweep against real hot ingest and lease renewal.
+test-gc-contention ROWS="1000000" DURATION="15s" RATE="1000" TAIL_PERCENT="10" CASE="both":
+    JETSTREAM_TEST_STORAGE_REQUIRED=1 JETSTREAM_TEST_GC_CONTENTION_ROWS={{ROWS}} JETSTREAM_TEST_GC_CONTENTION_DURATION={{DURATION}} JETSTREAM_TEST_GC_CONTENTION_RATE={{RATE}} JETSTREAM_TEST_GC_CONTENTION_TAIL_PERCENT={{TAIL_PERCENT}} JETSTREAM_TEST_GC_CONTENTION_CASE={{CASE}} gotestsum --format-hide-empty-pkg --format-icons hivis -- -count=1 -v ./internal/pgstore -run '^TestGCCollectorContention$'
+
 # Runs the tests with the race detector enabled
 test-race *ARGS="./...":
     just test-long -race {{ARGS}}
