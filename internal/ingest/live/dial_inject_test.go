@@ -107,7 +107,8 @@ func TestConsumer_Run_InMemoryDial(t *testing.T) {
 
 	cancel()
 	select {
-	case <-runErr:
+	case err := <-runErr:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
@@ -174,7 +175,8 @@ func TestConsumer_Run_SequenceGapCountsGapMetricNotDecodeErrors(t *testing.T) {
 
 	cancel()
 	select {
-	case <-runErr:
+	case err := <-runErr:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
@@ -265,7 +267,8 @@ func TestConsumer_Run_UnknownAndErrorFramesClassified(t *testing.T) {
 
 	cancel()
 	select {
-	case <-runErr:
+	case err := <-runErr:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}

@@ -331,7 +331,8 @@ func testSplitCommitRelayCursor(t *testing.T, kind storagefake.FaultKind) {
 		t.Fatal("session 1 never failed")
 	}
 	cancel1()
-	<-errc1
+	runErr1 := <-errc1
+	_ = runErr1 // The session failure was checked through OnFailure above.
 	_ = c1.Close()
 	require.True(t, fault.Fired())
 	hold.Store(false)
@@ -354,7 +355,7 @@ func testSplitCommitRelayCursor(t *testing.T, kind storagefake.FaultKind) {
 	cancel2, errc2 := run(c2)
 	require.Eventually(t, func() bool { return c2.cursorValue() >= 3 }, 5*time.Second, time.Millisecond)
 	cancel2()
-	<-errc2
+	require.ErrorIs(t, <-errc2, context.Canceled)
 	require.NoError(t, c2.Close())
 	require.NoError(t, m.Close())
 
@@ -467,7 +468,8 @@ func TestConsumer_Hot_ChainStateCommitsWithLastRow(t *testing.T) {
 		t.Fatal("the session never failed")
 	}
 	cancel()
-	<-errc
+	runErr := <-errc
+	_ = runErr // The session failure was checked through OnFailure above.
 	_ = c.Close()
 	require.True(t, fault.Fired())
 

@@ -199,7 +199,8 @@ func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) (string, error) {
 		return buf.String(), err
 	case <-time.After(timeout):
 		_ = cmd.Process.Kill()
-		<-done // reap so the buffer write has settled
+		waitErr := <-done // reap so the buffer write has settled
+		_ = waitErr
 		return buf.String(), fmt.Errorf("lifecycle child did not exit within %s", timeout)
 	}
 }

@@ -236,7 +236,8 @@ func (s *Server) Run(ctx context.Context) error {
 		s.logger.Error("failed during startup", "err", err)
 		_ = s.shutdown()
 		for i := 1; i < serveCount; i++ {
-			<-errs
+			serveErr := <-errs
+			_ = serveErr // Preserve the first startup failure.
 		}
 		return err
 	default:
