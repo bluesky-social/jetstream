@@ -549,21 +549,44 @@ func seedGCScanFixture(t *testing.T, store *pgstore.Store, rows int) gcScanFixtu
 			f.claims = append(f.claims, uint64(id))
 		}
 	}
-	_, err := store.Pool().Exec(t.Context(), `INSERT INTO objects(object_id,key,sha256,byte_length,state,created_at,unreferenced_at)
+	// Bound each statement for slower CI servers while sharing one now()
+	// across the complete fixture.
+	const batchSize = 20_000
+	err := pgx.BeginFunc(t.Context(), store.Pool(), func(tx pgx.Tx) error {
+		for first := 1; first <= rows; first += batchSize {
+			last := min(first+batchSize-1, rows)
+			tag, err := tx.Exec(t.Context(), `INSERT INTO objects(object_id,key,sha256,byte_length,state,created_at,unreferenced_at)
  SELECT id,md5('scan-key-'||id)::uuid,decode(md5('scan-sha-'||id)||md5('scan-sha2-'||id),'hex'),1000,
- CASE WHEN id>$2 AND id%2=1 THEN 'uploading' ELSE 'available' END,
- now()-CASE WHEN id>$3 AND id%4<=1 THEN interval '2 days' ELSE interval '10 minutes' END,
- CASE WHEN id>$2 AND id%2=0 THEN now()-CASE WHEN id>$3 AND id%4<=1 THEN interval '2 days' ELSE interval '10 minutes' END ELSE NULL END
- FROM generate_series(1,$1::bigint)id`, rows, f.base, oldStart)
-	require.NoError(t, err)
-	// Each reference relation grows with the catalog, rather than placing
-	// almost all history in generation_blocks and leaving the others tiny.
-	_, err = store.Pool().Exec(t.Context(), `
- INSERT INTO segments(namespace,segment_index,state,current_generation_id,revision) VALUES('main',0,'sealed',1,1),('main',1,'active',NULL,1);
- INSERT INTO segment_generations(generation_id,namespace,segment_index,header,footer_object_id,revision) SELECT object_id,'main',0,decode(repeat('00',256),'hex'),object_id,1 FROM objects WHERE object_id<=$1 AND object_id%4=1 AND object_id%97<>0;
- INSERT INTO generation_blocks(generation_id,ordinal,object_id,compressed_length) SELECT 1,object_id::integer,object_id,1000 FROM objects WHERE object_id<=$1 AND object_id%4=2 AND object_id%97<>0;
- INSERT INTO active_segment_blocks(namespace,segment_index,ordinal,object_id,event_count,min_seq,max_seq,min_witnessed_us,max_witnessed_us,compressed_length,uncompressed_length,revision) SELECT 'main',1,object_id::integer,object_id,1,object_id,object_id,1,1,1000,1000,1 FROM objects WHERE object_id<=$1 AND object_id%4=3 AND object_id%97<>0;
- INSERT INTO hot_batches(first_seq,last_seq,event_count,min_witnessed_us,max_witnessed_us,epoch,revision,object_id) SELECT object_id,object_id,1,1,1,1,1,object_id FROM objects WHERE object_id<=$1 AND object_id%4=0 AND object_id%97<>0;`, pgx.QueryExecModeSimpleProtocol, f.base)
+ CASE WHEN id>$3 AND id%2=1 THEN 'uploading' ELSE 'available' END,
+ now()-CASE WHEN id>$4 AND id%4<=1 THEN interval '2 days' ELSE interval '10 minutes' END,
+ CASE WHEN id>$3 AND id%2=0 THEN now()-CASE WHEN id>$4 AND id%4<=1 THEN interval '2 days' ELSE interval '10 minutes' END ELSE NULL END
+ FROM generate_series($1::bigint,$2::bigint)id`, first, last, f.base, oldStart)
+			if err != nil {
+				return err
+			}
+			if want := int64(last - first + 1); tag.RowsAffected() != want {
+				return fmt.Errorf("seed objects [%d,%d]: inserted %d rows, want %d", first, last, tag.RowsAffected(), want)
+			}
+		}
+		_, err := tx.Exec(t.Context(), `INSERT INTO segments(namespace,segment_index,state,current_generation_id,revision) VALUES('main',0,'sealed',1,1),('main',1,'active',NULL,1)`)
+		if err != nil {
+			return err
+		}
+		// Each reference relation grows with the catalog, rather than placing
+		// almost all history in generation_blocks and leaving the others tiny.
+		for first := 1; first <= f.base; first += batchSize {
+			last := min(first+batchSize-1, f.base)
+			_, err := tx.Exec(t.Context(), `
+ INSERT INTO segment_generations(generation_id,namespace,segment_index,header,footer_object_id,revision) SELECT object_id,'main',0,decode(repeat('00',256),'hex'),object_id,1 FROM objects WHERE object_id>=$1 AND object_id<=$2 AND object_id%4=1 AND object_id%97<>0;
+ INSERT INTO generation_blocks(generation_id,ordinal,object_id,compressed_length) SELECT 1,object_id::integer,object_id,1000 FROM objects WHERE object_id>=$1 AND object_id<=$2 AND object_id%4=2 AND object_id%97<>0;
+ INSERT INTO active_segment_blocks(namespace,segment_index,ordinal,object_id,event_count,min_seq,max_seq,min_witnessed_us,max_witnessed_us,compressed_length,uncompressed_length,revision) SELECT 'main',1,object_id::integer,object_id,1,object_id,object_id,1,1,1000,1000,1 FROM objects WHERE object_id>=$1 AND object_id<=$2 AND object_id%4=3 AND object_id%97<>0;
+ INSERT INTO hot_batches(first_seq,last_seq,event_count,min_witnessed_us,max_witnessed_us,epoch,revision,object_id) SELECT object_id,object_id,1,1,1,1,1,object_id FROM objects WHERE object_id>=$1 AND object_id<=$2 AND object_id%4=0 AND object_id%97<>0;`, pgx.QueryExecModeSimpleProtocol, first, last)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	require.NoError(t, err)
 	_, err = store.Pool().Exec(t.Context(), "ANALYZE")
 	require.NoError(t, err)
