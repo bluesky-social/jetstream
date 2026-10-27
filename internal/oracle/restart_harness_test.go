@@ -956,7 +956,8 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 		}
 		_ = cmd.Process.Kill()
 		select {
-		case <-waitDone:
+		case waitErr := <-waitDone:
+			_ = waitErr
 		case <-time.After(5 * time.Second):
 		}
 	}()
@@ -992,7 +993,8 @@ func runRestartChild(t *testing.T, args restartChildArgs) restartChildResult {
 		_ = cmd.Process.Kill()
 		waitErr = fmt.Errorf("restart child did not exit within %s", args.timeout)
 		select {
-		case <-waitDone:
+		case reapErr := <-waitDone:
+			_ = reapErr
 			reaped = true
 		case <-time.After(5 * time.Second):
 		}

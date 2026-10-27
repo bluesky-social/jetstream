@@ -93,7 +93,10 @@ func startDebug(ctx context.Context, cfg debugConfig) (func(), error) {
 		if err != nil {
 			return nil, fmt.Errorf("debug: pprof listen on %q: %w", cfg.pprofAddr, err)
 		}
-		srv := &http.Server{Handler: mux}
+		srv := &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
 		go func() {
 			fmt.Fprintf(os.Stderr, "debug: pprof listening on http://%s/debug/pprof/\n", ln.Addr())
 			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {

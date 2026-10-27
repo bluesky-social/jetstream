@@ -456,7 +456,11 @@ func (r *migrationRig) startSplitClient(archive, live string) *splitClient {
 		}
 		c.done <- ctx.Err()
 	}()
-	r.t.Cleanup(func() { cancel(); <-c.done })
+	r.t.Cleanup(func() {
+		cancel()
+		runErr := <-c.done
+		_ = runErr // Delivery failures are checked by waitSplitClient.
+	})
 	return c
 }
 
@@ -909,6 +913,8 @@ func TestMigration_Reclaim(t *testing.T) {
 	require.Equal(t, catalog.MigrationDone, r.migrationState(), "a bad margin changes nothing")
 	_, err = r.fake.Backend.ReclaimLocal(ctx, time.Minute, r.dir, r.fs, seqspace.CursorSeqMaxThreshold-10)
 	require.ErrorContains(t, err, "seq ceiling")
+	require.Equal(t, catalog.MigrationDone, r.migrationState(), "a rejected resume seq must not revert the catalog")
+	require.Equal(t, migrate.GuardDone, r.localGuard(), "a rejected resume seq must preserve the handoff guard")
 	res, err := r.fake.Backend.ReclaimLocal(ctx, time.Minute, r.dir, r.fs, 1000)
 	require.NoError(t, err)
 	require.Equal(t, catalog.MigrationReverted, r.migrationState())

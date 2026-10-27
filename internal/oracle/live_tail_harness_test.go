@@ -171,7 +171,8 @@ func (h *liveTailHarness) StopConsumer(t *testing.T) {
 	t.Helper()
 	h.runCancel()
 	select {
-	case <-h.runErr:
+	case err := <-h.runErr:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(10 * time.Second):
 		t.Fatal("consumer.Run did not return after cancel")
 	}

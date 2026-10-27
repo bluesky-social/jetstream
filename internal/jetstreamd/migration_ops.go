@@ -274,16 +274,11 @@ func (b *StorageBackend) ReclaimLocal(ctx context.Context, lease time.Duration, 
 		return ReclaimResult{}, fmt.Errorf("migrate reclaim: %w", err)
 	}
 	switch state {
-	case catalog.MigrationDone:
-		if _, err := sess.SetMigrationState(ctx, state, catalog.MigrationReverted, nil); err != nil {
-			return ReclaimResult{}, fmt.Errorf("migrate reclaim: %w", err)
-		}
-	case catalog.MigrationReverted:
+	case catalog.MigrationDone, catalog.MigrationReverted:
 	default:
 		return ReclaimResult{}, fmt.Errorf("migrate reclaim: migration/state is %q; reclaim only undoes a finished handoff (abort an unfinished one)", state)
 	}
-	// Under the lease and with the state reverted, no writer can move the
-	// seq key again.
+	// Under the lease, no writer can move the seq key.
 	v, err := b.MetaStore(nil).Get(ctx, []byte(catalog.MainSeqKey))
 	if err != nil && !errors.Is(err, metastore.ErrNotFound) {
 		return ReclaimResult{}, fmt.Errorf("migrate reclaim: read the catalog: %w", err)
@@ -307,6 +302,13 @@ func (b *StorageBackend) ReclaimLocal(ctx context.Context, lease time.Duration, 
 		return ReclaimResult{}, fmt.Errorf("migrate reclaim: seq %d plus margin %d reaches the seq ceiling %d; use a smaller --margin", base, margin, seqspace.CursorSeqMaxThreshold)
 	}
 	res.ResumeSeq = base + margin
+	// Validate before reverting, but revert before clearing the local guard
+	// so a crash cannot enable both writers.
+	if state == catalog.MigrationDone {
+		if _, err := sess.SetMigrationState(ctx, state, catalog.MigrationReverted, nil); err != nil {
+			return ReclaimResult{}, fmt.Errorf("migrate reclaim: %w", err)
+		}
+	}
 	// The seq lease registers [seq/next, seq/max_reserved) as a vacancy
 	// when the next session starts, exactly as after an unclean stop.
 	b2 := st.NewBatch()

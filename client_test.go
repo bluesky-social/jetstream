@@ -338,9 +338,14 @@ func TestConcurrentEventsIsRejected(t *testing.T) {
 	c := &Client{engine: newReplayEngine(cfg)}
 
 	firstDone := make(chan struct{})
+	var firstErr error
 	go func() {
 		defer close(firstDone)
-		for range c.Events(context.Background()) {
+		for _, err := range c.Events(context.Background()) {
+			if err != nil {
+				firstErr = err
+				return
+			}
 		}
 	}()
 	require.Eventually(t, func() bool { return h.as.segReqs.Load() > 0 }, 5*time.Second, time.Millisecond,
@@ -357,6 +362,7 @@ func TestConcurrentEventsIsRejected(t *testing.T) {
 	close(gate)
 	select {
 	case <-firstDone:
+		require.NoError(t, firstErr)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the first Events iteration did not finish")
 	}
@@ -473,7 +479,8 @@ func TestCloseRacesEvents(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range c.Events(ctx) {
+		for _, err := range c.Events(ctx) {
+			_ = err // Close may win before Events starts.
 		}
 	}()
 

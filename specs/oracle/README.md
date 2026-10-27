@@ -78,3 +78,8 @@ naming the failure mode (not the test).
   dropped events for a client resuming with a cursor equal to the next seq.
   Fixed by starting such a cursor exactly where it points, and by having the
   child wait for its stream to start.
+- [2026-10-27 — Darwin metadata writes are not durable across a kill](2026-10-27-darwin-unsynced-recovery.md):
+  eight restart assertions fail under Darwin's intentional `pebble.NoSync`
+  policy. Changing only metadata syncing in an isolated copy makes all eight
+  pass; restoring `NoSync` makes them fail again. Root cause documented; no
+  runtime or test-policy fix applied.

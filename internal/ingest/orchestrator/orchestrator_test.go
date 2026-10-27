@@ -180,5 +180,5 @@ func TestRun_BarrierAfterBootstrapBlocksBeforeMerge(t *testing.T) {
 		return err == nil && phase == lifecycle.PhaseSteadyState
 	}, 5*time.Second, 20*time.Millisecond)
 	cancel()
-	<-done
+	require.ErrorIs(t, <-done, context.Canceled)
 }
