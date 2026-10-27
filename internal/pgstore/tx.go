@@ -972,6 +972,8 @@ const unreferencedSQL = `NOT EXISTS (SELECT 1 FROM hot_batches h WHERE h.object_
 	AND NOT EXISTS (SELECT 1 FROM segment_generations s WHERE s.footer_object_id = o.object_id)`
 
 func (t *tx) MarkUnreferenced(ctx context.Context, after uint64, limit int) (catalog.MarkPage, error) {
+	// The explicit page-ID restriction keeps generic plans from scanning the
+	// entire UPDATE target even though the join selects a bounded page.
 	var (
 		page catalog.MarkPage
 		last pgtype.Int8
@@ -983,7 +985,8 @@ func (t *tx) MarkUnreferenced(ctx context.Context, after uint64, limit int) (cat
 		     ORDER BY object_id LIMIT $2),
 		 marked AS (
 		     UPDATE objects o SET unreferenced_at = now()
-		     FROM page p WHERE o.object_id = p.object_id AND `+unreferencedSQL+`
+		     FROM page p WHERE o.object_id = p.object_id
+		       AND o.object_id = ANY (ARRAY(SELECT object_id FROM page)) AND `+unreferencedSQL+`
 		     RETURNING 1)
 		 SELECT (SELECT count(*) FROM page), (SELECT max(object_id) FROM page), (SELECT count(*) FROM marked)`,
 		clampSeq(after), limit).Scan(&page.Scanned, &last, &page.Marked)
@@ -1003,6 +1006,7 @@ func collectObjects(rows pgx.Rows) ([]catalog.ObjectRow, error) {
 func (t *tx) ClaimObjects(ctx context.Context, gcDelay, orphanAge time.Duration, limit int) ([]catalog.ObjectRow, error) {
 	// The CTE's snapshot of each row is its pre-claim state; RETURNING
 	// reports it, so the caller knows which claims to re-check.
+	// As in marking, restrict the UPDATE target explicitly to avoid a full scan.
 	rows, err := t.query(ctx,
 		`WITH c AS (
 		     SELECT `+objectCols+` FROM objects
@@ -1010,6 +1014,7 @@ func (t *tx) ClaimObjects(ctx context.Context, gcDelay, orphanAge time.Duration,
 		        OR (state = 'uploading' AND created_at < now() - $2::bigint * interval '1 microsecond')
 		     ORDER BY object_id LIMIT $3 FOR UPDATE)
 		 UPDATE objects o SET state = 'deleting' FROM c WHERE o.object_id = c.object_id
+		   AND o.object_id = ANY (ARRAY(SELECT object_id FROM c))
 		 RETURNING c.object_id, c.key, c.sha256, c.byte_length, c.state, c.created_at, c.unreferenced_at`,
 		gcDelay.Microseconds(), orphanAge.Microseconds(), limit)
 	if err != nil {

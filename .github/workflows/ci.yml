@@ -245,6 +245,8 @@ jobs:
             auth.docker.io:443
             production.cloudflare.docker.com:443
             production.cloudfront.docker.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -269,6 +271,21 @@ jobs:
 
       - name: Test storage
         run: nix --extra-experimental-features 'nix-command flakes' develop --command just test-storage
+
+      - name: Check GC UPDATE-target work
+        env:
+          JETSTREAM_TEST_PG_URL: postgres://jetstream:jetstream@127.0.0.1:15432/jetstream?sslmode=disable
+          JETSTREAM_TEST_GC_SCAN_ARTIFACT_DIR: ${{ github.workspace }}/gc-scan-plans
+        run: nix --extra-experimental-features 'nix-command flakes' develop --command just test-gc-scans
+
+      - name: Upload GC scan plans
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gc-scan-plans
+          path: ${{ github.workspace }}/gc-scan-plans
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Storage logs
         if: failure()
