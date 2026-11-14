@@ -8,6 +8,10 @@
 name: release
 
 on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/release.yml
   push:
     branches: [main]
     tags: ["v*"]
@@ -20,7 +24,7 @@ concurrency:
 
 jobs:
   publish:
-    name: publish image
+    name: build and publish image
     if: github.repository == 'bluesky-social/jetstream'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -72,11 +76,14 @@ jobs:
           date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           tags=()
-          case "${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}" in
-            branch:main)
+          case "${GITHUB_EVENT_NAME}:${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}" in
+            pull_request:*)
+              tags+=("jetstream:ci-${short_sha}")
+              ;;
+            push:branch:main)
               tags+=("${image}:sha-${short_sha}")
               ;;
-            tag:v*)
+            push:tag:v*)
               if [[ ! "${GITHUB_REF_NAME}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
                 echo "release tag ${GITHUB_REF_NAME@Q} is not a valid Docker tag" >&2
                 exit 1
@@ -101,6 +108,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Log in to GHCR
+        if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -108,6 +116,7 @@ jobs:
           echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Refuse to overwrite existing image tags
+        if: github.event_name == 'push'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
@@ -136,6 +145,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          output_args=(--load)
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            output_args=(--push)
+          fi
+
           tag_args=()
           mapfile -t tags <<< "${TAGS}"
           for tag in "${tags[@]}"; do
@@ -143,7 +157,7 @@ jobs:
           done
 
           docker buildx build \
-            --push \
+            "${output_args[@]}" \
             --provenance=false \
             --platform linux/amd64 \
             --build-arg "VERSION=${VERSION}" \
