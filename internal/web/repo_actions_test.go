@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
@@ -13,7 +14,7 @@ import (
 // the pending-events wiring, not reconstruction.
 type stubSelector struct{}
 
-func (stubSelector) SelectBlocksForDID(catalog.Namespace, string) (repoexport.Selection, error) {
+func (stubSelector) SelectBlocksForDID(context.Context, catalog.Namespace, string) (repoexport.Selection, error) {
 	return nil, nil
 }
 

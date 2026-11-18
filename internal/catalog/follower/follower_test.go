@@ -55,7 +55,9 @@ func TestFollower_FoldBetweenTicks(t *testing.T) {
 	r.requireStream(logEvents(t, f, 1), 1)
 	r.requireStream(coldEvents(t, f, 1), 1)
 
-	require.Len(t, m.SegmentChecksums(), 2, "both seals reached the manifest")
+	checksums, err := m.SegmentChecksumsContext(t.Context())
+	require.NoError(t, err)
+	require.Len(t, checksums, 2, "both seals reached the manifest")
 	require.Equal(t, uint64(22), f.Snapshot().TipSeq(catalog.Main))
 }
 
@@ -135,7 +137,9 @@ func TestFollower_LogMatchesCommittedStream(t *testing.T) {
 			if len(r.events) > 0 {
 				r.requireStream(coldEvents(t, f, 1), 1)
 			}
-			require.Len(t, m.SegmentChecksums(), int(r.seg))
+			checksums, err := m.SegmentChecksumsContext(t.Context())
+			require.NoError(t, err)
+			require.Len(t, checksums, int(r.seg))
 		})
 	}
 }
@@ -332,7 +336,9 @@ func TestFollower_BootstrapThenSteadyState(t *testing.T) {
 	require.NoError(t, f.Refresh(ctx))
 	require.NoError(t, f.Ready(ctx))
 	require.Equal(t, uint64(5), f.Log().FloorSeq())
-	require.Len(t, m.SegmentChecksums(), 1)
+	checksums, err := m.SegmentChecksumsContext(t.Context())
+	require.NoError(t, err)
+	require.Len(t, checksums, 1)
 	r.requireStream(coldEvents(t, f, 1), 1)
 
 	r.commitHot(1, false)

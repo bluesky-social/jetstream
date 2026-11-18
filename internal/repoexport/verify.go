@@ -84,6 +84,9 @@ func Verify(ctx context.Context, cfg VerifyConfig) (VerifyReport, error) {
 		DID:           cfg.DID,
 		PendingEvents: cfg.PendingEvents,
 	})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return VerifyReport{}, ctxErr
+	}
 	if err != nil {
 		if errors.Is(err, ErrNoLocalRepo) {
 			report.Message = err.Error()
@@ -160,7 +163,7 @@ func loadAuthoritativeCommit(ctx context.Context, xrpcClient *xrpc.Client, did, 
 	}
 	defer func() { _ = body.Close() }()
 
-	block, err := readAuthoritativeCommitBlock(body, commitCID)
+	block, err := readAuthoritativeCommitBlock(ctx, body, commitCID)
 	if err != nil {
 		return nil, err
 	}
@@ -183,14 +186,17 @@ func loadAuthoritativeCommit(ctx context.Context, xrpcClient *xrpc.Client, did, 
 	return commit, nil
 }
 
-func readAuthoritativeCommitBlock(r io.Reader, commitCID cbor.CID) (car.Block, error) {
+func readAuthoritativeCommitBlock(ctx context.Context, r io.Reader, commitCID cbor.CID) (car.Block, error) {
 	br := bufio.NewReader(r)
 
-	if err := readCARHeaderAllowEmptyRoots(br); err != nil {
+	if err := readCARHeaderAllowEmptyRoots(ctx, br); err != nil {
 		return car.Block{}, fmt.Errorf("repoexport: read authoritative commit CAR: %w", err)
 	}
-	for blocksRead := range maxAuthoritativeCommitBlocks {
-		block, err := readCARBlock(br)
+	for range maxAuthoritativeCommitBlocks {
+		if err := ctx.Err(); err != nil {
+			return car.Block{}, err
+		}
+		block, err := readCARBlock(ctx, br)
 		if errors.Is(err, io.EOF) {
 			return car.Block{}, fmt.Errorf("repoexport: authoritative commit block %s not found in getBlocks response", commitCID.String())
 		}
@@ -200,18 +206,24 @@ func readAuthoritativeCommitBlock(r io.Reader, commitCID cbor.CID) (car.Block, e
 		if block.CID.Equal(commitCID) {
 			return block, nil
 		}
-		if blocksRead == maxAuthoritativeCommitBlocks-1 {
-			break
-		}
 	}
 
-	return car.Block{}, fmt.Errorf("repoexport: authoritative getBlocks response exceeded %d blocks without commit %s", maxAuthoritativeCommitBlocks, commitCID.String())
+	return car.Block{}, fmt.Errorf("repoexport: authoritative commit %s not found in getBlocks response within the first %d blocks", commitCID.String(), maxAuthoritativeCommitBlocks)
 }
 
-func readCARHeaderAllowEmptyRoots(br *bufio.Reader) error {
+func readCARHeaderAllowEmptyRoots(ctx context.Context, br *bufio.Reader) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	headerLen, err := binary.ReadUvarint(br)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("reading header length: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if headerLen > car.MaxBlockSize {
 		return fmt.Errorf("header length %d exceeds max size", headerLen)
@@ -219,6 +231,9 @@ func readCARHeaderAllowEmptyRoots(br *bufio.Reader) error {
 
 	header := make([]byte, headerLen)
 	if _, err := io.ReadFull(br, header); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("reading header: %w", err)
 	}
 
@@ -229,6 +244,9 @@ func readCARHeaderAllowEmptyRoots(br *bufio.Reader) error {
 
 	var hasVersion bool
 	for range count {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		key, newPos, err := cbor.ReadText(header, pos)
 		if err != nil {
 			return fmt.Errorf("header key: %w", err)
@@ -256,12 +274,21 @@ func readCARHeaderAllowEmptyRoots(br *bufio.Reader) error {
 	if !hasVersion {
 		return errors.New("header missing 'version'")
 	}
-	return nil
+	return ctx.Err()
 }
 
-func readCARBlock(br *bufio.Reader) (car.Block, error) {
+func readCARBlock(ctx context.Context, br *bufio.Reader) (car.Block, error) {
+	if err := ctx.Err(); err != nil {
+		return car.Block{}, err
+	}
 	blockLen, err := binary.ReadUvarint(br)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return car.Block{}, ctxErr
+		}
+		return car.Block{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return car.Block{}, err
 	}
 	if blockLen == 0 {
@@ -273,7 +300,13 @@ func readCARBlock(br *bufio.Reader) (car.Block, error) {
 
 	buf := make([]byte, blockLen)
 	if _, err := io.ReadFull(br, buf); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return car.Block{}, ctxErr
+		}
 		return car.Block{}, fmt.Errorf("reading block: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return car.Block{}, err
 	}
 	cid, cidLen, err := cbor.ParseCIDPrefix(buf)
 	if err != nil {
@@ -283,6 +316,9 @@ func readCARBlock(br *bufio.Reader) (car.Block, error) {
 	expected := cbor.ComputeCID(cid.Codec(), data)
 	if !expected.Equal(cid) {
 		return car.Block{}, fmt.Errorf("block CID mismatch: claimed %s, computed %s", cid.String(), expected.String())
+	}
+	if err := ctx.Err(); err != nil {
+		return car.Block{}, err
 	}
 	return car.Block{CID: cid, Data: data}, nil
 }

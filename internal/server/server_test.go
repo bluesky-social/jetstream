@@ -402,27 +402,43 @@ func TestPublicHandler_StatusUnwired(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
-func TestPublicHandler_StatusWired(t *testing.T) {
+func TestPublicHandler_StatusRoutesWired(t *testing.T) {
 	t.Parallel()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	metrics := obs.NewMetrics()
-	srv := New(Config{
-		PublicAddr:      "127.0.0.1:0",
-		DebugAddr:       "127.0.0.1:0",
-		ShutdownTimeout: 5 * time.Second,
-		StatusHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte("ok"))
-		}),
-	}, logger, metrics)
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "status page", path: "/status"},
+		{name: "verification fragment", path: "/status/verify_repo?did=did%3Aplc%3Atest"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			metrics := obs.NewMetrics()
+			srv := New(Config{
+				PublicAddr:      "127.0.0.1:0",
+				DebugAddr:       "127.0.0.1:0",
+				ShutdownTimeout: 5 * time.Second,
+				StatusHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "text/html")
+					_, _ = w.Write([]byte("ok"))
+				}),
+			}, logger, metrics)
+			ts := httptest.NewServer(srv.PublicHandler())
+			defer ts.Close()
 
-	ts := httptest.NewServer(srv.PublicHandler())
-	defer ts.Close()
-
-	resp, err := doGet(t.Context(), ts.URL+"/status")
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+test.path, nil)
+			require.NoError(t, err)
+			response, err := http.DefaultClient.Do(request)
+			require.NoError(t, err)
+			defer func() { _ = response.Body.Close() }()
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.Equal(t, "ok", string(body))
+		})
+	}
 }
 
 func TestRegisterPublicRoute(t *testing.T) {

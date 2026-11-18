@@ -1,6 +1,8 @@
 package jetstreamd
 
 import (
+	"context"
+
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/repoexport"
@@ -26,22 +28,32 @@ func newManifestSelector(m *manifest.Manifest) repoexport.Selector {
 // SelectBlocksForDID reports every segment the manifest holds as checked,
 // with its candidate blocks. The manifest covers main only; other
 // namespaces come back unchecked for the footer fallback.
-func (s manifestSelector) SelectBlocksForDID(ns catalog.Namespace, did string) (repoexport.Selection, error) {
+func (s manifestSelector) SelectBlocksForDID(ctx context.Context, ns catalog.Namespace, did string) (repoexport.Selection, error) {
 	if ns != catalog.Main {
 		return nil, nil
 	}
 	// Take the resident set before selecting: a segment absorbed between
 	// the two calls is then left unchecked and decoded in full, rather than
 	// marked checked with no candidates.
+	checked, err := s.m.SegmentChecksumsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	sel := repoexport.Selection{}
-	for idx := range s.m.SegmentChecksums() {
+	for idx := range checked {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sel[idx] = nil
 	}
-	picks, err := s.m.SelectBlocksForDID(did)
+	picks, err := s.m.SelectBlocksForDID(ctx, did)
 	if err != nil {
 		return nil, err
 	}
 	for _, p := range picks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sel[p.Idx] = p.Blocks
 	}
 	return sel, nil

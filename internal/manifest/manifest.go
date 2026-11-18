@@ -854,21 +854,31 @@ func ApplySegmentFile(m *Manifest, fs vfs.FS, idx uint64, path string) error {
 	return m.ApplySegment(idx, p.Generation, p.Header, p.Footer, p.CreatedAt, p.Size)
 }
 
-// SegmentChecksums returns the resident header checksum of every
-// sealed segment keyed by index, as one snapshot. Used by the
-// compactor's manifest reconcile to detect stale entries without
-// re-reading full segment metadata.
-func (m *Manifest) SegmentChecksums() map[uint64]uint64 {
-	if err := m.waitReady(); err != nil {
-		return nil
+// SegmentChecksumsContext returns a context-cancellable snapshot of resident
+// sealed segment checksums keyed by index.
+func (m *Manifest) SegmentChecksumsContext(ctx context.Context) (map[uint64]uint64, error) {
+	if err := m.Wait(ctx); err != nil {
+		return nil, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make(map[uint64]uint64, len(m.segments))
 	for i := range m.segments {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		out[m.segments[i].Idx] = m.segments[i].Header.Checksum
 	}
-	return out
+	return out, nil
+}
+
+// SegmentChecksums returns resident sealed segment checksums as one snapshot.
+func (m *Manifest) SegmentChecksums() map[uint64]uint64 {
+	checksums, err := m.SegmentChecksumsContext(context.Background())
+	if err != nil {
+		return nil
+	}
+	return checksums
 }
 
 func (m *Manifest) commitSegment(meta SegmentMetadata, start time.Time) error {
@@ -1015,21 +1025,13 @@ type SegmentBlockSelection struct {
 	Blocks []int
 }
 
-// SelectBlocksForDID returns, for every sealed segment that may contain
-// did, the blocks within it that may hold the DID -- computed entirely
-// from the resident segment and per-block DID blooms, without opening a
-// single segment file. This is the in-memory cache that lets repo
-// reconstruction open only the few segments an account actually touches
-// instead of every sealed segment on disk.
-//
-// The selection inherits SelectBlocksForDID's one-sided contract: no
-// false negatives (every block that holds did is included), possible
-// false positives (a returned block may not hold did; the caller
-// filters per-event after decode). Segments whose segment-level bloom
-// misses are omitted entirely. Results are ascending by segment Idx;
-// the returned slices are fresh and safe for the caller to retain.
-func (m *Manifest) SelectBlocksForDID(did string) ([]SegmentBlockSelection, error) {
-	if err := m.waitReady(); err != nil {
+// SelectBlocksForDID returns candidate blocks for every sealed segment that
+// may contain did. It scans resident blooms without opening segment files.
+// ctx bounds both waiting for manifest readiness and the per-segment scan.
+// False positives are possible; false negatives are not. The returned slices
+// are fresh and ordered by segment index.
+func (m *Manifest) SelectBlocksForDID(ctx context.Context, did string) ([]SegmentBlockSelection, error) {
+	if err := m.Wait(ctx); err != nil {
 		return nil, err
 	}
 	m.mu.RLock()
@@ -1037,6 +1039,9 @@ func (m *Manifest) SelectBlocksForDID(did string) ([]SegmentBlockSelection, erro
 
 	var out []SegmentBlockSelection
 	for i := range m.segments {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		seg := &m.segments[i]
 		blocks := segment.SelectBlocksForDID(seg.SegmentBloom, seg.BlockBlooms, did)
 		if len(blocks) == 0 {

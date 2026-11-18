@@ -338,7 +338,7 @@ func TestGenerationAdvancesOnMutation(t *testing.T) {
 
 	// Read-only queries must not move it.
 	_ = m.SegmentCount()
-	_, _ = m.SelectBlocksForDID("did:plc:whatever")
+	_, _ = m.SelectBlocksForDID(t.Context(), "did:plc:whatever")
 	require.Equal(t, g0, m.Generation(), "read-only queries must not advance the generation")
 
 	path := filepath.Join(dir, "seg_0000000000.jss")

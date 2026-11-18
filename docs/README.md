@@ -728,9 +728,15 @@ pprof endpoint until the operator explicitly enables the operator port.
 When the debug listener is enabled, `/readyz` only means the public listener
 and debug listener are bound and serving; it is not an ingest-health or
 steady-state signal. Use `/status` and Prometheus metrics for the ingestion
-view. If you raise `JETSTREAM_SHUTDOWN_TIMEOUT`, configure the container or
-orchestrator stop grace to be at least that long so Jetstream is not hard-killed
-mid-shutdown.
+view. Account-detail repository verification is fetched separately through
+`GET /status/verify_repo` after the page renders and is bounded to a 20-second
+request deadline. If you raise `JETSTREAM_SHUTDOWN_TIMEOUT`, configure the
+container or orchestrator stop grace to be at least that long so Jetstream is
+not hard-killed mid-shutdown.
+
+The fragment response carries
+`X-Jetstream-Status-Fragment: repo-verification`; the browser inserts only
+marked HTML fragments, not intermediary error pages.
 
 Normal steady-state relay freshness is exported as two gauges:
 
