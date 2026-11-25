@@ -11,6 +11,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/ingest/repair"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
@@ -92,6 +93,10 @@ type Config struct {
 	// LiveMetrics is shared between the bootstrap-time and
 	// steady-state live consumers. Optional.
 	LiveMetrics *live.Metrics
+	// RepairMetrics is the Prometheus metric family for the unified per-DID
+	// repair pipeline (per-DID gate, durable inbox, off-hot-path ClassBulk
+	// resyncs and retries). Optional.
+	RepairMetrics *repair.Metrics
 
 	// BackfillMetrics is consumed by the backfill engine in the
 	// bootstrap phase only. Optional.

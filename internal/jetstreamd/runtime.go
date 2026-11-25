@@ -20,6 +20,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
+	"github.com/bluesky-social/jetstream/internal/ingest/repair"
 	"github.com/bluesky-social/jetstream/internal/leader"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
@@ -424,6 +425,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			Metrics:                        rt.orchMetrics,
 			IngestMetrics:                  ingest.NewMetrics(metrics.Registry),
 			LiveMetrics:                    liveMetrics,
+			RepairMetrics:                  repair.NewMetrics(metrics.Registry),
 			DropMetrics:                    ingest.NewDropMetrics(metrics.Registry),
 			BackfillMetrics:                backfillMetrics,
 			SegmentMetrics:                 segmentMetrics,

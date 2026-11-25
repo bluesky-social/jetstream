@@ -7,6 +7,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/repair"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
@@ -106,6 +107,13 @@ type Config struct {
 	// durability. If set, Consumer commits its staged chain/hosting writes in
 	// the same pebble batch as the relay cursor after a segment block fsyncs.
 	SyncStateStore *syncstate.StateStore
+
+	// Repair, when set, moves automatic Sync 1.1 resyncs off Consumer.Run onto
+	// an off-hot-path ClassBulk worker behind a per-DID gate and durable inbox
+	// committed atomically with relay/cursor. Steady-state consumers share one
+	// Coordinator with RunFailedRepoRetry so no DID ever has concurrent
+	// ClassLive and ClassBulk writes in flight.
+	Repair *repair.Coordinator
 
 	// Tombstones, when set, is updated after each event is durably appended
 	// and assigned a seq. Steady-state passes use it as their live in-memory

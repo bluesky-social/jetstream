@@ -19,6 +19,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/maintainer"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
+	"github.com/bluesky-social/jetstream/internal/ingest/repair"
 	"github.com/bluesky-social/jetstream/internal/leader"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/metastore"
@@ -96,9 +97,10 @@ const memoryHeadroom = 0.75
 
 // disaggregated is the per-process state only disaggregated mode has.
 type disaggregated struct {
-	backend  *StorageBackend
-	follower *follower.Follower
-	uploader *protocol.Uploader
+	backend   *StorageBackend
+	follower  *follower.Follower
+	archiveID [16]byte
+	uploader  *protocol.Uploader
 	// objects reads objects for the maintainer's seals straight from the
 	// catalog, not through the follower's mirror, which may lag the
 	// leader's own commits.
@@ -284,6 +286,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 		return fail(fmt.Errorf("serve: check catalog: %w", err))
 	}
 	logger.Info("catalog", "archive_id", objstore.FormatUUID(archive.ArchiveID), "schema_version", archive.SchemaVersion, "format_version", archive.FormatVersion)
+	rt.disagg.archiveID = archive.ArchiveID
 	// Every pod reads objects, and any pod may become leader and write
 	// them, so each checks all three permissions before its first read can
 	// mistake a denied GET for corruption.
@@ -469,6 +472,7 @@ func buildDisaggregated(ctx context.Context, opts Options, processLogger, logger
 			Metrics:       rt.orchMetrics,
 			IngestMetrics: ingestMetrics,
 			LiveMetrics:   liveMetrics,
+			RepairMetrics: repair.NewMetrics(reg),
 			DropMetrics:   ingest.NewDropMetrics(reg),
 			// Bootstrap and merge write in direct mode, which does its own
 			// concurrent uploads, so BackfillAsyncFlushWorkers stays unset.
@@ -761,6 +765,8 @@ func (r *Runtime) leaderSession(ctx context.Context, epoch uint64, sess *catalog
 		Direct:                direct,
 		Hot:                   hot,
 		Objects:               d.objects,
+		StageBlob:             d.backend.Blob,
+		StagePrefix:           objstore.FormatUUID(d.archiveID) + "/repair/",
 		Catalog:               d.follower,
 		Uploader:              d.uploader,
 		CompactionMemoryBytes: st.CompactionMemoryBytes,

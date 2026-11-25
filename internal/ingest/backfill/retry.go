@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/repair"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
@@ -74,6 +75,11 @@ type RetryConfig struct {
 	// DropMetrics is the shared ingest validation-drop counter family,
 	// forwarded to the SegmentHandler. Optional.
 	DropMetrics *ingest.DropMetrics
+
+	// Repair, when set, gates every steady-state failed-repo retry behind the
+	// shared per-DID gate + durable inbox so live events for the same DID
+	// cannot interleave with ClassBulk replacement chunks.
+	Repair *repair.Coordinator
 
 	// BackfillStore, when non-nil, is the shared *Store the runner uses for
 	// all metadata reads/writes instead of constructing its own over Store.
@@ -483,13 +489,18 @@ func (r *retryRunner) attemptCandidate(ctx context.Context, cand retryCandidate)
 		r.hostSucceeded(cand.Host)
 		return cand, false, nil
 	}
+	if errors.Is(err, repair.ErrAlreadyGated) || errors.Is(err, repair.ErrStaleGeneration) {
+		// Another repair (e.g. an automatic Sync 1.1 resync) already owns this
+		// DID's gate or superseded our generation. Skip without penalizing the
+		// repo or parking its host.
+		return cand, false, nil
+	}
 	if ctx.Err() != nil {
 		return cand, false, ctx.Err()
 	}
 	if isLocalRetryError(err) {
 		return cand, false, err
 	}
-
 	// Direct attempts park/record under the roster hostname — that is the
 	// key candidates are scanned and parked by, so parking anything else
 	// would not suppress same-host work. A failure after a relay fallback,
@@ -553,11 +564,44 @@ func (r *retryRunner) recordFailure(ctx context.Context, cand retryCandidate, fa
 }
 
 func (r *retryRunner) tryRepo(ctx context.Context, cand retryCandidate) (string, bool, error) {
+	var handle *repair.RetryHandle
+	if r.cfg.Repair != nil {
+		var err error
+		handle, err = r.cfg.Repair.BeginFailedRetry(ctx, cand.DID)
+		if err != nil {
+			if errors.Is(err, repair.ErrAlreadyGated) {
+				return "", false, err
+			}
+			return "", false, fmt.Errorf("backfill: retry: complete repo: begin repair gate: %w", err)
+		}
+		defer func() {
+			if handle != nil {
+				_ = handle.Abort(ctx)
+			}
+		}()
+	}
+
 	rp, commit, host, viaFallback, err := r.download(ctx, cand)
 	if err != nil {
+		if handle != nil {
+			abortErr := handle.Abort(ctx)
+			handle = nil
+			if abortErr != nil && ctx.Err() == nil {
+				return host, viaFallback, fmt.Errorf("backfill: retry: complete repo: abort repair gate: %w", abortErr)
+			}
+		}
 		return host, viaFallback, err
 	}
-	if err := r.handler.HandleRepoResync(ctx, cand.DID, rp, commit); err != nil {
+	if handle != nil {
+		pubErr := handle.PublishRepo(ctx, rp, commit)
+		handle = nil
+		if pubErr != nil {
+			if errors.Is(pubErr, repair.ErrStaleGeneration) || errors.Is(pubErr, repair.ErrInvalidRev) || errors.Is(pubErr, repair.ErrStaleSnapshot) {
+				return host, viaFallback, pubErr
+			}
+			return host, viaFallback, fmt.Errorf("backfill: retry: append batch: %w", pubErr)
+		}
+	} else if err := r.handler.HandleRepoResync(ctx, cand.DID, rp, commit); err != nil {
 		return host, viaFallback, err
 	}
 	completionHost := cand.PDS
