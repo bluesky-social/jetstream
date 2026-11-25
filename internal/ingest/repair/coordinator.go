@@ -42,6 +42,11 @@ var (
 	ErrStaleGeneration = errors.New("repair: stale repair generation")
 	// ErrInvalidRev is returned when a resync or snapshot carries a non-TID rev.
 	ErrInvalidRev = errors.New("repair: invalid rev")
+	// ErrStaleSnapshot is returned by PublishRepo when the fetched repo rev is
+	// strictly older than the archive head applied before the gate activated.
+	// The gate drains buffered live events without emitting KindSync, and the
+	// caller must treat the retry attempt as retryable rather than complete.
+	ErrStaleSnapshot = errors.New("repair: snapshot rev older than applied head")
 )
 
 // FetchRepoFunc downloads and verifies a repo snapshot when resuming a crashed
@@ -643,6 +648,20 @@ func (c *Coordinator) EnqueueLiveResync(evt streaming.Event, witnessedAt int64) 
 	if gate, exists := c.gated[did]; exists {
 		switch gate.job.Phase {
 		case PhaseQueued:
+			if gate.job.Source == SourceFailedRetry {
+				// Owned by a RetryHandle: record a durable follow-up instead of
+				// racing the retry goroutine over workData/queue.
+				if evt.Sync.Rev > gate.job.FollowUpRev {
+					gate.job.FollowUpRev = evt.Sync.Rev
+					jobBytes, err := encodeJob(&gate.job)
+					if err != nil {
+						c.mu.Unlock()
+						return err
+					}
+					c.stageOps(setOp(jobKey(did), jobBytes))
+				}
+				break
+			}
 			// Still queued (not staged yet): supersede with newer event.
 			if evt.Sync.Rev >= gate.job.TargetRev {
 				gate.job.TargetRev = evt.Sync.Rev
@@ -820,14 +839,18 @@ func (h *RetryHandle) PublishRepo(ctx context.Context, rp *repo.Repo, commit *re
 	}
 
 	// Refuse a stale snapshot older than the archive head applied before the
-	// gate opened: drain inbox without emitting KindSync and reopen gate.
+	// gate opened: drain inbox without emitting KindSync, reopen gate, and
+	// report ErrStaleSnapshot so the retry runner does not mark StatusComplete.
 	if h.appliedRev != "" && commit.Rev < h.appliedRev {
 		h.c.logger.WarnContext(ctx, "refusing stale failed-repo retry snapshot",
 			"did", string(h.did),
 			"snapshot_rev", commit.Rev,
 			"applied_rev", h.appliedRev,
 		)
-		return h.abortInternal(ctx)
+		if err := h.abortInternal(ctx); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: did=%s snapshot=%s applied=%s", ErrStaleSnapshot, h.did, commit.Rev, h.appliedRev)
 	}
 
 	// Verify generation is still current before staging.
@@ -1043,6 +1066,7 @@ func (c *Coordinator) processQueuedDID(ctx context.Context, did atmos.DID) error
 	c.mu.Lock()
 	gate, ok := c.gated[did]
 	if !ok {
+		delete(c.workData, did)
 		c.mu.Unlock()
 		return nil
 	}
@@ -1401,9 +1425,10 @@ func (c *Coordinator) drainAndClose(ctx context.Context, job JobRecord, outcome 
 		}
 		c.cfg.Metrics.incCompleted(outcome)
 
-		// If a strictly newer resync arrived while we were publishing, kick off
-		// a follow-up repair job (if FetchRepo is configured).
-		if followUpRev != "" && c.cfg.FetchRepo != nil {
+		// If a strictly newer resync arrived while we were gated (or while a
+		// failed-repo retry ran and aborted/published an older rev), kick off
+		// a follow-up repair job when FetchRepo is configured.
+		if followUpRev != "" && (job.SnapshotRev == "" || followUpRev > job.SnapshotRev) && c.cfg.FetchRepo != nil {
 			c.enqueueFollowUp(job.DID, followUpRev)
 		}
 		return nil

@@ -29,6 +29,12 @@ func TestStageStore_RoundTripResumeAndIntegrity(t *testing.T) {
 			name:  "blob",
 			build: func(*testing.T) StageStore { return NewBlobStageStore(memblob.New(), "archive-1/repair/") },
 		},
+		{
+			name: "blob_multipart",
+			build: func(*testing.T) StageStore {
+				return NewBlobStageStoreWithPartSize(memblob.New(), "archive-1/repair/", 64)
+			},
+		},
 	}
 
 	events := make([]segment.Event, 15)

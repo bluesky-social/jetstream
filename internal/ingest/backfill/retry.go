@@ -596,7 +596,7 @@ func (r *retryRunner) tryRepo(ctx context.Context, cand retryCandidate) (string,
 		pubErr := handle.PublishRepo(ctx, rp, commit)
 		handle = nil
 		if pubErr != nil {
-			if errors.Is(pubErr, repair.ErrStaleGeneration) || errors.Is(pubErr, repair.ErrInvalidRev) {
+			if errors.Is(pubErr, repair.ErrStaleGeneration) || errors.Is(pubErr, repair.ErrInvalidRev) || errors.Is(pubErr, repair.ErrStaleSnapshot) {
 				return host, viaFallback, pubErr
 			}
 			return host, viaFallback, fmt.Errorf("backfill: retry: append batch: %w", pubErr)

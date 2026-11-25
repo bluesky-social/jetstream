@@ -486,7 +486,8 @@ func TestCoordinator_FailedRetryAbortStaleSnapshotAndConcurrency(t *testing.T) {
 	staleRP, staleCommit := makeSignedRepo(t, did, rev40, map[string]string{
 		"app.bsky.feed.post/stale": "should-not-publish",
 	})
-	require.NoError(t, h2.PublishRepo(ctx, staleRP, staleCommit))
+	err = h2.PublishRepo(ctx, staleRP, staleCommit)
+	require.ErrorIs(t, err, repair.ErrStaleSnapshot, "stale snapshot must fail with ErrStaleSnapshot so caller does not mark StatusComplete")
 	require.False(t, rep.IsGated(did))
 	require.Len(t, rec.snapshot(), 1, "stale snapshot must not emit KindSync or overwrite newer archive")
 }
@@ -547,5 +548,72 @@ func TestCoordinator_EnqueueLiveResyncRunsOffHotPathAndDrainsInbox(t *testing.T)
 	require.Equal(t, segment.KindCreate, evts[1].Kind)
 	require.Equal(t, "after-sync", evts[1].Rkey)
 	require.Equal(t, 1.0, testutil.ToFloat64(metrics.JobsEnqueued.WithLabelValues(string(repair.SourceSyncEvent))))
+	require.Equal(t, 1.0, testutil.ToFloat64(metrics.JobsCompleted.WithLabelValues("succeeded")))
+}
+
+// Regression test for roast finding R-d5505e: a live resync arriving while a
+// failed-repo retry owns PhaseQueued must record FollowUpRev instead of racing
+// the RetryHandle, and run cleanly once the retry aborts.
+func TestCoordinator_LiveResyncDuringQueuedFailedRetryTriggersFollowUp(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	store := memstore.New()
+	stage := repair.NewMemStageStore()
+	segFS := vfs.NewMem()
+
+	did := atmos.DID("did:plc:followup0000000000000000")
+	rev42 := "3l3qo2vutsw2c"
+
+	var fetchCalled sync.WaitGroup
+	fetchCalled.Add(1)
+	var fetchOnce sync.Once
+	rep, _, w, metrics, rec := openLocalRepairStack(t, store, stage, segFS, "/segments", 4, nil,
+		func(_ context.Context, fetchDID atmos.DID) (*atmosrepo.Repo, *atmosrepo.Commit, error) {
+			require.Equal(t, did, fetchDID)
+			fetchOnce.Do(func() { fetchCalled.Done() })
+			rp, commit := makeSignedRepo(t, did, rev42, map[string]string{
+				"app.bsky.feed.post/from-followup": "recovered",
+			})
+			return rp, commit, nil
+		},
+	)
+	defer func() { _ = w.Close() }()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- rep.Run(runCtx) }()
+
+	// Failed-repo retry opens a PhaseQueued gate.
+	handle, err := rep.BeginFailedRetry(ctx, did)
+	require.NoError(t, err)
+
+	// While retry is still downloading (PhaseQueued), a live #sync resync arrives.
+	evt := streaming.Event{
+		Seq:    200,
+		Resync: streaming.ResyncSyncEvent,
+		Sync: &comatproto.SyncSubscribeRepos_Sync{
+			DID:  string(did),
+			Rev:  rev42,
+			Time: "2026-11-25T00:00:00Z",
+		},
+	}
+	require.NoError(t, rep.EnqueueLiveResync(evt, time.Now().UnixMicro()))
+
+	// Retry download fails and aborts; the recorded FollowUpRev must trigger
+	// a follow-up repair job via FetchRepo instead of dropping the resync.
+	require.NoError(t, handle.Abort(ctx))
+
+	fetchCalled.Wait()
+	require.NoError(t, rep.WaitIdle(ctx))
+	cancel()
+	require.ErrorIs(t, <-runDone, context.Canceled)
+
+	evts := rec.snapshot()
+	require.Len(t, evts, 2)
+	require.Equal(t, segment.KindSync, evts[0].Kind)
+	require.Equal(t, rev42, evts[0].Rev)
+	require.Equal(t, segment.KindCreateResync, evts[1].Kind)
+	require.Equal(t, "from-followup", evts[1].Rkey)
+	require.Equal(t, 1.0, testutil.ToFloat64(metrics.JobsCompleted.WithLabelValues("aborted")))
 	require.Equal(t, 1.0, testutil.ToFloat64(metrics.JobsCompleted.WithLabelValues("succeeded")))
 }

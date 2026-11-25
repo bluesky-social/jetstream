@@ -120,6 +120,11 @@ func Open(cfg Config) (*Consumer, error) {
 					return err
 				}
 			}
+			if rep != nil {
+				if err := rep.OnAppend(ev); err != nil {
+					return err
+				}
+			}
 			if ss != nil {
 				switch ev.Kind {
 				case segment.KindAccount:
@@ -129,11 +134,6 @@ func Open(cfg Config) (*Consumer, error) {
 				}
 				if m := c.promoteAt.Load(); m != nil && m.row == ev {
 					c.promoteSyncState(m.group)
-				}
-			}
-			if rep != nil {
-				if err := rep.OnAppend(ev); err != nil {
-					return err
 				}
 			}
 			return nil

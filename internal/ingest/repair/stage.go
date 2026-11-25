@@ -348,56 +348,186 @@ func (s *fsStageSink) Abort() error {
 	return err
 }
 
+const defaultBlobStagePartSize = 4 << 20 // 4 MiB bounded RAM per staged part
+
+var blobManifestMagic = [4]byte{'J', 'S', 'M', 'B'}
+
 // BlobStageStore persists staged replacement artifacts in disaggregated mode
-// under <prefix><key> on objstore.Blob, outside the catalog objects/ prefix so
-// object GC cannot delete in-flight repair stages.
+// under <prefix><key> (manifest) and <prefix><key>.pXXXXXX (fixed-size parts)
+// on objstore.Blob, outside the catalog objects/ prefix so object GC cannot
+// delete in-flight repair stages. Both write and read stream one part at a time,
+// bounding RAM to O(partSize) regardless of repository size.
 type BlobStageStore struct {
-	blob   objstore.Blob
-	prefix string
+	blob     objstore.Blob
+	prefix   string
+	partSize int
 }
 
-// NewBlobStageStore returns a StageStore backed by blob under prefix.
+// NewBlobStageStore returns a StageStore backed by blob under prefix using the
+// default 4 MiB part size.
 func NewBlobStageStore(blob objstore.Blob, prefix string) *BlobStageStore {
-	return &BlobStageStore{blob: blob, prefix: prefix}
+	return NewBlobStageStoreWithPartSize(blob, prefix, defaultBlobStagePartSize)
 }
 
-func (s *BlobStageStore) key(k string) string {
+// NewBlobStageStoreWithPartSize returns a BlobStageStore with an explicit part
+// size cap (used by tests to exercise multi-part streaming on small inputs).
+func NewBlobStageStoreWithPartSize(blob objstore.Blob, prefix string, partSize int) *BlobStageStore {
+	if partSize <= 0 {
+		partSize = defaultBlobStagePartSize
+	}
+	return &BlobStageStore{blob: blob, prefix: prefix, partSize: partSize}
+}
+
+func (s *BlobStageStore) manifestKey(k string) string {
 	return s.prefix + filepath.Base(k)
 }
 
-func (s *BlobStageStore) Create(_ context.Context, key string) (StageSink, error) {
-	return &blobStageSink{blob: s.blob, key: s.key(key)}, nil
+func (s *BlobStageStore) partKey(k string, idx int) string {
+	return fmt.Sprintf("%s%s.p%06d", s.prefix, filepath.Base(k), idx)
+}
+
+func encodeBlobManifest(parts uint32) []byte {
+	var b [8]byte
+	copy(b[:4], blobManifestMagic[:])
+	binary.BigEndian.PutUint32(b[4:], parts)
+	return b[:]
+}
+
+func decodeBlobManifest(b []byte) (int, error) {
+	if len(b) != 8 || !bytes.Equal(b[:4], blobManifestMagic[:]) {
+		return 0, fmt.Errorf("repair: invalid blob stage manifest (len=%d)", len(b))
+	}
+	return int(binary.BigEndian.Uint32(b[4:])), nil
+}
+
+func (s *BlobStageStore) Create(ctx context.Context, key string) (StageSink, error) {
+	return &blobStageSink{
+		store: s,
+		ctx:   ctx,
+		key:   key,
+		buf:   make([]byte, 0, min(s.partSize, 64<<10)),
+	}, nil
 }
 
 func (s *BlobStageStore) Open(ctx context.Context, key string) (io.ReadCloser, error) {
-	data, err := s.blob.GetKey(ctx, s.key(key))
+	raw, err := s.blob.GetKey(ctx, s.manifestKey(key))
 	if err != nil {
 		return nil, err
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	parts, err := decodeBlobManifest(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &blobStageReader{
+		store: s,
+		ctx:   ctx,
+		key:   key,
+		parts: parts,
+	}, nil
 }
 
 func (s *BlobStageStore) Delete(ctx context.Context, key string) error {
-	return s.blob.DeleteKey(ctx, s.key(key))
+	raw, err := s.blob.GetKey(ctx, s.manifestKey(key))
+	if err == nil {
+		if parts, derr := decodeBlobManifest(raw); derr == nil {
+			for i := range parts {
+				_ = s.blob.DeleteKey(ctx, s.partKey(key, i))
+			}
+		}
+	}
+	return s.blob.DeleteKey(ctx, s.manifestKey(key))
 }
 
 type blobStageSink struct {
-	blob objstore.Blob
-	key  string
-	buf  bytes.Buffer
+	store *BlobStageStore
+	ctx   context.Context
+	key   string
+	buf   []byte
+	parts int
 }
 
-func (s *blobStageSink) Write(p []byte) (int, error) { return s.buf.Write(p) }
+func (s *blobStageSink) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		room := s.store.partSize - len(s.buf)
+		take := min(room, len(p))
+		s.buf = append(s.buf, p[:take]...)
+		p = p[take:]
+		written += take
+		if len(s.buf) >= s.store.partSize {
+			if err := s.flushPart(s.ctx); err != nil {
+				return written, err
+			}
+		}
+	}
+	return written, nil
+}
+
+func (s *blobStageSink) flushPart(ctx context.Context) error {
+	if len(s.buf) == 0 {
+		return nil
+	}
+	if err := s.store.blob.PutKey(ctx, s.store.partKey(s.key, s.parts), s.buf); err != nil {
+		return fmt.Errorf("put stage part %d: %w", s.parts, err)
+	}
+	s.parts++
+	s.buf = s.buf[:0]
+	return nil
+}
 
 func (s *blobStageSink) Commit(ctx context.Context) error {
-	data := s.buf.Bytes()
-	err := s.blob.PutKey(ctx, s.key, data)
-	s.buf.Reset()
-	return err
+	if err := s.flushPart(ctx); err != nil {
+		_ = s.Abort()
+		return err
+	}
+	if err := s.store.blob.PutKey(ctx, s.store.manifestKey(s.key), encodeBlobManifest(uint32(s.parts))); err != nil {
+		_ = s.Abort()
+		return err
+	}
+	s.buf = nil
+	return nil
 }
 
 func (s *blobStageSink) Abort() error {
-	s.buf.Reset()
+	s.buf = nil
+	for i := range s.parts {
+		_ = s.store.blob.DeleteKey(context.Background(), s.store.partKey(s.key, i))
+	}
+	s.parts = 0
+	return nil
+}
+
+type blobStageReader struct {
+	store   *BlobStageStore
+	ctx     context.Context
+	key     string
+	parts   int
+	nextIdx int
+	cur     []byte
+	off     int
+}
+
+func (r *blobStageReader) Read(p []byte) (int, error) {
+	for r.off >= len(r.cur) {
+		if r.nextIdx >= r.parts {
+			r.cur = nil
+			return 0, io.EOF
+		}
+		data, err := r.store.blob.GetKey(r.ctx, r.store.partKey(r.key, r.nextIdx))
+		if err != nil {
+			return 0, fmt.Errorf("get stage part %d: %w", r.nextIdx, err)
+		}
+		r.cur = data
+		r.off = 0
+		r.nextIdx++
+	}
+	n := copy(p, r.cur[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func (r *blobStageReader) Close() error {
+	r.cur = nil
 	return nil
 }
 
