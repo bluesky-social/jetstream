@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -9,7 +10,13 @@ import (
 	"github.com/bluesky-social/jetstream/internal/catalog"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/ingest/repair"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/jcalabro/atmos"
+	atmosrepo "github.com/jcalabro/atmos/repo"
+	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -53,6 +60,34 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			tombstones = nil
 			tombstoneCap = 0
 		}
+		var stageStore repair.StageStore
+		switch {
+		case o.cfg.Disaggregated != nil && o.cfg.Disaggregated.StageBlob != nil:
+			stageStore = repair.NewBlobStageStore(o.cfg.Disaggregated.StageBlob, o.cfg.Disaggregated.StagePrefix)
+		case o.cfg.DataDir != "":
+			stageStore = repair.NewFSStageStore(o.cfg.FS, filepath.Join(o.cfg.DataDir, "repair"))
+		default:
+			stageStore = repair.NewMemStageStore()
+		}
+
+		rep, err := repair.New(repair.Config{
+			Store:          o.cfg.Store,
+			Stage:          stageStore,
+			SyncStateStore: o.cfg.SyncStateStore,
+			DropMetrics:    o.cfg.DropMetrics,
+			Metrics:        o.cfg.RepairMetrics,
+			Logger:         o.cfg.Logger,
+			OnEvent:        o.cfg.OnEvent,
+			FetchRepo:      o.makeRepairFetcher(),
+		})
+		if err != nil {
+			return fmt.Errorf("orchestrator: init repair coordinator: %w", err)
+		}
+		// Restore active per-DID gates and pending verifier checkpoints BEFORE
+		// opening the live consumer / starting the verifier or retry runner.
+		if err := rep.Recover(ctx); err != nil {
+			return fmt.Errorf("orchestrator: recover repair coordinator: %w", err)
+		}
 
 		cfg := live.Config{
 			DataDir:                  o.cfg.DataDir,
@@ -70,6 +105,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			WriterMetrics:         o.cfg.IngestMetrics,
 			Verifier:              o.cfg.Verifier,
 			SyncStateStore:        o.cfg.SyncStateStore,
+			Repair:                rep,
 			Tombstones:            tombstones,
 			TombstoneCap:          tombstoneCap,
 			CompactionTrigger:     o.compactionTrigger,
@@ -119,6 +155,15 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		// Run the main loop
 		g.Go(func() error { return c.Run(gctx) })
 
+		// Run the off-hot-path repair / ClassBulk publisher loop.
+		g.Go(func() error {
+			err := rep.Run(gctx)
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		})
+
 		// Run the compactor loop
 		g.Go(func() error {
 			err := o.runSteadyCompactor(gctx, c.Writer())
@@ -133,6 +178,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 				err := backfill.RunFailedRepoRetry(gctx, backfill.RetryConfig{
 					Store:         o.cfg.Store,
 					Writer:        c.Writer(),
+					Repair:        rep,
 					HTTPClient:    o.cfg.HTTPClient,
 					RelayURL:      o.cfg.RelayURL,
 					Logger:        o.cfg.Logger,
@@ -154,4 +200,63 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 
 		return g.Wait()
 	})
+}
+
+// makeRepairFetcher returns a verified getRepo callback used only when
+// resuming a crashed PhaseQueued repair job whose in-memory resync event is no
+// longer present.
+func (o *Orchestrator) makeRepairFetcher() repair.FetchRepoFunc {
+	if o.cfg.RelayURL == "" || o.cfg.HTTPClient == nil {
+		return nil
+	}
+	xc := &xrpc.Client{
+		Host:       o.cfg.RelayURL,
+		HTTPClient: gt.Some(o.cfg.HTTPClient),
+	}
+	var opts atmossync.Options
+	opts.Client = xc
+	if o.cfg.Directory != nil {
+		opts.Directory = gt.Some(o.cfg.Directory)
+	}
+	sc := atmossync.NewClient(opts)
+	dir := o.cfg.Directory
+	return func(ctx context.Context, did atmos.DID) (*atmosrepo.Repo, *atmosrepo.Commit, error) {
+		body, err := sc.GetRepoStream(ctx, did, "")
+		if err != nil {
+			return nil, nil, err
+		}
+		defer func() { _ = body.Close() }()
+		rp, commit, err := atmosrepo.LoadFromCAR(bufio.NewReader(body))
+		if err != nil {
+			return nil, nil, err
+		}
+		if commit.DID != string(did) {
+			return nil, nil, fmt.Errorf("repair: fetched commit DID %q does not match %q", commit.DID, did)
+		}
+		if dir != nil {
+			id, err := dir.LookupDID(ctx, did)
+			if err != nil {
+				return nil, nil, fmt.Errorf("repair: resolve %s for signature verify: %w", did, err)
+			}
+			pub, err := id.PublicKey()
+			if err != nil {
+				return nil, nil, fmt.Errorf("repair: public key for %s: %w", did, err)
+			}
+			if err := commit.VerifySignature(pub); err != nil {
+				dir.Purge(ctx, did)
+				id2, err2 := dir.LookupDID(ctx, did)
+				if err2 != nil {
+					return nil, nil, fmt.Errorf("repair: re-resolve %s: %w", did, err2)
+				}
+				pub2, err2 := id2.PublicKey()
+				if err2 != nil {
+					return nil, nil, fmt.Errorf("repair: public key retry for %s: %w", did, err2)
+				}
+				if err2 := commit.VerifySignature(pub2); err2 != nil {
+					return nil, nil, fmt.Errorf("repair: verify commit signature for %s: %w", did, err2)
+				}
+			}
+		}
+		return rp, commit, nil
+	}
 }

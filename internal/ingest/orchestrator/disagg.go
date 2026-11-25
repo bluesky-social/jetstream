@@ -32,6 +32,12 @@ type Disaggregated struct {
 	// and blocks compaction rewrites: protocol.Reader.
 	Objects objstore.Store
 
+	// StageBlob and StagePrefix persist immutable staged replacement artifacts
+	// for the steady-state repair pipeline outside the catalog objects/ prefix
+	// so object GC cannot delete in-flight repair stages. Optional.
+	StageBlob   objstore.Blob
+	StagePrefix string
+
 	// Catalog is the follower. Compaction reads the archive through it:
 	// the view, block fetches, and each sealed segment's current
 	// generation. Required when CompactionInterval is set.

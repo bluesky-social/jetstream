@@ -671,3 +671,72 @@ func TestStateStore_FailedGroupCarriesEveryBatch(t *testing.T) {
 		require.Equal(t, want, durable.Rev)
 	}
 }
+
+func TestStateStore_PeekRestoreAndPromoteInboxCheckpoints(t *testing.T) {
+	t.Parallel()
+	raw := newTestStore(t)
+	s := New(raw)
+	did := parseDID(t, "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz")
+
+	// Commit an initial applied rev1.
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev1", Data: fixedCID(t)}))
+	s.PromoteChain(did, "3lrev1")
+	b := raw.NewBatch()
+	s.StageFlush(b)
+	require.NoError(t, b.Commit(t.Context()))
+	s.CommitStaged()
+
+	// Save two pipelined pending states (rev2, rev3) and hosting seq 50.
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev2", Data: fixedCID(t)}))
+	require.NoError(t, s.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3lrev3", Data: fixedCID(t)}))
+	require.NoError(t, s.SaveHosting(t.Context(), did, atmossync.HostingState{Seq: 50, Active: true}))
+
+	// PeekPendingChain(rev2) returns rev2 without removing rev2 or rev3.
+	chain2, ok := s.PeekPendingChain(did, "3lrev2")
+	require.True(t, ok)
+	host50, ok := s.PeekPendingHosting(did, 50)
+	require.True(t, ok)
+
+	// Verifier still sees rev3 via LoadChain, while LoadAppliedChain stays at rev1.
+	cur, err := s.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev3", cur.Rev)
+	applied, err := s.LoadAppliedChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev1", applied.Rev)
+
+	// Simulate restart: new StateStore over same raw store restores pending
+	// checkpoints without promoting them to applied.
+	s2 := New(raw)
+	require.NoError(t, s2.RestorePendingChain(did, chain2))
+	require.NoError(t, s2.RestorePendingHosting(did, host50))
+
+	loaded, err := s2.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev2", loaded.Rev)
+	applied2, err := s2.LoadAppliedChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev1", applied2.Rev, "RestorePendingChain must not promote to applied")
+
+	// Flushing now must NOT persist the restored pending checkpoints.
+	bEmpty := raw.NewBatch()
+	s2.StageFlush(bEmpty)
+	require.Zero(t, bEmpty.Len())
+
+	// PromoteChainBytes + PromoteHostingBytes stage them for durable commit.
+	require.NoError(t, s2.PromoteChainBytes(did, chain2))
+	require.NoError(t, s2.PromoteHostingBytes(did, host50))
+	bCommit := raw.NewBatch()
+	s2.StageFlush(bCommit)
+	require.Equal(t, 2, bCommit.Len())
+	require.NoError(t, bCommit.Commit(t.Context()))
+	s2.CommitStaged()
+
+	s3 := New(raw)
+	durableChain, err := s3.LoadAppliedChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3lrev2", durableChain.Rev)
+	durableHost, err := s3.LoadAppliedHosting(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, int64(50), durableHost.Seq)
+}

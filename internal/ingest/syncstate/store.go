@@ -170,6 +170,18 @@ func takePending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, max
 	return buf, true
 }
 
+// peekPending returns a copy of did's newest pending state whose key is at most
+// max without removing it from the pending queue.
+func peekPending[K cmp.Ordered](m map[atmos.DID][]pending[K], did atmos.DID, max K) ([]byte, bool) {
+	q := m[did]
+	for i := len(q) - 1; i >= 0; i-- {
+		if q[i].key <= max {
+			return append([]byte(nil), q[i].buf...), true
+		}
+	}
+	return nil, false
+}
+
 // committedChainCap bounds StateStore.committedChain. An entry is about 200
 // bytes, so the cache stays near 50 MB.
 const committedChainCap = 1 << 18
@@ -294,6 +306,36 @@ func (p *StateStore) LoadChain(ctx context.Context, did atmos.DID) (*atmossync.C
 	state, err := decodeChainState(val)
 	if err != nil {
 		return nil, fmt.Errorf("syncstate: load chain %s: %w", did, err)
+	}
+	return &state, nil
+}
+
+// LoadAppliedChain returns the chain state for did EXCLUDING pending entries:
+// promoted-but-unflushed state first, then committed cache, then the metadata
+// store. Used by the per-DID repair gate to determine the applied archive head
+// without being misled by pipelined verifier writes that have not landed yet.
+func (p *StateStore) LoadAppliedChain(ctx context.Context, did atmos.DID) (*atmossync.ChainState, error) {
+	p.mu.Lock()
+	var buf []byte
+	if promoted, ok := p.promotedChain[did]; ok {
+		buf = append([]byte(nil), promoted...)
+	} else if committed, ok := p.committedChain.get(did); ok {
+		buf = append([]byte(nil), committed...)
+	}
+	p.mu.Unlock()
+	if buf == nil {
+		val, err := p.s.Get(ctx, chainKey(did))
+		if errors.Is(err, metastore.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("syncstate: load applied chain %s: %w", did, err)
+		}
+		buf = val
+	}
+	state, err := decodeChainState(buf)
+	if err != nil {
+		return nil, fmt.Errorf("syncstate: load applied chain %s: %w", did, err)
 	}
 	return &state, nil
 }
@@ -504,6 +546,102 @@ func (p *StateStore) PromoteHosting(did atmos.DID, maxSeq int64) {
 	}
 	p.promotedHosting[did] = buf
 	p.unsnappedHosting[did] = buf
+}
+
+// PeekPendingChain returns an encoded copy of the newest pending chain entry
+// for did with rev <= maxRev without removing it. Used when capturing a live
+// group into a gated DID's durable inbox so the verifier keeps seeing the
+// in-session checkpoint while the inbox preserves it for restart recovery.
+func (p *StateStore) PeekPendingChain(did atmos.DID, maxRev string) ([]byte, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return peekPending(p.pendingChain, did, maxRev)
+}
+
+// PeekPendingHosting returns an encoded copy of the newest pending hosting
+// entry for did with seq <= maxSeq without removing it.
+func (p *StateStore) PeekPendingHosting(did atmos.DID, maxSeq int64) ([]byte, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return peekPending(p.pendingHosting, did, maxSeq)
+}
+
+// RestorePendingChain seeds an encoded chain checkpoint from a durable repair
+// inbox into the verifier's pending map before the verifier starts after a
+// restart. It deliberately does not promote the checkpoint to applied state.
+func (p *StateStore) RestorePendingChain(did atmos.DID, encoded []byte) error {
+	state, err := decodeChainState(encoded)
+	if err != nil {
+		return fmt.Errorf("syncstate: restore pending chain %s: %w", did, err)
+	}
+	p.mu.Lock()
+	savePending(p.pendingChain, did, pending[string]{buf: append([]byte(nil), encoded...), key: state.Rev})
+	p.mu.Unlock()
+	return nil
+}
+
+// RestorePendingHosting seeds an encoded hosting checkpoint from a durable
+// repair inbox into the verifier's pending map before the verifier starts after
+// a restart. It deliberately does not promote the checkpoint to applied state.
+func (p *StateStore) RestorePendingHosting(did atmos.DID, encoded []byte) error {
+	state, err := decodeHostingState(encoded)
+	if err != nil {
+		return fmt.Errorf("syncstate: restore pending hosting %s: %w", did, err)
+	}
+	p.mu.Lock()
+	savePending(p.pendingHosting, did, pending[int64]{buf: append([]byte(nil), encoded...), key: state.Seq})
+	p.mu.Unlock()
+	return nil
+}
+
+// PromoteChainBytes promotes a previously captured encoded chain checkpoint
+// directly to durable-eligible state (used from OnAppend when draining a repair
+// inbox group whose rows are now appended to the main archive) and drops any
+// pending entries at or below its rev.
+func (p *StateStore) PromoteChainBytes(did atmos.DID, encoded []byte) error {
+	state, err := decodeChainState(encoded)
+	if err != nil {
+		return fmt.Errorf("syncstate: promote chain bytes %s: %w", did, err)
+	}
+	cp := append([]byte(nil), encoded...)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, _ = takePending(p.pendingChain, did, state.Rev)
+	p.promotedChain[did] = cp
+	p.unsnappedChain[did] = cp
+	return nil
+}
+
+// PromoteHostingBytes promotes a previously captured encoded hosting checkpoint
+// directly to durable-eligible state and drops any pending entries at or below
+// its seq.
+func (p *StateStore) PromoteHostingBytes(did atmos.DID, encoded []byte) error {
+	state, err := decodeHostingState(encoded)
+	if err != nil {
+		return fmt.Errorf("syncstate: promote hosting bytes %s: %w", did, err)
+	}
+	cp := append([]byte(nil), encoded...)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, _ = takePending(p.pendingHosting, did, state.Seq)
+	p.promotedHosting[did] = cp
+	p.unsnappedHosting[did] = cp
+	return nil
+}
+
+// PromoteSnapshotChain encodes and promotes a verified repair snapshot's chain
+// state to durable-eligible state when the snapshot's last row is appended.
+func (p *StateStore) PromoteSnapshotChain(did atmos.DID, state atmossync.ChainState) error {
+	buf, err := encodeChainState(state)
+	if err != nil {
+		return fmt.Errorf("syncstate: promote snapshot chain %s: %w", did, err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, _ = takePending(p.pendingChain, did, state.Rev)
+	p.promotedChain[did] = buf
+	p.unsnappedChain[did] = buf
+	return nil
 }
 
 // Settle records that the consumer has received did's upstream event with

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/repair"
 	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/internal/metastore"
 	"github.com/bluesky-social/jetstream/internal/obs"
@@ -109,9 +110,10 @@ func Open(cfg Config) (*Consumer, error) {
 	// — a restart redelivery would then re-archive the row as a
 	// permanent duplicate, the exact bug the guards exist to prevent.
 	var onAppend func(ev *segment.Event) error
-	if cfg.Tombstones != nil || cfg.SyncStateStore != nil {
+	if cfg.Tombstones != nil || cfg.SyncStateStore != nil || cfg.Repair != nil {
 		ts := cfg.Tombstones
 		ss := cfg.SyncStateStore
+		rep := cfg.Repair
 		onAppend = func(ev *segment.Event) error {
 			if ts != nil {
 				if err := ts.Observe(ev); err != nil {
@@ -129,10 +131,14 @@ func Open(cfg Config) (*Consumer, error) {
 					c.promoteSyncState(m.group)
 				}
 			}
+			if rep != nil {
+				if err := rep.OnAppend(ev); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 	}
-
 	w, err := ingest.Open(ingest.Config{
 		SegmentsDir:              cfg.SegmentsDir,
 		FS:                       cfg.FS,
@@ -165,6 +171,9 @@ func Open(cfg Config) (*Consumer, error) {
 		return nil, fmt.Errorf("livestream: open writer: %w", err)
 	}
 	c.writer = w
+	if cfg.Repair != nil {
+		cfg.Repair.AttachWriter(w)
+	}
 
 	return c, nil
 }
@@ -289,6 +298,26 @@ func (c *Consumer) dropStaleOrderedAsyncResync(ctx context.Context, evt streamin
 	return true, nil
 }
 
+func (c *Consumer) dropStaleOrderedAsyncResyncHeader(ctx context.Context, evt streaming.Event) (bool, error) {
+	if evt.Resync != streaming.ResyncAsync || c.cfg.SyncStateStore == nil || evt.Sync == nil {
+		return false, nil
+	}
+	state, err := c.cfg.SyncStateStore.LoadChain(ctx, atmos.DID(evt.Sync.DID))
+	if err != nil {
+		return false, fmt.Errorf("livestream: async resync ordering guard: %w", err)
+	}
+	if state == nil || state.Rev <= evt.Sync.Rev {
+		return false, nil
+	}
+	c.cfg.Metrics.incStaleResyncsDropped()
+	c.logger.WarnContext(ctx, "dropped stale-ordered async resync",
+		"did", evt.Sync.DID,
+		"resync_rev", evt.Sync.Rev,
+		"chain_rev", state.Rev,
+	)
+	return true, nil
+}
+
 // dropReplayedAccountEvent guards against relay seq replays of #account
 // events. atmos's verifier replay-drops duplicate #commit/#sync deliveries
 // (rev-replay protection), but OnAccountEvent's seq guard only suppresses
@@ -379,6 +408,7 @@ func (c *Consumer) cursorValue() int64 {
 type durablePrepare struct {
 	cursor int64
 	sync   *syncstate.Snapshot
+	repair *repair.MetaSnapshot
 }
 
 func (c *Consumer) cursorValueForDurableBatch() any {
@@ -389,6 +419,9 @@ func (c *Consumer) prepareDurable(cur int64) durablePrepare {
 	p := durablePrepare{cursor: cur}
 	if c.cfg.SyncStateStore != nil {
 		p.sync = c.cfg.SyncStateStore.Snapshot()
+	}
+	if c.cfg.Repair != nil {
+		p.repair = c.cfg.Repair.SnapshotMeta()
 	}
 	return p
 }
@@ -416,40 +449,45 @@ func (c *Consumer) onDurableBatch(ctx context.Context, b metastore.Batch, _ uint
 	if cur < 0 {
 		return nil, nil, fmt.Errorf("livestream: refuse to save negative cursor %d to %s", cur, c.cfg.CursorKey)
 	}
-	if cur == 0 {
-		// Block flushed before any upstream event was fully
-		// processed (only possible during very early startup if
-		// the writer has pre-existing state). No cursor to save,
-		// but promoted syncstate — including the #identity ratchet
-		// recorded by OnAppend for rows in the block just fsynced —
-		// can already exist. Persist it on its own so a crash here
-		// can't leave a durable identity row unguarded (#234).
-		if prep.sync != nil {
-			c.cfg.SyncStateStore.StageSnapshot(b, prep.sync)
-			return func() { c.cfg.SyncStateStore.CommitStaged() }, c.abortStaged, nil
-		}
-		return nil, nil, nil
+	if cur > 0 {
+		b.Set([]byte(c.cfg.CursorKey), metastore.EncodeVersionedUint64LE(cursorV1, uint64(cur)))
 	}
-	b.Set([]byte(c.cfg.CursorKey), metastore.EncodeVersionedUint64LE(cursorV1, uint64(cur)))
-	var afterDone func(error)
+	syncStaged := false
 	if prep.sync != nil {
 		c.cfg.SyncStateStore.StageSnapshot(b, prep.sync)
-		afterDone = c.abortStaged
+		syncStaged = true
+	}
+	repairStaged := false
+	if c.cfg.Repair != nil {
+		repairStaged = c.cfg.Repair.StageMetaSnapshot(b, prep.repair)
+	}
+	if cur == 0 && !syncStaged && !repairStaged {
+		return nil, nil, nil
+	}
+	var afterDone func(error)
+	if syncStaged || repairStaged {
+		afterDone = func(err error) {
+			if err != nil {
+				if syncStaged {
+					c.cfg.SyncStateStore.AbortStaged()
+				}
+				if repairStaged {
+					c.cfg.Repair.AbortMetaStaged()
+				}
+			}
+		}
 	}
 	return func() {
-		if c.cfg.SyncStateStore != nil {
+		if syncStaged {
 			c.cfg.SyncStateStore.CommitStaged()
 		}
-		c.cfg.Metrics.setUpstreamCursor(cur)
+		if repairStaged {
+			c.cfg.Repair.CommitMetaStaged()
+		}
+		if cur > 0 {
+			c.cfg.Metrics.setUpstreamCursor(cur)
+		}
 	}, afterDone, nil
-}
-
-// abortStaged is a durable batch's afterDone: a batch that failed to commit
-// hands its verifier state to the next one staged.
-func (c *Consumer) abortStaged(err error) {
-	if err != nil {
-		c.cfg.SyncStateStore.AbortStaged()
-	}
 }
 
 func (c *Consumer) saveCursorAndSyncState(cur int64) error {
@@ -693,6 +731,28 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			c.cfg.Metrics.incEventsReceived()
 			c.settleSyncState(evt)
 
+			// When the unified repair pipeline is wired, move automatic
+			// Sync 1.1 resyncs off Consumer.Run BEFORE ConvertEvent clones
+			// every record payload or touches ClassBulk. The per-DID gate and
+			// durable repair job are staged atomically with relay/cursor.
+			if c.cfg.Repair != nil && evt.Resync != streaming.ResyncNone && evt.Sync != nil {
+				if stale, err := c.dropStaleOrderedAsyncResyncHeader(ctx, evt); err != nil {
+					return err
+				} else if stale {
+					continue
+				}
+				if err := c.cfg.Repair.EnqueueLiveResync(evt, witnessedAt); err != nil {
+					if errors.Is(err, repair.ErrInvalidRev) {
+						c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, ingest.DropReasonInvalidRev)
+						c.noteUpstreamSeq(evt.Seq)
+						continue
+					}
+					return fmt.Errorf("livestream: enqueue repair resync: %w", err)
+				}
+				c.noteUpstreamSeq(evt.Seq)
+				continue
+			}
+
 			segEvts, err := ConvertEvent(evt, witnessedAt)
 			dme, isDropped := errors.AsType[*DroppedOpsError](err)
 			ive, isInvalid := errors.AsType[*InvalidEventError](err)
@@ -812,6 +872,47 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			appendCtx := ctx
 			if evt.Resync != streaming.ResyncNone {
 				appendCtx = ingest.WithClass(ctx, ingest.ClassBulk)
+			}
+
+			// When a repair coordinator is active, filter validated rows first
+			// so gated DIDs capture only validated groups into their durable
+			// inbox and never mix ClassLive with an in-flight ClassBulk repair.
+			if c.cfg.Repair != nil && evt.Resync == streaming.ResyncNone && len(segEvts) > 0 {
+				validated := make([]segment.Event, 0, len(segEvts))
+				for i := range segEvts {
+					if err := segment.ValidateEvent(segEvts[i]); err != nil {
+						if errors.Is(err, segment.ErrFieldTooLong) {
+							c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, ingest.DropReasonFieldTooLong)
+							c.logger.WarnContext(ctx, "dropped unarchivable upstream event",
+								"seq", evt.Seq,
+								"kind", segEvts[i].Kind,
+								"did_len", len(segEvts[i].DID),
+								"collection_len", len(segEvts[i].Collection),
+								"rkey_len", len(segEvts[i].Rkey),
+								"rev_len", len(segEvts[i].Rev),
+								"payload_len", len(segEvts[i].Payload),
+								"err", err,
+							)
+							continue
+						}
+						return fmt.Errorf("livestream: invalid segment event: %w", err)
+					}
+					validated = append(validated, segEvts[i])
+				}
+				if len(validated) == 0 {
+					c.promoteSyncState(segEvts)
+					c.noteUpstreamSeq(evt.Seq)
+					continue
+				}
+				handled, err := c.cfg.Repair.InterceptLiveGroup(evt.Seq, validated)
+				if err != nil {
+					return fmt.Errorf("livestream: repair gate: %w", err)
+				}
+				if handled {
+					c.noteUpstreamSeq(evt.Seq)
+					continue
+				}
+				segEvts = validated
 			}
 
 			// The last row that will be appended carries the promotion.
